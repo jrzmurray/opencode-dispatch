@@ -565,7 +565,9 @@ fi
 # launcher owns allocation, bootstrap, directory verification, session
 # creation, and attached-client startup; this wrapper must not duplicate any
 # of those safety-sensitive steps.
+ISOLATED=0
 if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
+  ISOLATED=1
   orch="${ORCHESTRATION_ROOT:-$DIR/scripts}"
   spawn="$orch/spawn-agent.mjs"
   if [ ! -f "$spawn" ]; then
@@ -577,18 +579,14 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
   [ -n "$MODEL" ] && spawn_args+=(--model "$MODEL")
   [ -n "$VARIANT" ] && spawn_args+=(--variant "$VARIANT")
   [ -n "$WORKTREE_ROOT" ] && spawn_args+=(--worktree-root "$WORKTREE_ROOT")
-  if [ -n "$FOLLOW" ] || [ -n "$AWAIT" ]; then
-    spawn_args+=(--foreground)
-  fi
-  worker_output="$(mktemp "${TMPDIR:-/tmp}/opencode-worker.XXXXXX")"
-  trap 'rm -f "$diff" "$msgfile" "$worker_output"' EXIT
-  if [ -n "$FOLLOW" ] || [ -n "$AWAIT" ]; then
-    node "${spawn_args[@]}" >"$worker_output" || { cat "$worker_output" >&2; echo "error: isolated worker launch failed" >&2; exit 5; }
-    worker_json="$(tail -n 1 "$worker_output")"
-    sed '$d' "$worker_output" || true
-  else
-    worker_json="$(node "${spawn_args[@]}")" || { echo "error: isolated worker launch failed" >&2; exit 5; }
-  fi
+  worker_json="$(node "${spawn_args[@]}")" || { echo "error: isolated worker launch failed" >&2; exit 5; }
+  IFS=$'\t' read -r SID DIR < <(printf '%s' "$worker_json" | node -e '
+    const r=JSON.parse(require("fs").readFileSync(0,"utf8"));
+    process.stdout.write(`${r.sessionId || ""}\t${r.worktreePath || ""}\n`);') || {
+      echo "error: isolated worker returned invalid metadata" >&2; exit 5;
+    }
+  [ -n "$SID" ] && [ -n "$DIR" ] || { echo "error: isolated worker did not return session/worktree" >&2; exit 5; }
+  refresh_dir_query
   printf '%s\n' "$worker_json" | MODE="$MODE" node -e '
     let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
       const r=JSON.parse(d);
@@ -599,10 +597,11 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
       console.log(`  dir:     ${r.worktreePath}`);
       if(r.logPath) console.log(`  log:     ${r.logPath}`);
     });'
-  exit 0
+  if [ -z "$FOLLOW" ] && [ -z "$AWAIT" ]; then exit 0; fi
 fi
 
 # task/bulk may edit files → pre-authorize edit/bash so the turn doesn't stall on a prompt.
+if [ "$ISOLATED" -eq 0 ]; then
 perm=""
 { [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; } && perm='[{"permission":"edit","pattern":"**","action":"allow"},{"permission":"bash","pattern":"**","action":"allow"}]'
 
@@ -628,6 +627,7 @@ if { [ -n "$FOLLOW" ] || [ -n "$AWAIT" ]; } && { [ "$MODE" = "task" ] || [ "$MOD
       exit 9
     fi
   fi
+fi
 fi
 
 if [ -n "$FOLLOW" ]; then
