@@ -22,5 +22,8 @@ Run:
 bash "$HOME/.claude/scripts/opencode-dispatch.sh" status $ARGUMENTS
 ```
 
-Return the output verbatim. If `state: WORKING` but `updated` was a long time ago,
-the turn may be stuck — consider `/opencode:abort <id>`.
+Return the output verbatim. If `state: WORKING` but `updated` was a long time
+ago, check `/opencode:permissions` FIRST — a parked permission prompt (shown as
+`PERMASK` in the list view / `WORKING — PERMISSION PROMPT` in the detail view)
+is the usual cause; approve it with `/opencode:allow <requestID>` and the turn
+resumes. Only if nothing is pending is it a dead turn — then `/opencode:abort <id>`.

@@ -9,10 +9,12 @@ CLAUDE="${CLAUDE_HOME:-$HOME/.claude}"
 echo "repo:   $REPO"
 echo "claude: $CLAUDE"
 
-# 1) dispatch script
+# 1) scripts
 mkdir -p "$CLAUDE/scripts"
 install -m 0755 "$REPO/scripts/opencode-dispatch.sh" "$CLAUDE/scripts/opencode-dispatch.sh"
 echo "installed: $CLAUDE/scripts/opencode-dispatch.sh"
+install -m 0755 "$REPO/scripts/opencode-hang-diag.sh" "$CLAUDE/scripts/opencode-hang-diag.sh"
+echo "installed: $CLAUDE/scripts/opencode-hang-diag.sh"
 
 # 2) slash commands
 mkdir -p "$CLAUDE/commands/opencode"

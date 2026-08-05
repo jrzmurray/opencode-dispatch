@@ -32,6 +32,11 @@
 #             --wait (default) blocks for the reply; --steer injects into the
 #             running turn; --queue appends after the current turn.
 #   abort     Interrupt the in-progress turn of a session. <sessionID> required.
+#   permissions  List pending permission requests on the server (request id,
+#                permission, patterns, session, tool). A WORKING-but-frozen
+#                session is usually parked on one of these.
+#   allow      Approve a pending permission request. <requestID> required;
+#              --always also remembers the pattern for the session.
 #   setup     Show install / auth / model status and exit.
 #
 # Flags (all optional):
@@ -49,8 +54,14 @@
 #                             dir). Passed as ?directory= on create+prompt, so a
 #                             single shared server can run each session in its own
 #                             worktree — no server-per-agent needed.
-#   --prompt-file <path>      (run modes) read the message/task from a file instead
-#                             of positional args. For large prompts and to avoid
+#   --prompt-file <path>      (run modes + send) REQUIRED source of the message/task.
+#                             Inline positional prompt text is REJECTED: argv is
+#                             visible host-wide via `ps` for the whole run, and a
+#                             pruned session context cannot re-read inline text.
+#                             task/bulk additionally copy the prompt into the
+#                             worker's worktree as ./.opencode-task-brief.md
+#                             (git-excluded) and tell the worker to re-read it.
+#                             Historical rationale (superseded text follows): for large prompts and to avoid
 #                             shell quoting/arg-length issues. Overrides positionals.
 #   --synchronous             (run modes) run one-shot & non-server, blocking,
 #                             output inline (NOT --sync). Default is server+async.
@@ -101,7 +112,7 @@ set -euo pipefail
 
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
-  echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|history|setup)" >&2
+  echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|history|permissions|allow|setup)" >&2
   exit 2
 fi
 shift || true
@@ -129,6 +140,7 @@ WAIT=""
 SYNC=""
 FOLLOW=""
 AWAIT=""
+ALWAYS=""
 SUMMARIZE=""
 FOLLOW_TIMEOUT="300"
 TIMEOUT_SET=""
@@ -167,6 +179,7 @@ while [ $# -gt 0 ]; do
     --synchronous)       SYNC=1; shift ;;
     --follow)            FOLLOW=1; shift ;;
     --await)             AWAIT=1; shift ;;
+    --always)            ALWAYS=1; shift ;;
     --summarize)         SUMMARIZE=1; shift ;;
     --timeout)           FOLLOW_TIMEOUT="${2:-}"; TIMEOUT_SET=1; shift 2 ;;
     --stall)             STALL_SECS="${2:-}"; shift 2 ;;
@@ -221,6 +234,15 @@ if [ -n "$AWAIT" ] && [ -z "$TIMEOUT_SET" ]; then FOLLOW_TIMEOUT="86400"; fi
 
 server_up() { curl -sf -m 3 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" -o /dev/null 2>/dev/null; }
 
+# parked_permission <sessionID> — echoes "requestID permission patterns" if the
+# server holds a pending permission ask for that session, else nothing. Lets
+# every "working"-ish readout (status, follow, await heartbeats) tell a parked
+# permission prompt apart from real progress.
+parked_permission() {
+  curl -sf -m 5 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/permission" 2>/dev/null \
+    | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);process.stdout.write(p.id+" "+p.permission+" "+((p.patterns||[]).join(" ")))}catch(e){process.exit(0)}})' 2>/dev/null || true
+}
+
 require_server() {
   if ! server_up; then
     echo "error: no opencode server reachable at $BASE_URL" >&2
@@ -243,7 +265,7 @@ start_server() {  # $1 = directory to root the server in
 
 ensure_server() {  # auto-start in $DIR if none is reachable
   server_up && return 0
-  echo "no opencode server at $BASE_URL — starting one in $DIR…" >&2
+  echo "no opencode server at $BASE_URL — starting one in ${DIR}…" >&2
   start_server "$DIR" || { echo "error: server did not start; see $SERVE_LOG" >&2; exit 6; }
 }
 
@@ -261,10 +283,20 @@ oc_create_session() {  # $1=agent $2=model $3=variant $4=title $5=permJson(optio
   | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).id)}catch(e){process.exit(1)}});'
 }
 
-oc_submit_async() {  # $1=sessionId $2=path-to-message-text-file
-  MSGFILE="$2" node -e '
+# The agent MUST be repeated on the prompt. The agent passed to POST /session is
+# not inherited by the turn: without it here every server-backed turn runs as the
+# server default (`build`), whatever the session was created as. That silently
+# defeated the `review` agent's read-only denies (bash/edit/webfetch) AND its
+# permission block, so review turns both had write access they should not have
+# and parked forever on an external_directory prompt no one could answer.
+# Verified via `select json_extract(data,'$.agent') from message` — every review
+# session pre-fix reads `build`.
+oc_submit_async() {  # $1=sessionId $2=path-to-message-text-file $3=agent(optional)
+  MSGFILE="$2" AGENT_ID="${3:-}" node -e '
     const fs=require("fs");
-    process.stdout.write(JSON.stringify({parts:[{type:"text",text:fs.readFileSync(process.env.MSGFILE,"utf8")}]}));' \
+    const b={parts:[{type:"text",text:fs.readFileSync(process.env.MSGFILE,"utf8")}]};
+    if(process.env.AGENT_ID) b.agent=process.env.AGENT_ID;
+    process.stdout.write(JSON.stringify(b));' \
   | curl -sf -m 20 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/session/$1/prompt_async?$DIR_Q" -H 'content-type: application/json' --data-binary @-
 }
 
@@ -383,8 +415,12 @@ if [ "$MODE" = "status" ]; then
   [ -n "$TASK_ID" ] && { resolve_task_context; }
   if [ -z "$SID" ]; then
     # No session ID: show one-line summary for every session, sorted newest first.
+    # Fetch the pending-permission session ids once so a parked ask can mark its
+    # session instead of a misleading plain "WORKING".
+    permsids="$(curl -sf -m 5 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/permission" 2>/dev/null \
+      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{for(const p of JSON.parse(d)){if(p.sessionID)console.log(p.sessionID)}}catch(e){}})' 2>/dev/null || true)"
     curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" \
-      | LIMIT="$TAIL" node -e '
+      | BN="$(basename "$0")" PERMSIDS="$permsids" LIMIT="$TAIL" node -e '
         let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
           let a; try{a=JSON.parse(d)}catch(e){console.error("bad JSON from server");process.exit(1)}
           const norm=t=>t&&t<1e12?t*1000:t;
@@ -392,25 +428,32 @@ if [ "$MODE" = "status" ]; then
           const lim=parseInt(process.env.LIMIT,10)||50;
           const shown=a.slice(0,lim);
           const now=Date.now();
+          const permset=new Set((process.env.PERMSIDS||"").split("\n").filter(Boolean));
           const fmt=ms=>{let x=Math.floor(ms/1000);const h=Math.floor(x/3600);x%=3600;const mi=Math.floor(x/60);const se=x%60;return (h?h+"h ":"")+(h||mi?mi+"m ":"")+se+"s";};
+          let nperm=0;
           for(const s of shown){
             const u=norm(s?.time?.updated)||0;
             const idle=now-u;
             const li=s?.lastMessage?.info||{};
             const working=li.role==="assistant"&&!(li.time&&li.time.completed);
-            const state=working?"WORKING":"idle";
+            const parked=permset.has(s.id);
+            if(parked) nperm++;
+            const state=working?(parked?"PERMASK":"WORKING"):"idle";
             const age=u?fmt(idle)+" ago":"?";
             console.log(`${s.id}  ${state.padEnd(7)}  ${age.padStart(12)}  ${s.title||""}`);
           }
+          if(nperm) console.log(`… ${nperm} session(s) parked on a permission prompt (see: ${process.env.BN} permissions / allow)`);
           if(a.length>shown.length) console.log(`… ${a.length-shown.length} older session(s) not shown (raise --tail).`);
         });'
     exit 0
   fi
   sess="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID?$DIR_Q")" || { echo "error: session not found" >&2; exit 5; }
   msgs="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" || echo '[]')"
-  printf '{"session":%s,"messages":%s}' "$sess" "$msgs" | node -e '
+  parked="$(parked_permission "$SID")"
+  printf '{"session":%s,"messages":%s}' "$sess" "$msgs" | PARKED="$parked" node -e '
     let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
       const {session:s,messages:m}=JSON.parse(d);
+      const parked=process.env.PARKED||"";
       const norm=t=>t&&t<1e12?t*1000:t;
       const upd=norm(s?.time?.updated)||0; const now=Date.now();
       const idle=Math.max(0,now-upd);
@@ -424,7 +467,14 @@ if [ "$MODE" = "status" ]; then
       console.log("model:    "+(s?.model?.providerID||"?")+"/"+(s?.model?.id||"?"));
       console.log("messages: "+(Array.isArray(m)?m.length:0)+"   cost: $"+(s.cost??0));
       console.log("updated:  "+(upd?new Date(upd).toISOString().replace("T"," ").slice(0,19):"?")+"  ("+fmt(idle)+" ago)");
-      console.log("state:    "+(working?"WORKING (turn in progress)":"idle"));
+      // A WORKING flag with a long-frozen `updated` is a parked turn (typically
+      // an unanswerable permission ask on a headless server), not live work.
+      const stale = working && idle > 30*60*1000;
+      let state;
+      if (parked) state = "WORKING — PERMISSION PROMPT ("+parked+") — approve: opencode-dispatch.sh allow <requestID> [--always]";
+      else if (stale) state = "WORKING — STALE ("+fmt(idle)+" without activity; likely a dead turn — try 'abort')";
+      else state = working ? "WORKING (turn in progress)" : "idle";
+      console.log("state:    "+state);
       if(lastErr) console.log("lastError: "+(lastErr.name||"?")+" "+(lastErr.data?.statusCode||"")+" "+(lastErr.data?.message||""));
     });'
   exit 0
@@ -435,9 +485,23 @@ if [ "$MODE" = "send" ]; then
   require_server
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
-  [ -z "$SID" ] && { echo "error: send needs a <sessionID> and a message" >&2; exit 2; }
-  MSG="${MSG_PARTS[*]:1}"
-  [ -z "$MSG" ] && { echo "error: send needs a message after the sessionID" >&2; exit 2; }
+  [ -z "$SID" ] && { echo "error: send needs a <sessionID> and --prompt-file <path>" >&2; exit 2; }
+  # PROMPT FILES EXCLUSIVELY: inline message words would sit in this process's
+  # argv for the whole (possibly minutes-long) run, visible to every user via
+  # `ps` — and inline text can't be re-read by the worker after context
+  # pruning. Write the message to a file and pass --prompt-file.
+  if [ "${#MSG_PARTS[@]}" -gt 1 ]; then
+    echo "error: inline send messages are no longer accepted (argv leaks to the OS process list)." >&2
+    echo "  Write the message to a file and run: $(basename "$0") send $SID --prompt-file <path>" >&2
+    exit 2
+  fi
+  [ -n "$PROMPT_FILE" ] || { echo "error: send needs --prompt-file <path> after the sessionID" >&2; exit 2; }
+  [ -r "$PROMPT_FILE" ] || { echo "error: --prompt-file not readable: $PROMPT_FILE" >&2; exit 2; }
+  MSG="$(cat "$PROMPT_FILE")"
+  [ -n "$MSG" ] && MSG="$MSG
+
+(This message is also saved at $PROMPT_FILE — re-read that file if your context gets pruned.)"
+  [ -z "$MSG" ] && { echo "error: prompt file is empty: $PROMPT_FILE" >&2; exit 2; }
   if [ -n "$STEER" ] || [ -n "$QUEUE" ]; then
     delivery="steer"; [ -n "$QUEUE" ] && delivery="queue"
     MSG="$MSG" DELIVERY="$delivery" node -e '
@@ -470,16 +534,72 @@ if [ "$MODE" = "abort" ]; then
   exit 0
 fi
 
+# ---- permissions --------------------------------------------------------------
+# List pending permission requests held by the server. A turn that reads WORKING
+# but frozen (see `status`) is usually parked on one of these — an
+# `external_directory`/`bash` ask on a headless server no TUI ever answered.
+if [ "$MODE" = "permissions" ]; then
+  require_server
+  curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/permission" \
+    | node -e '
+      let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+        let a;try{a=JSON.parse(d)}catch(e){console.error("bad JSON from server");process.exit(1)}
+        if(!Array.isArray(a)){console.error("unexpected response");process.exit(1)}
+        if(a.length===0){console.log("no pending permission requests");process.exit(0)}
+        for(const p of a){
+          console.log(p.id);
+          console.log("  permission: "+(p.permission||"?"));
+          console.log("  patterns:   "+((p.patterns||[]).join(" ")||"(none)"));
+          console.log("  session:    "+(p.sessionID||"?"));
+          if(p.tool) console.log("  tool:       "+p.tool);
+          if(p.metadata&&p.metadata.title) console.log("  title:      "+p.metadata.title);
+          console.log("");
+        }
+        console.log("approve with: opencode-dispatch.sh allow <requestID> [--always]");
+      });'
+  exit 0
+fi
+
+# ---- allow --------------------------------------------------------------------
+# Approve a pending permission request (ids come from `permissions`). Default
+# replies "once" (this request only); --always also remembers the pattern for
+# the session, so covered asks auto-resolve without a prompt. Approvals are
+# in-memory only — they do not survive a server restart (config is the durable
+# fix). The blocked turn resumes if its session is still active.
+if [ "$MODE" = "allow" ]; then
+  require_server
+  RID="${MSG_PARTS[0]:-}"
+  [ -z "$RID" ] && { echo "error: allow needs a <requestID> (see: $(basename "$0") permissions)" >&2; exit 2; }
+  REPLY="once"; [ -n "$ALWAYS" ] && REPLY="always"
+  REPLY="$REPLY" node -e 'process.stdout.write(JSON.stringify({reply:process.env.REPLY}));' \
+    | curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/permission/$RID/reply?$DIR_Q" \
+        -H 'content-type: application/json' --data-binary @- -o /dev/null \
+    || { echo "error: reply failed (request not found, already resolved, or server unreachable)" >&2; exit 5; }
+  echo "allowed $RID ($REPLY)"
+  exit 0
+fi
+
 # ---- run modes (review|plan|ask|task|bulk) -----------------------------------
 # DEFAULT: server-backed + async (observable via status/history, killable via
 # abort). Opt into a one-shot, non-server, blocking run with --synchronous.
-MSG="${MSG_PARTS[*]:-}"
-# --prompt-file: take the message from a file (large prompts, no arg-length/quote
-# hazard). Overrides any positional text. Without this flag the arg parser would
-# fall through and treat "--prompt-file <path>" as literal prompt words.
+# PROMPT FILES EXCLUSIVELY (run modes): inline prompt words would sit in this
+# process's argv for the whole run (visible via `ps` to every user of the host)
+# and can't be re-read by the worker after opencode's context pruning truncates
+# old tool output. All run-mode messages come from --prompt-file; positional
+# prompt text is rejected with guidance.
+if [ "${#MSG_PARTS[@]}" -gt 0 ]; then
+  echo "error: inline prompt text is no longer accepted for run modes (argv leaks to the OS process list; pruned contexts can't re-read it)." >&2
+  echo "  Write the prompt to a file and run: $(basename "$0") $MODE [flags] --prompt-file <path>" >&2
+  exit 2
+fi
+MSG=""
 if [ -n "$PROMPT_FILE" ]; then
   [ -r "$PROMPT_FILE" ] || { echo "error: --prompt-file not readable: $PROMPT_FILE" >&2; exit 2; }
   MSG="$(cat "$PROMPT_FILE")"
+fi
+# review may run with no message (default intro); every other run mode needs one.
+if [ "$MODE" != "review" ] && [ -z "$MSG" ]; then
+  echo "error: $MODE needs --prompt-file <path> (inline prompts are not accepted)" >&2; exit 2
 fi
 
 case "$MODE" in
@@ -556,6 +676,19 @@ if [ "$MODE" = "review" ]; then
     default_intro="Review the following git diff."; title="review: ${DIR##*/}"
   fi
   { printf '%s\n\n```diff\n' "${MSG:-$default_intro} Report concrete issues only; cite file:line."; cat "$diff"; printf '\n```\n'; } > "$msgfile"
+elif [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
+  # Durable, re-readable brief: the full prompt is copied into the worker's
+  # worktree (after spawn, below) as ./.opencode-task-brief.md, and the
+  # submitted message leads with that pointer. opencode prunes older tool
+  # output to ~2k chars once a session grows, so a long brief WILL vanish from
+  # the model's context mid-session — the on-disk copy is the recovery path.
+  {
+    printf '%s\n' "YOUR COMPLETE TASK BRIEF IS SAVED AT ./.opencode-task-brief.md (root of your working directory)."
+    printf '%s\n' "Long sessions prune older tool output from your context. RE-READ that file (in chunks if large) before each major implementation step, and any time you are unsure of the spec."
+    printf '%s\n\n---\n\n' "Keep all scratch files INSIDE your working directory (writing outside it, e.g. /tmp, can stall the session on a permission prompt no one can answer)."
+    printf '%s' "$MSG"
+  } > "$msgfile"
+  title="$MODE: ${MSG:0:60}"
 else
   printf '%s' "$MSG" > "$msgfile"
   title="$MODE: ${MSG:0:60}"
@@ -586,6 +719,17 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
       echo "error: isolated worker returned invalid metadata" >&2; exit 5;
     }
   [ -n "$SID" ] && [ -n "$DIR" ] || { echo "error: isolated worker did not return session/worktree" >&2; exit 5; }
+  # Land the durable brief copy the submitted message points at. Local-only:
+  # excluded from git so it can never ride into a commit. (The submit is
+  # async; this cp completes long before the model's first read.)
+  if cp "$msgfile" "$DIR/.opencode-task-brief.md" 2>/dev/null; then
+    excl="$(git -C "$DIR" rev-parse --git-path info/exclude 2>/dev/null || true)"
+    if [ -n "$excl" ]; then
+      grep -qxF ".opencode-task-brief.md" "$excl" 2>/dev/null || echo ".opencode-task-brief.md" >> "$excl"
+    fi
+  else
+    echo "warning: could not write $DIR/.opencode-task-brief.md (worker must rely on in-context brief)" >&2
+  fi
   refresh_dir_query
   printf '%s\n' "$worker_json" | MODE="$MODE" node -e '
     let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
@@ -606,7 +750,7 @@ perm=""
 { [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; } && perm='[{"permission":"edit","pattern":"**","action":"allow"},{"permission":"bash","pattern":"**","action":"allow"}]'
 
 SID="$(oc_create_session "$AGENT_USE" "$MODEL" "$VARIANT" "$title" "$perm")" || { echo "error: could not create session" >&2; exit 5; }
-oc_submit_async "$SID" "$msgfile" || { echo "error: could not submit prompt to $SID" >&2; exit 5; }
+oc_submit_async "$SID" "$msgfile" "$AGENT_USE" || { echo "error: could not submit prompt to $SID" >&2; exit 5; }
 
 # Early worktree-mismatch guard. Server-backed sessions run in the SERVER's cwd,
 # not --dir; --follow/--await exit before the final banner's NOTE, so warn up
@@ -633,13 +777,31 @@ fi
 if [ -n "$FOLLOW" ]; then
   echo "[$MODE] session $SID started; following (timeout ${FOLLOW_TIMEOUT}s)…" >&2
   deadline=$(( $(date +%s) + FOLLOW_TIMEOUT ))
+  last_beat=0
   while :; do
     read -r n st < <(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
       | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const a=JSON.parse(d);const l=a[a.length-1]?.info;const w=l&&l.role==="assistant"&&!(l.time&&l.time.completed);process.stdout.write(a.length+" "+(w?"working":"idle")+"\n")});' 2>/dev/null) || true
     [ "${n:-0}" -ge 2 ] && [ "$st" = "idle" ] && break
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s." >&2
-      echo "watch: $(basename "$0") status $SID | $(basename "$0") history $SID --turns 1 | $(basename "$0") abort $SID" >&2
+    now=$(date +%s)
+    # follow has no stall guard, so a parked permission ask would otherwise sit
+    # silent until timeout: heartbeat the parked state at ~30s while working.
+    if [ "$st" = "working" ] && [ $(( now - last_beat )) -ge 30 ]; then
+      parked="$(parked_permission "$SID")"
+      if [ -n "$parked" ]; then
+        echo "[$MODE] $SID Permissions prompt (request $parked) — approve: $(basename "$0") allow <requestID> [--always]" >&2
+      else
+        echo "[$MODE] $SID working… ${n:-0} msgs" >&2
+      fi
+      last_beat=$now
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      if [ -n "${parked:-}" ]; then
+        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s (parked on a permission prompt: $parked)." >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      else
+        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s." >&2
+        echo "watch: $(basename "$0") status $SID | $(basename "$0") history $SID --turns 1 | $(basename "$0") abort $SID" >&2
+      fi
       exit 0
     fi
     sleep 1.5
@@ -682,20 +844,41 @@ if [ -n "$AWAIT" ]; then
     now=$(date +%s)
     # reset the stall clock whenever the newest timestamp moves
     if [ "${mx:-0}" != "${prev_mx:-}" ]; then prev_mx="${mx:-0}"; last_change=$now; fi
-    # tailable heartbeat, throttled to every ~30s
+    # tailable heartbeat, throttled to every ~30s. While working, ALSO poll the
+    # server's pending-permission list for THIS session: a turn parked on an
+    # unanswered ask (headless server, no TUI) reads as "working" forever, so
+    # say "Permissions prompt" instead of "working" and point at `allow`.
     if [ "$st" = "working" ] && [ $(( now - last_beat )) -ge 30 ]; then
-      echo "[$MODE] $SID working… ${n:-0} msgs, $(( now - last_change ))s since last activity" >&2
+      parked="$(parked_permission "$SID")"
+      if [ -n "$parked" ]; then
+        echo "[$MODE] $SID Permissions prompt (request $parked) — approve: $(basename "$0") allow <requestID> [--always]" >&2
+      else
+        echo "[$MODE] $SID working… ${n:-0} msgs, $(( now - last_change ))s since last activity" >&2
+      fi
       last_beat=$now
     fi
-    # stall bail: newest timestamp frozen for STALL_SECS → hung turn
+    # stall bail: newest timestamp frozen for STALL_SECS → hung turn. Name the
+    # parked-permission case explicitly — it is NOT hung, just waiting on a human.
     if [ "${STALL_SECS:-0}" -gt 0 ] && [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
-      echo "[$MODE] session $SID STALLED: no activity for ${STALL_SECS}s (likely a hung turn); giving up." >&2
-      echo "watch: $(basename "$0") status $SID   |   abort: $(basename "$0") abort $SID" >&2
+      parked="$(parked_permission "$SID")"
+      if [ -n "$parked" ]; then
+        echo "[$MODE] session $SID STALLED: parked on a permission prompt for ${STALL_SECS}s (request $parked)." >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      else
+        echo "[$MODE] session $SID STALLED: no activity for ${STALL_SECS}s (likely a hung turn); giving up." >&2
+        echo "watch: $(basename "$0") status $SID   |   abort: $(basename "$0") abort $SID" >&2
+      fi
       exit 8
     fi
     if [ "$unbounded" -eq 0 ] && [ "$now" -ge "$deadline" ]; then
-      echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s; exiting non-zero (still running server-side)." >&2
-      echo "watch: $(basename "$0") status $SID" >&2
+      parked="$(parked_permission "$SID")"
+      if [ -n "$parked" ]; then
+        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s (parked on a permission prompt: $parked)." >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      else
+        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s; exiting non-zero (still running server-side)." >&2
+        echo "watch: $(basename "$0") status $SID" >&2
+      fi
       exit 3
     fi
     sleep 2

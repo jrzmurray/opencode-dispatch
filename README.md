@@ -104,6 +104,9 @@ endpoint; it still routes each created session to its explicit directory.
 | `/opencode:sessions` | List server sessions. |
 | `/opencode:status <session> \| --task <task>` | Show liveness and server state. |
 | `/opencode:history <session> \| --task <task>` | Read a bounded transcript. |
+| `/opencode:hangdiag [<session>]` | Diagnose why a session hung — stalled tool call, duration, permission ask (no arg: list recent sessions). |
+| `/opencode:permissions` | List pending permission requests (parked asks). |
+| `/opencode:allow <requestID> [--always]` | Approve a pending permission request, resuming its turn. |
 | `/opencode:send <session> \| --task <task> <message>` | Send, steer, or queue a prompt. |
 | `/opencode:abort <session> \| --task <task>` | Stop an active turn. |
 | `/opencode:setup` | Show executable, server, auth, and model diagnostics. |

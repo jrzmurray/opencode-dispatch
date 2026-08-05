@@ -1,0 +1,72 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": [
+        "npx",
+        "@playwright/mcp@latest"
+      ],
+      "enabled": true
+    }
+  },
+  "model": "deepseek/deepseek-v4-flash",
+  "small_model": "deepseek/deepseek-v4-flash",
+  "agent": {
+    "build": {
+      "description": "General-purpose senior coding agent (edits, runs, verifies).",
+      "temperature": 0.2,
+      "prompt": "You are an expert senior software engineer operating as an autonomous coding agent in a large existing codebase. Understand before you change: read the relevant files and match the surrounding conventions, names, and libraries. Never invent APIs; verify a symbol exists before using it. Make the smallest change that fully solves the task; prefer editing existing files over adding new ones and do not refactor unrelated code. Write code that reads like the code around it; comment only non-obvious why. After editing, verify by running the relevant build/lint/test command when one is available, and fix what you broke; do not claim success you have not checked. Be decisive and concise: do not ask for confirmation on reversible, in-scope work. When done, give a short summary citing file paths; do not restate the full diff.",
+      "permission": {
+        "external_directory": {
+          "/tmp/**": "allow",
+          "/private/tmp/**": "allow",
+          "~/Code/**": "allow"
+        }
+      }
+    },
+    "review": {
+      "description": "Read-only code reviewer. Reports issues; never edits.",
+      "mode": "all",
+      "temperature": 0.1,
+      "prompt": "You are a rigorous senior code reviewer. Review ONLY the provided changes/diff (attached or described). Lead with concrete correctness bugs, security issues, and regressions; then note maintainability and style. Cite file:line for every finding. You are read-only: do NOT propose to make edits yourself, do NOT claim you changed anything, and do NOT restate the whole diff. If the change is clean, say so plainly and stop.",
+      "permission": {
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "webfetch": "deny",
+        "edit": "deny",
+        "bash": "deny",
+        "external_directory": {
+          "/tmp/**": "allow",
+          "/private/tmp/**": "allow",
+          "~/Code/**": "allow"
+        }
+      }
+    },
+    "auto": {
+      "description": "Autonomous agent that auto-approves writes and executions in the repo and tmp dirs. Use for unattended/background work.",
+      "mode": "all",
+      "temperature": 0.2,
+      "prompt": "You are an expert senior software engineer operating in autonomous mode. Make decisions independently; do not ask for confirmation on reversible, in-scope work. Understand before you change: read the relevant files and match the surrounding conventions, names, and libraries. Never invent APIs; verify a symbol exists before using it. Make the smallest change that fully solves the task; prefer editing existing files over adding new ones and do not refactor unrelated code. Write code that reads like the code around it; comment only non-obvious why. After editing, verify by running the relevant build/lint/test command when one is available, and fix what you broke. Be decisive and concise.",
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "task": "allow",
+        "todowrite": "allow",
+        "question": "allow",
+        "webfetch": "allow",
+        "external_directory": {
+          "/tmp/**": "allow",
+          "/private/tmp/**": "allow",
+          "~/Code/**": "allow"
+        }
+      }
+    }
+  }
+}
