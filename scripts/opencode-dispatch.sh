@@ -11,7 +11,7 @@
 #
 # Run modes default to SERVER-BACKED + ASYNC: they submit to the persistent
 # server and return a session id immediately (watch with status/history, kill
-# with abort). Pass --synchronous to instead run a one-shot, non-server,
+# with abort). Pass --direct to instead run a one-shot, non-server,
 # blocking `opencode run` that prints output inline (for quick/small asks).
 #
 # Modes:
@@ -21,6 +21,11 @@
 #   task      Agentic build task — the model may edit files and run commands.
 #   bulk      Same as task (async server run is inherently background-friendly).
 #   serve     Start (or confirm) a persistent local `opencode serve` on --port.
+#             --stop stops the running server (identified by the recorded
+#             launch args, or --port/--host if none are recorded). --restart
+#             stops and starts it again with the SAME arguments it was last
+#             invoked with, overridden by any flags passed now (e.g.
+#             `serve --restart --port 5000`).
 #   sessions  List sessions from a running server (id, updated, title).
 #   history   Print a session's transcript. <sessionID> positional required.
 #             Limit with any of: --tail N (default 100 lines), --since <range>
@@ -29,8 +34,13 @@
 #             session (activity, cost, state). Without one: one-line summary of
 #             all sessions, sorted newest first. Cheap — no transcript pulled.
 #   send      Message an existing session. <sessionID> then the message text.
-#             --wait (default) blocks for the reply; --steer injects into the
-#             running turn; --queue appends after the current turn.
+#             Default delivery: async submit + follow the turn (300s bounded,
+#             --timeout tunable) then print the reply — no more hard 300s curl
+#             cap that died on long turns. --wait/--background select the same
+#             24h-backstop completion loop as the run modes (stall guard,
+#             parked-permission heartbeat, distilled reply, exit codes 3/7/8).
+#             --steer injects into the running turn; --queue appends after the
+#             current turn (both synchronous, no reply loop).
 #   abort     Interrupt the in-progress turn of a session. <sessionID> required.
 #   permissions  List pending permission requests on the server (request id,
 #                permission, patterns, session, tool). A WORKING-but-frozen
@@ -44,78 +54,313 @@
 #                              Falls back to $OPENCODE_DISPATCH_MODEL, then to
 #                              opencode's configured default (no -m passed).
 #   --agent <name>            Override the opencode agent (build|plan|review|…).
-#   --effort <name>           Provider-specific reasoning effort -> --variant.
-#   --variant <name>          Same as --effort (explicit passthrough).
-#   --base <ref>              (review) diff base ref, e.g. main; default = working tree
+#   --effort <low|medium|high|xhigh|max>  Codex-style reasoning effort, mapped
+#                             to the provider's --variant. Use --variant for
+#                             provider-specific names.
+#   --variant <name>          Raw provider variant passthrough (unvalidated).
+#   --base <ref>              (review) what base branch to use for the job's
+#                             base, e.g. main; default = working tree.
+#   --scope <auto|working-tree|branch>  (review) what to diff: auto = --base
+#                             <ref>...HEAD when --base is given, else the working
+#                             tree; working-tree = uncommitted changes only
+#                             (git diff HEAD); branch = --base <ref>...HEAD
+#                             (requires --base).
 #   --pr <n>                  (review) review GitHub PR #n: fetches `gh pr diff <n>`
 #                             IN-SCRIPT and uploads it to the delegate — the diff
 #                             never returns to the caller's context. Needs gh+auth.
+#   --repo <owner/repo>       (review with --pr) explicit repo for gh pr diff,
+#                             for when the --dir has no git remote (default:
+#                             inferred from --dir's origin remote).
 #   --dir <path>              Directory to root the SESSION in (default: current
 #                             dir). Passed as ?directory= on create+prompt, so a
 #                             single shared server can run each session in its own
 #                             worktree — no server-per-agent needed.
-#   --prompt-file <path>      (run modes + send) REQUIRED source of the message/task.
-#                             Inline positional prompt text is REJECTED: argv is
-#                             visible host-wide via `ps` for the whole run, and a
-#                             pruned session context cannot re-read inline text.
+#   --prompt-file <path>      (run modes + send) preferred source of the
+#                             message/task. --brief is an alias for this flag.
+#                             Plain positional prompt text is ALSO
+#                             accepted: it is written to a temp file immediately
+#                             and the script re-executes itself with
+#                             --prompt-file, so the prompt never stays in this
+#                             process's argv for the run (it survives only in the
+#                             invoking shell's one-line command string, which no
+#                             CLI can avoid, and in the file). A pruned session
+#                             context can always re-read the file. Positional
+#                             arguments are space-joined into one line (no line
+#                             breaks unless an argument itself contains one).
 #                             task/bulk additionally copy the prompt into the
 #                             worker's worktree as ./.opencode-task-brief.md
 #                             (git-excluded) and tell the worker to re-read it.
 #                             Historical rationale (superseded text follows): for large prompts and to avoid
-#                             shell quoting/arg-length issues. Overrides positionals.
-#   --synchronous             (run modes) run one-shot & non-server, blocking,
-#                             output inline (NOT --sync). Default is server+async.
-#   --follow                  (run modes) after the async submit, wait (bounded)
-#                             for the turn to finish and print the reply inline.
-#   --await                   (run modes) block until the turn COMPLETES, print
-#                             only the distilled result, then EXIT 0 — designed to
-#                             be launched as a background task so the caller (e.g.
-#                             Claude Code) is woken on exit ("wake-on-complete").
-#                             No short deadline: waits ~24h by default; --timeout 0
-#                             = truly unbounded. Exits non-zero on turn error or if
-#                             the server becomes unreachable.
-#   --summarize               (with --await) instead of the final message, produce
-#                             a REMOTE summary (POST /session/:id/summarize, done on
-#                             the delegate model) and print only that. For churny
-#                             task/bulk sessions; reviews are already distilled.
-#   --timeout <N>             (with --follow/--await) max seconds to wait. --follow
-#                             default 300 then leaves it running; --await default
-#                             ~24h then exits non-zero. 0 = unbounded (--await).
-#   --stall <N>               (with --await) give up if the session makes NO
+#                             shell quoting/arg-length issues. Positionals and --prompt-file are mutually exclusive.
+#   --direct                  (run modes) invoke the opencode CLI DIRECTLY — a
+#                             one-shot, non-server, blocking `opencode run` that
+#                             prints output inline (NOT --sync). No session is
+#                             created on the persistent server, so the run is
+#                             unobservable and not killable. For quick/small asks;
+#                             read-only modes only. Default is server+async.
+#                             --auto posture (opencode 1.18.9): passed ONLY for
+#                             review — its edit/webfetch are explicitly denied,
+#                             so --auto cannot unlock them, and bash is
+#                             explicitly allowed (git reads). plan/ask run
+#                             WITHOUT --auto: the plan agent's bash is already
+#                             allow-by-default (opencode's `*` default), so
+#                             --auto adds nothing there and would only
+#                             auto-approve plan's remaining read-only guards
+#                             (external_directory/doom_loop asks).
+#   --follow                  (run modes + send) after the async submit, wait
+#                             (bounded) for the turn to finish and print the
+#                             reply inline. Run-mode default timeout 300s then
+#                             leaves it running; send's DEFAULT delivery is this
+#                             loop (300s, --timeout tunable).
+#   --background              (run modes + send) the job runs in the BACKGROUND
+#                             on the persistent opencode server (detached, no
+#                             terminal; it survives this process). The wrapper
+#                             then WAITS for the turn to complete, prints only
+#                             the distilled result, and EXITs 0 — launch the
+#                             wrapper itself as a background task and the caller
+#                             (e.g. Claude Code) is woken on that exit
+#                             ("wake-on-complete"): only the waiting wrapper
+#                             blocks, never the session. No short deadline:
+#                             ~24h default; --timeout 0 = truly unbounded.
+#                             Exits non-zero on turn error or if the server
+#                             becomes unreachable. DEFAULT for all run modes
+#                             (unless --wait/--follow/--direct); for send it
+#                             must be requested (--background or --wait).
+#   --wait                    (run modes + send) FOREGROUND blocking wait: block
+#                             the session until the turn completes, then print
+#                             the result — call the wrapper in the FOREGROUND
+#                             (not as a background task), so the caller waits
+#                             inline for the answer. Same completion loop as
+#                             --background (24h backstop, stall guard, distilled
+#                             result, exit 0); the difference is the launch:
+#                             --wait blocks the session, --background does not
+#                             (wake-on-complete). Last one given wins.
+#   --timeout <N>             (with --follow/--background) max seconds to wait.
+#                             --follow default 300 then leaves it running;
+#                             --background default ~24h then exits non-zero.
+#                             0 = unbounded (--background).
+#   --stall <N>               (with --background) give up if the session makes NO
 #                             progress for N seconds — its newest message
 #                             timestamp stops advancing (default 900; 0 = off;
 #                             env OPENCODE_DISPATCH_STALL_SECS). Catches hung
 #                             turns that read as "working" forever. Exit 8.
-#   --require-dir             (task/bulk with --follow/--await) hard-fail if the
+#   --require-dir             (task/bulk with --follow/--background) hard-fail if the
 #                             server's cwd differs from --dir: abort the session
 #                             and exit 9 instead of just warning. Use to stop a
 #                             subagent editing the wrong (shared) tree.
 #   --orchestration-root <p>  Directory containing spawn-agent.mjs and the
 #                             worktree lifecycle helpers (task/bulk).
 #   --task <id>               Resolve a worker task record for lifecycle commands.
-#   --json                    (run modes, --synchronous only) raw JSON events
+#   --json                    (run modes, --direct only) raw JSON events
 #   --tail <N>                (history) keep only the last N lines (default 100)
 #   --turns <N>               (history) keep only the last N prompts + their responses
-#                             (alias --prompts). Un-truncated unless --tail is also given.
+#                             (alias --prompts). Output stays bounded by the
+#                             line cap (--tail or 100 lines).
 #   --since <range>           (history) only messages newer than now-range (1d/6h/10m/30s/2w)
-#   --wait                    (send) block for the reply (default delivery)
+#   --wait                    (send) block for the reply — selects the completion
+#                             loop (24h backstop, stall guard, exit codes 3/7/8)
+#   --background              (send) same completion loop as --wait (equivalent
+#                             code path; caller-side launch convention only)
 #   --steer                   (send) inject into the in-progress turn
 #   --queue                   (send) append after the current turn
-#   --port <N>                Server port (default $OPENCODE_DISPATCH_PORT or 4096)
-#   --host <addr>             Server host (default $OPENCODE_DISPATCH_HOST or 127.0.0.1)
+#   --port <N>                Server port (profile field, or $OPENCODE_DISPATCH_PORT, or 4096)
+#   --host <addr>             Server ADDRESSABLE host — how the dispatcher reaches the
+#                             server (profile field, or $OPENCODE_DISPATCH_HOST, or the
+#                             listen address). NEVER 0.0.0.0/:: (unreachable).
+#   --listen <addr>           (serve) bind interface passed to `opencode serve
+#                             --hostname` (profile 'listen' field; 127.0.0.1 |
+#                             0.0.0.0 | an interface IP). Distinct from --host: you
+#                             bind one interface but reach the server at another.
+#   --server <name>           Server definition name (default: default, or
+#                             $OPENCODE_DISPATCH_SERVER). Definitions live in
+#                             $OPENCODE_DISPATCH_SERVERS (default
+#                             ~/.config/opencode-dispatch/servers.json; sample in
+#                             config/servers.json). Keys starting with _ are
+#                             ignored. Per-field precedence:
+#                             CLI flag > env (OPENCODE_DISPATCH_*) > definition.
+#   --stop                    (serve) stop the running opencode server (needs
+#                             lsof; uses the recorded launch args unless
+#                             --port/--host are given).
+#   --restart                 (serve) stop and restart the server, reusing the
+#                             recorded launch args (dir/port/host/listen) overridden by
+#                             any flags passed on this command line.
 #   --                        Everything after this is the literal message
 #
-# Server auth: if $OPENCODE_SERVER_PASSWORD is set, curl uses it as basic-auth
-# password (empty username), matching an `opencode serve` started with that env.
+# Server auth: the resolved profile's 'password' (or $OPENCODE_SERVER_PASSWORD,
+# or a .env.local in the skill dir) is used as the basic-auth password with
+# username $OPENCODE_SERVER_USERNAME (default 'opencode') for every request,
+# and both are exported to the launched `opencode serve` — server and clients
+# always share one credential pair. Binding a non-loopback interface REQUIRES a
+# password — the dispatcher refuses to start an unauthenticated server.
 
 set -euo pipefail
 
+# ---- .env.local credential loading ------------------------------------------
+# A .env.local in the skill directory can carry OPENCODE_SERVER_USERNAME /
+# OPENCODE_SERVER_PASSWORD (nothing else is read from it). Looked up in order:
+# $OPENCODE_DISPATCH_ENV_FILE, then walking up from this script's directory
+# (stopping at $HOME). Values apply ONLY when the variable is not already set
+# in the real environment (dotenv semantics), so an exported shell var always
+# wins. Only KEY=VALUE lines are parsed — never sourced, so the file cannot
+# execute code.
+load_env_local() {
+  local f="${OPENCODE_DISPATCH_ENV_FILE:-}" d key val line
+  if [ -z "$f" ]; then
+    d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    while :; do
+      if [ -f "$d/.env.local" ]; then f="$d/.env.local"; break; fi
+      [ "$d" = "$HOME" ] || [ "$d" = "/" ] && break
+      d="$(dirname "$d")"
+    done
+  fi
+  [ -f "$f" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    case "$val" in
+      \"*\") val="${val#\"}"; val="${val%\"}" ;;
+      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    case "$key" in
+      OPENCODE_SERVER_USERNAME|OPENCODE_SERVER_PASSWORD)
+        if [ -z "${!key:-}" ]; then export "$key=$val"; fi ;;
+    esac
+  done < "$f"
+}
+load_env_local
+
+print_usage() {
+  cat <<'EOF'
+Usage: opencode-dispatch.sh <mode> [flags] [message...]
+
+Delegate work to a persistent opencode server (or run one-shot with --direct).
+
+Modes:
+  review      Review local git changes or a GitHub PR (read-only; agent 'review').
+  plan        Read-only analysis/planning (agent 'plan').
+  ask         Read-only question answering (agent 'plan').
+  task        Agentic build task in a freshly allocated worktree (agent 'auto').
+  bulk        Same as task, for background/batch work.
+  serve       Start/confirm the persistent server; also --stop / --restart.
+  sessions    List sessions from the server (id, updated, title).
+  status      Liveness of a session (or a one-line summary of all sessions).
+  history     Print a session transcript (bound with --tail/--turns/--since).
+  send        Message an existing session (completion-loop reply, or --steer/--queue).
+  abort       Interrupt a session's in-progress turn.
+  permissions List pending permission requests on the server.
+  allow       Approve a pending permission request (--always remembers it).
+  setup       Show executable, server, auth, and model diagnostics.
+
+Run-mode flags (review|plan|ask|task|bulk):
+  --background        DEFAULT: the job runs in the background on the server;
+                      the wrapper waits until the turn completes, prints the
+                      distilled result, and exits 0 (wake-on-complete).
+  --wait              Foreground blocking wait: the session blocks until the
+                      turn completes (call the wrapper inline, not backgrounded).
+  --follow            Bounded foreground wait (300s); leaves the session running.
+  --direct            One-shot 'opencode run' bypassing the server (read-only
+                      modes only; unobservable, not killable). --auto is passed
+                      only for review (its edit/webfetch are explicitly denied);
+                      plan/ask run without it (bash is already allow-by-default
+                      there, and --auto would only lift plan's read-only asks).
+  --timeout <N>       Max seconds to wait (--follow: 300; --background: ~24h;
+                      0 = unbounded).
+  --stall <N>         With --background: give up after N seconds without
+                      progress (default 900; 0 = off).
+  --model <provider/model>  Explicit model, e.g. deepseek/deepseek-v4-flash.
+  --effort <low|medium|high|xhigh|max>  Reasoning effort (maps to --variant).
+  --variant <name>    Raw provider variant passthrough.
+  --agent <name>      Override the agent (plan|ask -> plan; task|bulk -> auto).
+  --dir <path>        Directory to root the session in (default: current dir).
+  --prompt-file <path>  Preferred prompt source (alias: --brief). Plain
+                      positional prompt text
+                      is also accepted (space-joined); the two are mutually
+                      exclusive.
+  --json              With --direct: raw JSON events.
+
+Send flags (send):
+  --background/--wait Select the completion loop (24h backstop, stall guard,
+                      parked-permission heartbeat, distilled reply; exit codes
+                      3 = timeout, 7 = server unreachable, 8 = stall). --wait
+                      and --background are equivalent code paths (caller-side
+                      launch convention only).
+  --follow            Bounded completion wait (DEFAULT for send: 300s,
+                      --timeout tunable); prints the reply and exits 0 on
+                      timeout, leaving the turn running.
+  --timeout/--stall   As in run-mode flags above.
+
+Review-only flags:
+  --base <ref>        Diff base ref (the job's base branch), e.g. main.
+  --pr <n>            Review GitHub PR #n (needs gh + auth).
+  --repo <owner/repo> Explicit repo for --pr when --dir has no git remote.
+  --scope <auto|working-tree|branch>  What to diff; branch requires --base.
+
+Task/bulk-only flags:
+  --orchestration-root <p>  Directory with spawn-agent.mjs + worktree helpers.
+  --worktree-root <p>  Override the worktree allocation root.
+  --require-dir       With --follow/--background: abort if the server cwd
+                      differs from --dir.
+
+Serve flags:
+  --stop              Stop the running server (recorded launch args, or an
+                      explicit --port/--host; never guesses a port).
+  --restart           Restart using the recorded launch args, overridden by
+                      any flags passed now (e.g. --restart --port 5000).
+
+Server selection (all server-backed modes):
+  --server <name>     Named server definition (default: 'default').
+                      Definitions file: $OPENCODE_DISPATCH_SERVERS (default
+                      ~/.config/opencode-dispatch/servers.json).
+  --listen <addr>     (serve) bind interface for `opencode serve --hostname`
+                      (127.0.0.1 | 0.0.0.0 | an interface IP). The server is
+                      still REACHED at --host — never 0.0.0.0.
+
+Session/control flags:
+  --task <id>         Resolve a worker task record for status/history/send/abort.
+  --tail <N>          (history/sessions) keep only the last N lines/entries.
+  --turns <N>         (history) keep only the last N prompts + their responses.
+  --since <range>     (history) only messages newer than now-range (1d/6h/10m/30s).
+  --steer             (send) inject into the in-progress turn.
+  --queue             (send) append after the current turn.
+  --always            (allow) also remember the pattern for the session.
+  --port <N>          Server port (profile field, or $OPENCODE_DISPATCH_PORT, or 4096).
+  --host <addr>       Server ADDRESSABLE host — how the dispatcher reaches the
+                      server (never 0.0.0.0/::).
+  --                  Everything after is literal message text.
+
+Notes:
+  - Run modes are server-backed; the server auto-starts if none is reachable.
+  - Server definitions: per-server bind interface ('listen') vs addressable
+    host ('host'); binding a non-loopback interface requires a password.
+  - --await was removed (use --background); --no-await was removed (use --wait).
+  - Server auth: OPENCODE_SERVER_USERNAME (default 'opencode') +
+    OPENCODE_SERVER_PASSWORD (or the profile's password field) must match
+    'opencode serve'. A .env.local in the skill dir can supply both.
+  - Never pipe this script's output through tail (a PreToolUse hook blocks it).
+EOF
+}
+
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
-  echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|history|permissions|allow|setup)" >&2
+  echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|status|history|send|abort|permissions|allow|setup)" >&2
+  echo "  Run: $(basename "$0") --help" >&2
   exit 2
 fi
 shift || true
+
+# --help / --usage / -? anywhere on the command line prints the reference.
+if [ "$MODE" = "--help" ] || [ "$MODE" = "--usage" ] || [ "$MODE" = "-?" ]; then
+  print_usage
+  exit 0
+fi
+for _a in "$@"; do
+  case "$_a" in
+    --help|--usage|-?) print_usage; exit 0 ;;
+  esac
+done
 
 if ! command -v opencode >/dev/null 2>&1; then
   echo "error: opencode is not installed or not on PATH." >&2
@@ -126,8 +371,11 @@ fi
 MODEL="${OPENCODE_DISPATCH_MODEL:-}"
 AGENT=""
 VARIANT=""
+EFFORT=""
 BASE=""
+REPO=""
 PR=""
+SCOPE=""
 DIR="$PWD"
 FORMAT=""
 TAIL="100"
@@ -137,14 +385,14 @@ SINCE=""
 STEER=""
 QUEUE=""
 WAIT=""
-SYNC=""
+DIRECT=""
 FOLLOW=""
 AWAIT=""
+NO_AWAIT=""
 ALWAYS=""
-SUMMARIZE=""
 FOLLOW_TIMEOUT="300"
 TIMEOUT_SET=""
-# --await stall guard: give up if the session makes NO progress (its newest
+# --background stall guard: give up if the session makes NO progress (its newest
 # message timestamp stops advancing) for this many seconds. Catches hung turns
 # that read as "working" forever — the 20h-zombie failure mode. 0 = disable.
 STALL_SECS="${OPENCODE_DISPATCH_STALL_SECS:-900}"
@@ -156,47 +404,147 @@ ORCHESTRATION_ROOT="${OPENCODE_ORCHESTRATION_ROOT:-}"
 WORKTREE_ROOT="${AGENT_WORKTREE_ROOT:-}"
 TASK_ID=""
 PROMPT_FILE=""
-PORT="${OPENCODE_DISPATCH_PORT:-4096}"
-HOST="${OPENCODE_DISPATCH_HOST:-127.0.0.1}"
+PORT="${OPENCODE_DISPATCH_PORT:-}"
+HOST="${OPENCODE_DISPATCH_HOST:-}"
+PORT_SET=""
+HOST_SET=""
+LISTEN=""
+LISTEN_SET=""
+SERVER_NAME="${OPENCODE_DISPATCH_SERVER:-}"
+SERVER_SET=""
+SERVERS_FILE="${OPENCODE_DISPATCH_SERVERS:-$HOME/.config/opencode-dispatch/servers.json}"
+DIR_SET=""
+STOP=""
+RESTART=""
 MSG_PARTS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --model)             MODEL="${2:-}"; shift 2 ;;
     --agent)             AGENT="${2:-}"; shift 2 ;;
-    --effort|--variant)  VARIANT="${2:-}"; shift 2 ;;
+    --effort)            EFFORT="${2:-}"; shift 2 ;;
+    --variant)           VARIANT="${2:-}"; shift 2 ;;
     --base)              BASE="${2:-}"; shift 2 ;;
     --pr)                PR="${2:-}"; shift 2 ;;
-    --dir)               DIR="${2:-}"; shift 2 ;;
-    --prompt-file)       PROMPT_FILE="${2:-}"; shift 2 ;;
+    --repo)              REPO="${2:-}"; shift 2 ;;
+    --scope)             SCOPE="${2:-}"; shift 2 ;;
+    --dir)               DIR="${2:-}"; DIR_SET=1; shift 2 ;;
+    --prompt-file|--brief) PROMPT_FILE="${2:-}"; shift 2 ;;
     --json)              FORMAT="json"; shift ;;
     --tail)              TAIL="${2:-}"; TAIL_SET=1; shift 2 ;;
     --turns|--prompts)   TURNS="${2:-}"; shift 2 ;;
     --since)             SINCE="${2:-}"; shift 2 ;;
     --steer)             STEER=1; shift ;;
     --queue)             QUEUE=1; shift ;;
-    --wait)              WAIT=1; shift ;;
-    --synchronous)       SYNC=1; shift ;;
+    --wait)              WAIT=1; AWAIT=1; NO_AWAIT=""; shift ;;
+    --background)        AWAIT=1; NO_AWAIT=""; shift ;;
+    --await)             echo "error: --await was removed — use --background instead (the default: job runs in the background, wrapper waits, caller woken on completion) or --wait (blocks the session until the turn completes)." >&2; exit 2 ;;
+    --direct)            DIRECT=1; shift ;;
     --follow)            FOLLOW=1; shift ;;
-    --await)             AWAIT=1; shift ;;
     --always)            ALWAYS=1; shift ;;
-    --summarize)         SUMMARIZE=1; shift ;;
+    --summarize)         echo "error: --summarize was removed — run modes now always return the session transcript's final message (no remote summary step)" >&2; exit 2 ;;
     --timeout)           FOLLOW_TIMEOUT="${2:-}"; TIMEOUT_SET=1; shift 2 ;;
     --stall)             STALL_SECS="${2:-}"; shift 2 ;;
     --require-dir)       REQUIRE_DIR=1; shift ;;
     --orchestration-root) ORCHESTRATION_ROOT="${2:-}"; shift 2 ;;
     --worktree-root)     WORKTREE_ROOT="${2:-}"; shift 2 ;;
     --task)              TASK_ID="${2:-}"; shift 2 ;;
-    --port)              PORT="${2:-}"; shift 2 ;;
-    --host)              HOST="${2:-}"; shift 2 ;;
+    --port)              PORT="${2:-}"; PORT_SET=1; shift 2 ;;
+    --host)              HOST="${2:-}"; HOST_SET=1; shift 2 ;;
+    --listen)            LISTEN="${2:-}"; LISTEN_SET=1; shift 2 ;;
+    --server)            SERVER_NAME="${2:-}"; SERVER_SET=1; shift 2 ;;
+    --stop)              STOP=1; shift ;;
+    --restart)           RESTART=1; shift ;;
     --)                  shift; MSG_PARTS+=("$@"); break ;;
     *)                   MSG_PARTS+=("$1"); shift ;;
   esac
 done
 
+# ---- server definition resolution --------------------------------------------
+# Named profiles in $SERVERS_FILE (sample: config/servers.json). Each profile
+# separates the BIND interface ('listen', passed to `opencode serve
+# --hostname`) from the ADDRESSABLE host the dispatcher reaches it at
+# ('host') — the address can never be 0.0.0.0/::, and binding a non-loopback
+# interface requires a password. Per-field precedence:
+#   CLI flag > env (OPENCODE_DISPATCH_*) > definition field > default.
+# Definition keys starting with `_` are ignored (documentation examples).
+# (serve) `serve <name>` is shorthand for `serve --server <name>`.
+[ "$MODE" = "serve" ] && [ -n "${MSG_PARTS[0]:-}" ] && SERVER_NAME="${MSG_PARTS[0]}"
+SERVER_NAME="${SERVER_NAME:-default}"
+case "$SERVER_NAME" in
+  ""|*[!A-Za-z0-9._-]*)
+    echo "error: invalid server name: '$SERVER_NAME' (use letters, digits, . _ -)" >&2; exit 2 ;;
+esac
+# Fields are joined with \x1f (unit separator) — NOT tab: tab is IFS whitespace,
+# so bash `read` collapses empty middle fields (e.g. an unset 'dir' would push
+# the password into the wrong variable). \x1f is literal, so every field slot
+# survives, including empty ones.
+IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MODEL < <(
+  SRV_NAME="$SERVER_NAME" SERVERS_FILE="$SERVERS_FILE" \
+  CLI_LISTEN="$LISTEN" CLI_HOST="$HOST" CLI_PORT="$PORT" \
+  ENV_LISTEN="${OPENCODE_DISPATCH_LISTEN:-}" \
+  ENV_HOST="${OPENCODE_DISPATCH_HOST:-}" \
+  ENV_PORT="${OPENCODE_DISPATCH_PORT:-}" \
+  ENV_PASSWORD="${OPENCODE_SERVER_PASSWORD:-}" \
+  node - <<'EOF'
+    const fs = require("fs");
+    const file = process.env.SERVERS_FILE;
+    let defs = {};
+    if (fs.existsSync(file)) {
+      try { defs = JSON.parse(fs.readFileSync(file, "utf8")); }
+      catch (e) { console.error(`error: ${file} is not valid JSON: ${e.message}`); process.exit(1); }
+    }
+    const name = process.env.SRV_NAME || "default";
+    const d = defs[name] || {};
+    if (name !== "default" && !(name in defs)) {
+      console.error(`error: no server definition '${name}' in ${file}`);
+      process.exit(1);
+    }
+    const loopback = (a) => a === "localhost" || a === "::1" || /^127\./.test(a);
+    const listen = process.env.CLI_LISTEN || process.env.ENV_LISTEN || d.listen || "127.0.0.1";
+    // Addressable host defaults to the listen address when that is concrete
+    // (loopback or an interface IP); a wildcard bind (0.0.0.0/::) has no
+    // addressable form and REQUIRES an explicit host.
+    let host = process.env.CLI_HOST || process.env.ENV_HOST
+      || d.host || (loopback(listen) ? listen : "");
+    const port = parseInt(process.env.CLI_PORT || process.env.ENV_PORT || d.port || "4096", 10);
+    const pass = process.env.ENV_PASSWORD || d.password || "";
+    const dir = d.dir || "";
+    const model = d.model || "";
+    if (!(port >= 1 && port <= 65535)) {
+      console.error(`error: invalid port ${port} for server '${name}'`); process.exit(1);
+    }
+    if (host === "" || host === "0.0.0.0" || host === "::") {
+      console.error(`error: server '${name}' has no reachable address (host can never be 0.0.0.0/::) — set 'host' in the definition, or bind loopback and let the host default to it`);
+      process.exit(1);
+    }
+    process.stdout.write([name, listen, host, port, dir, pass, model].join("\x1f") + "\n");
+EOF
+) || exit 2
+# Binding a non-loopback interface without a password would expose an
+# unauthenticated server on the network — refuse.
+case "$LISTEN" in
+  127.*|localhost|::1) ;;
+  *)
+    if [ -z "$SERVE_PASSWORD" ]; then
+      echo "error: server '$SERVER_NAME' binds non-loopback interface '$LISTEN' — set 'password' in the definition (or OPENCODE_SERVER_PASSWORD), or it would be reachable without auth" >&2
+      exit 2
+    fi ;;
+esac
+# Profile fields feed the session defaults: directory root + dispatch model.
+[ -z "$DIR_SET" ] && [ -n "$SERVE_DIR" ] && DIR="$SERVE_DIR"
+[ -z "$MODEL" ] && [ -n "$DEF_MODEL" ] && MODEL="$DEF_MODEL"
+# Per-name launch record so stop/restart target the named server only.
+SERVE_ARGS_FILE="${TMPDIR:-/tmp}/opencode-serve/serve-${SERVER_NAME}.args"
+
 BASE_URL="http://${HOST}:${PORT}"
+# opencode serve's basic auth pairs a username (OPENCODE_SERVER_USERNAME,
+# default 'opencode' — the server validates it, verified on 1.18.9) with the
+# password. Both the launched server and every client use the SAME resolved
+# pair, so a .env.local / env change never desyncs them.
+SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
 CURL_AUTH=()
-[ -n "${OPENCODE_SERVER_PASSWORD:-}" ] && CURL_AUTH=( --user ":${OPENCODE_SERVER_PASSWORD}" )
+[ -n "${SERVE_PASSWORD:-}" ] && CURL_AUTH=( --user "${SERVER_USERNAME}:${SERVE_PASSWORD}" )
 
 # Per-session working directory. Every /session endpoint takes ?directory=<path>,
 # so ONE server can root each session in its own dir — no server-per-worktree.
@@ -228,19 +576,159 @@ if [ -n "$MODEL" ] && [ "${MODEL#*/}" = "$MODEL" ]; then
   exit 2
 fi
 
-# --await blocks to completion: no short deadline. Default backstop ~24h unless
+# --effort accepts the codex-style effort levels and maps to the provider's
+# variant; --variant remains the raw, unvalidated passthrough.
+if [ -n "$EFFORT" ]; then
+  case "$EFFORT" in
+    low|medium|high|xhigh|max) VARIANT="$EFFORT" ;;
+    *) echo "error: --effort must be one of low|medium|high|xhigh|max (got: $EFFORT); use --variant for provider-specific names" >&2; exit 2 ;;
+  esac
+fi
+
+# --scope: auto (default) | working-tree | branch. Review-only; enforced with
+# the --pr gate below.
+case "$SCOPE" in
+  ""|auto|working-tree|branch) ;;
+  *) echo "error: --scope must be one of auto|working-tree|branch (got: $SCOPE)" >&2; exit 2 ;;
+esac
+
+# Tasks default to --background: every run mode sends the job to the background
+# and blocks until the turn completes (wake-on-complete — the caller's session
+# is never blocked because the wrapper is launched as a background task and its
+# exit wakes the caller). --wait is the foreground blocking form (it BLOCKS the
+# session until the turn completes); --follow is the bounded wait; --direct is
+# the one-shot.
+case "$MODE" in
+  review|plan|ask|task|bulk)
+    if [ -z "$DIRECT" ] && [ -z "$FOLLOW" ] && [ -z "$AWAIT" ] && [ -z "$NO_AWAIT" ]; then
+      AWAIT=1
+    fi
+    ;;
+esac
+
+# ---- plain positional prompt support -----------------------------------------
+# Inline prompt text IS accepted for run modes and send — but never kept in
+# this process's argv for the run. It is written to a temp file immediately and
+# the script re-executes itself with --prompt-file, so `ps` shows the prompt
+# only in the invoking shell's one-line command string (unavoidable for any
+# CLI that takes a positional prompt) and in the file, never in the long-lived
+# process. --prompt-file remains the preferred, fully-clean path.
+prompt_rebuild() {  # $1 = leading positional arg to keep ("" = none); rest = prompt words
+  local lead="$1"; shift
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/opencode-msg.XXXXXX")"
+  # Space-join the positional arguments into one line, matching the codex
+  # plugin's `positionals.join(" ")`: no line breaks appear unless an argument
+  # itself contains one.
+  printf '%s\n' "$*" > "$tmp"
+  local args=("$MODE")
+  [ -n "$lead" ] && args+=("$lead")
+  [ -n "$MODEL" ] && args+=( --model "$MODEL" )
+  [ -n "$AGENT" ] && args+=( --agent "$AGENT" )
+  [ -n "$VARIANT" ] && args+=( --variant "$VARIANT" )
+  [ -n "$BASE" ] && args+=( --base "$BASE" )
+  [ -n "$REPO" ] && args+=( --repo "$REPO" )
+  [ -n "$PR" ] && args+=( --pr "$PR" )
+  [ -n "$SCOPE" ] && args+=( --scope "$SCOPE" )
+  args+=( --dir "$DIR" )
+  [ -n "$FORMAT" ] && args+=( --json )
+  [ -n "$TAIL_SET" ] && args+=( --tail "$TAIL" )
+  [ -n "$TURNS" ] && args+=( --turns "$TURNS" )
+  [ -n "$SINCE" ] && args+=( --since "$SINCE" )
+  [ -n "$STEER" ] && args+=( --steer )
+  [ -n "$QUEUE" ] && args+=( --queue )
+  [ -n "$DIRECT" ] && args+=( --direct )
+  [ -n "$FOLLOW" ] && args+=( --follow )
+  [ -n "$AWAIT" ] && args+=( --background )
+  [ -n "$NO_AWAIT" ] && args+=( --wait )
+  [ -n "$ALWAYS" ] && args+=( --always )
+  [ -n "$TIMEOUT_SET" ] && args+=( --timeout "$FOLLOW_TIMEOUT" )
+  args+=( --stall "$STALL_SECS" )
+  [ -n "$REQUIRE_DIR" ] && args+=( --require-dir )
+  [ -n "$ORCHESTRATION_ROOT" ] && args+=( --orchestration-root "$ORCHESTRATION_ROOT" )
+  [ -n "$WORKTREE_ROOT" ] && args+=( --worktree-root "$WORKTREE_ROOT" )
+  [ -n "$TASK_ID" ] && args+=( --task "$TASK_ID" )
+  # Only re-pass --server when the user EXPLICITLY set it: SERVER_NAME is
+  # defaulted to "default" before rebuild runs, so an unconditional re-pass
+  # would clobber a $OPENCODE_DISPATCH_SERVER env selection on the re-exec.
+  [ -n "$SERVER_SET" ] && args+=( --server "$SERVER_NAME" )
+  args+=( --port "$PORT" )
+  args+=( --host "$HOST" )
+  args+=( --prompt-file "$tmp" )
+  exec bash "$0" "${args[@]}"
+}
+
+case "$MODE" in
+  review|plan|ask|task|bulk)
+    if [ "${#MSG_PARTS[@]}" -gt 0 ]; then
+      if [ -n "$PROMPT_FILE" ]; then
+        echo "error: positional prompt text and --prompt-file are mutually exclusive" >&2; exit 2
+      fi
+      prompt_rebuild "" "${MSG_PARTS[@]}"
+    fi
+    ;;
+  send)
+    if [ "${#MSG_PARTS[@]}" -gt 0 ]; then
+      if [ -n "$PROMPT_FILE" ]; then
+        # Re-exec state: the message already lives in the file and the only
+        # positional is the <sessionID> (the rebuild passes it as the lead
+        # arg) — nothing to rebuild. A genuine conflict carries the message
+        # as an EXTRA positional (or any positional at all under --task,
+        # where the SID comes from the task record instead).
+        if [ -n "$TASK_ID" ] || [ "${#MSG_PARTS[@]}" -gt 1 ]; then
+          echo "error: positional message and --prompt-file are mutually exclusive" >&2; exit 2
+        fi
+      elif [ -n "$TASK_ID" ]; then
+        prompt_rebuild "" "${MSG_PARTS[@]}"
+      else
+        prompt_rebuild "${MSG_PARTS[0]}" "${MSG_PARTS[@]:1}"
+      fi
+    fi
+    ;;
+esac
+
+# --background blocks to completion: no short deadline. Default backstop ~24h unless
 # the caller set --timeout (0 = unbounded). --follow keeps its 300s default.
 if [ -n "$AWAIT" ] && [ -z "$TIMEOUT_SET" ]; then FOLLOW_TIMEOUT="86400"; fi
 
 server_up() { curl -sf -m 3 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" -o /dev/null 2>/dev/null; }
 
-# parked_permission <sessionID> — echoes "requestID permission patterns" if the
-# server holds a pending permission ask for that session, else nothing. Lets
-# every "working"-ish readout (status, follow, await heartbeats) tell a parked
-# permission prompt apart from real progress.
+# parked_permission <sessionID> [timeout-s] — echoes a descriptor when the
+# session is parked on an open ask: a permission request ("per_xxx bash ls
+# /tmp") OR a question ask ("que_xxx [question] header"). Both queues are
+# IN-MEMORY on the server — a restart loses them while the session stays
+# stuck, and /question has been observed empty while a question ask was
+# pending — so the wait loops fall back to the durable message-stream signal
+# (see pending_ask); the status paths also detect parking durably (tool part
+# stuck in state.status "running" with no time.end).
 parked_permission() {
-  curl -sf -m 5 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/permission" 2>/dev/null \
+  local tmo="${2:-5}"
+  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/permission" 2>/dev/null \
     | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);process.stdout.write(p.id+" "+p.permission+" "+((p.patterns||[]).join(" ")))}catch(e){process.exit(0)}})' 2>/dev/null || true
+  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/question" 2>/dev/null \
+    | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);const q=(p.questions||[])[0]||{};process.stdout.write(p.id+" [question] "+((q.header||q.question||"").slice(0,80)))}catch(e){process.exit(0)}})' 2>/dev/null || true
+}
+
+# pending_ask <sessionID> <stuckTool> <toolStartMs> <questionHeader> — echoes a
+# descriptor when the session is parked on an ask. Sources, in order:
+#   1. the server's in-memory /permission + /question queues (short timeout —
+#      this is polled every loop wake while a turn is working; queue
+#      descriptors carry a request id the `allow` mode can reply to);
+#   2. the durable message-stream signal, passed in by the caller from the
+#      transcript it already fetched: the newest assistant turn holds a tool
+#      part stuck in state.status "running" with no time.end. A stuck
+#      `question` tool IS a parked ask (it waits on a human); other stuck
+#      tools are long-running work, not asks (the caller renders them as
+#      activity, not parking). A stream-only question ask has no reply path —
+#      abort is the only way out (matches `status`).
+pending_ask() {
+  local sid="$1" tp="$2" qh="${4:-}" desc
+  desc="$(parked_permission "$sid" 3)"
+  if [ -n "$desc" ]; then printf '%s' "$desc"; return 0; fi
+  if [ "$tp" = "question" ]; then
+    printf '%s' "que_stream [question] ${qh:-?} (queue lost — no reply path; abort if it never finishes)"
+  fi
+  return 0
 }
 
 require_server() {
@@ -252,20 +740,102 @@ require_server() {
 }
 
 SERVE_LOG=""
-start_server() {  # $1 = directory to root the server in
-  local dir="${1:-$PWD}"
+start_server() {  # $1=dir (default $DIR) $2=port (default $PORT) $3=listen (default $LISTEN) $4=password
+  local dir="${1:-$DIR}" port="${2:-$PORT}" listen="${3:-$LISTEN}" pass="${4:-$SERVE_PASSWORD}"
   local logdir="${TMPDIR:-/tmp}/opencode-serve"; mkdir -p "$logdir"
-  SERVE_LOG="$logdir/serve-${PORT}.log"
-  ( cd "$dir" 2>/dev/null && exec nohup opencode serve --port "$PORT" --hostname "$HOST" >"$SERVE_LOG" 2>&1 ) &
+  SERVE_LOG="$logdir/serve-${port}.log"
+  if [ -n "$pass" ]; then
+    ( cd "$dir" 2>/dev/null && exec env OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" OPENCODE_SERVER_PASSWORD="$pass" nohup opencode serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
+  else
+    ( cd "$dir" 2>/dev/null && exec nohup opencode serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
+  fi
   disown 2>/dev/null || true
   local i
-  for i in $(seq 1 30); do server_up && return 0; sleep 0.3; done
+  for i in $(seq 1 50); do server_up && return 0; sleep 0.3; done
   return 1
+}
+
+# The last server THIS script started for the resolved server name is recorded
+# (dir/port/host, one per line) in $SERVE_ARGS_FILE, so --restart can reuse the
+# exact invocation and --stop can find it even when it is not on the default
+# port. Each named server keeps its own record; a server started by a pre-names
+# install has no per-name record, so 'default' also falls back to the legacy
+# serve.args path.
+write_serve_args() {  # $1=dir $2=port $3=host
+  mkdir -p "$(dirname "$SERVE_ARGS_FILE")"
+  printf '%s\n%s\n%s\n' "$1" "$2" "$3" > "$SERVE_ARGS_FILE"
+}
+
+read_serve_args() {  # sets RDIR/RPORT/RHOST (empty when no record exists)
+  RDIR=""; RPORT=""; RHOST=""
+  local f="$SERVE_ARGS_FILE"
+  if [ ! -f "$f" ] && [ "$SERVER_NAME" = "default" ]; then
+    f="${TMPDIR:-/tmp}/opencode-serve/serve.args"
+  fi
+  if [ -f "$f" ]; then
+    { IFS= read -r RDIR; IFS= read -r RPORT; IFS= read -r RHOST; } < "$f" || true
+  fi
+}
+
+server_pids() {  # $1=host $2=port — echo PIDs of opencode processes listening there
+  # lsof @host:port does NOT match a socket bound to the wildcard (0.0.0.0/::)
+  # but reached at a concrete --host (verified empirically on macOS lsof), so
+  # fall back to a port-only match when the host-qualified form finds nothing.
+  # The opencode command check below keeps the port-only match safe (a
+  # non-opencode process on the port is filtered out).
+  local pids
+  pids="$(lsof -nP -tiTCP@"$1":"$2" -sTCP:LISTEN 2>/dev/null || true)"
+  [ -z "$pids" ] && pids="$(lsof -nP -tiTCP:"$2" -sTCP:LISTEN 2>/dev/null || true)"
+  printf '%s\n' "$pids" | while IFS= read -r pid; do
+    [ -n "$pid" ] && ps -o command= -p "$pid" 2>/dev/null | grep -q opencode && echo "$pid"
+  done
+}
+
+stop_server() {  # stop the recorded server (or an explicitly-named --port/--host)
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "error: --stop/--restart need lsof (brew install lsof)" >&2
+    return 1
+  fi
+  read_serve_args
+  # Safety: never guess a port. Use the recorded invocation; without one, only
+  # stop a server the caller explicitly named with --port/--host.
+  local sport="${RPORT:-}" shost="${RHOST:-}" pids
+  if [ -z "$sport" ]; then
+    if [ -z "$PORT_SET" ] && [ -z "$HOST_SET" ]; then
+      echo "error: no recorded server to stop — pass --port <N> [--host <addr>] explicitly" >&2
+      return 1
+    fi
+    sport="$PORT"; shost="$HOST"
+  fi
+  pids="$(server_pids "$shost" "$sport")"
+  if [ -z "$pids" ]; then
+    echo "no opencode server running on $shost:$sport"
+    return 0
+  fi
+  for pid in $pids; do
+    echo "stopping opencode server (pid $pid) on $shost:$sport"
+    kill "$pid" 2>/dev/null || true
+  done
+  local i
+  for i in $(seq 1 40); do [ -z "$(server_pids "$shost" "$sport")" ] && break; sleep 0.25; done
+  if [ -n "$(server_pids "$shost" "$sport")" ]; then
+    echo "graceful stop timed out; forcing SIGKILL" >&2
+    for pid in $(server_pids "$shost" "$sport"); do kill -9 "$pid" 2>/dev/null || true; done
+    sleep 1
+  fi
+  if [ -n "$(server_pids "$shost" "$sport")" ]; then
+    echo "error: could not stop server on $shost:$sport" >&2
+    return 1
+  fi
+  echo "stopped: opencode server on $shost:$sport"
+  rm -f "$SERVE_ARGS_FILE"
+  [ "$SERVER_NAME" = "default" ] && rm -f "${TMPDIR:-/tmp}/opencode-serve/serve.args"
+  return 0
 }
 
 ensure_server() {  # auto-start in $DIR if none is reachable
   server_up && return 0
-  echo "no opencode server at $BASE_URL — starting one in ${DIR}…" >&2
+  echo "no opencode server ($SERVER_NAME) at $BASE_URL — starting one in ${DIR}…" >&2
   start_server "$DIR" || { echo "error: server did not start; see $SERVE_LOG" >&2; exit 6; }
 }
 
@@ -305,7 +875,40 @@ if [ "$MODE" = "setup" ]; then
   echo "opencode:  $(command -v opencode)"
   opencode --version 2>/dev/null | sed 's/^/version:   /' || true
   echo "config:    $HOME/.config/opencode/opencode.json"
-  echo "server:    $BASE_URL  ($(server_up && echo UP || echo down))"
+  echo "servers:   $SERVERS_FILE"
+  # Every defined server, with its bind vs addressable split and live state.
+  # '*' marks the one this invocation resolves (--server / OPENCODE_DISPATCH_SERVER).
+  while IFS=$'\x1f' read -r n l h p d pw m; do
+    [ -n "$n" ] || continue
+    mark=" "; [ "$n" = "$SERVER_NAME" ] && mark="*"
+    # The marked row shows the RESOLVED values (CLI/env overrides applied).
+    if [ "$n" = "$SERVER_NAME" ]; then
+      l="$LISTEN"; h="$HOST"; p="$PORT"; d="$SERVE_DIR"; pw="$SERVE_PASSWORD"; m="$DEF_MODEL"
+    fi
+    url="http://${h}:${p}"
+    auth=(); [ -n "$pw" ] && auth=( --user "${SERVER_USERNAME:-opencode}:${pw}" )
+    if curl -sf -m 2 ${auth[@]:+"${auth[@]}"} "$url/session" -o /dev/null 2>/dev/null; then st="UP"; else st="down"; fi
+    printf '%s %-16s %-14s -> %-22s %-5s %s%s\n' "$mark" "$n" "listen:$l" "$h:$p" "$st" "${m:+model: $m }" "${d:+dir: $d}"
+  done < <(
+    SERVERS_FILE="$SERVERS_FILE" node - <<'EOF'
+      const fs = require("fs");
+      const file = process.env.SERVERS_FILE;
+      let defs = {};
+      if (fs.existsSync(file)) {
+        try { defs = JSON.parse(fs.readFileSync(file, "utf8")); }
+        catch (e) { console.error(`error: ${file} is not valid JSON: ${e.message}`); process.exit(1); }
+      }
+      const loopback = (a) => a === "localhost" || a === "::1" || /^127\./.test(a);
+      for (const [k, v] of Object.entries(defs)) {
+        if (k.startsWith("_")) continue;  // documentation keys
+        const listen = v.listen || "127.0.0.1";
+        const host = v.host || (loopback(listen) ? listen : "");
+        // The env password is the effective one for any profile without its own.
+        const pw = v.password || process.env.OPENCODE_SERVER_PASSWORD || "";
+        process.stdout.write([k, listen, host, v.port || "4096", v.dir || "", pw, v.model || ""].join("\x1f") + "\n");
+      }
+EOF
+  )
   echo "default model (dispatch): ${MODEL:-<opencode config default>}"
   echo "authenticated providers:"
   opencode auth list 2>/dev/null | sed 's/^/  /' || echo "  (none — run: opencode auth login)"
@@ -315,19 +918,76 @@ if [ "$MODE" = "setup" ]; then
 fi
 
 # ---- serve -------------------------------------------------------------------
+# Temp prompt/diff files (opencode-msg.* / opencode-diff.*) are left behind by
+# design (prune-recovery: a re-exec'd run re-reads its prompt file), and a
+# kill -9 leaks the diff file past the EXIT trap — so they accumulate in TMPDIR.
+# Every `serve` invocation prunes files older than the TTL (default 7 days;
+# OPENCODE_DISPATCH_PROMPT_TTL_DAYS). Only these exact prefixes in TMPDIR are
+# ever touched — never user-supplied --prompt-file paths.
+prune_prompt_files() {
+  local ttl="${OPENCODE_DISPATCH_PROMPT_TTL_DAYS:-7}"
+  case "$ttl" in
+    ''|*[!0-9]*) ttl=7 ;;
+  esac
+  [ -d "${TMPDIR:-/tmp}" ] || return 0
+  find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name 'opencode-msg.*' -o -name 'opencode-diff.*' \) -mtime "+${ttl}" -delete 2>/dev/null || true
+}
 if [ "$MODE" = "serve" ]; then
-  if server_up; then
-    echo "opencode server already running at $BASE_URL"
+  prune_prompt_files
+  if [ -n "$STOP" ] && [ -n "$RESTART" ]; then
+    echo "error: --stop and --restart are mutually exclusive" >&2; exit 2
+  fi
+  if [ -n "$STOP" ]; then
+    stop_server || exit 6
     exit 0
   fi
-  if start_server "$DIR"; then
+  if [ -n "$RESTART" ]; then
+    # Stop the RECORDED server first (it may be on a different port than any
+    # --port passed now), then reuse its args overridden by this command line.
+    # Without a record, only restart when the target is explicitly named.
+    read_serve_args
+    if [ -n "$RPORT" ]; then
+      stop_server || exit 6
+    elif { [ -n "$PORT_SET" ] || [ -n "$HOST_SET" ]; } && server_up; then
+      stop_server || exit 6
+    elif [ -z "$PORT_SET" ] && [ -z "$HOST_SET" ]; then
+      echo "error: no recorded server to restart — pass --port <N> [--host <addr>] explicitly" >&2
+      exit 2
+    fi
+    [ -z "$DIR_SET" ]  && [ -n "$RDIR" ]  && DIR="$RDIR"
+    [ -z "$PORT_SET" ] && [ -n "$RPORT" ] && PORT="$RPORT"
+    [ -z "$HOST_SET" ] && [ -n "$RHOST" ] && HOST="$RHOST"
+    BASE_URL="http://${HOST}:${PORT}"
+    if start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD"; then
+      write_serve_args "$DIR" "$PORT" "$HOST"
+      echo "opencode server restarted at $BASE_URL (dir: $DIR)"
+      [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (password from env/.env.local/profile)"
+      echo "log: $SERVE_LOG"
+      exit 0
+    fi
+    echo "error: server did not come up within ~9s; see $SERVE_LOG" >&2
+    tail -5 "$SERVE_LOG" >&2 2>/dev/null || true
+    exit 6
+  fi
+  if server_up; then
+    echo "opencode server '$SERVER_NAME' already running at $BASE_URL"
+    exit 0
+  fi
+  if start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD"; then
+    write_serve_args "$DIR" "$PORT" "$HOST"
     echo "opencode server started at $BASE_URL (dir: $DIR)"
+    [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (password from env/.env.local/profile)"
     echo "log: $SERVE_LOG"
     exit 0
   fi
   echo "error: server did not come up within ~9s; see $SERVE_LOG" >&2
   tail -5 "$SERVE_LOG" >&2 2>/dev/null || true
   exit 6
+fi
+
+# --stop/--restart are serve-only.
+if { [ -n "$STOP" ] || [ -n "$RESTART" ]; } && [ "$MODE" != "serve" ]; then
+  echo "error: --stop and --restart are only valid for 'serve'" >&2; exit 2
 fi
 
 # ---- sessions ----------------------------------------------------------------
@@ -359,7 +1019,13 @@ if [ "$MODE" = "history" ]; then
     echo "error: history needs a <sessionID> (see: $(basename "$0") sessions)" >&2
     exit 2
   fi
-  curl -sf -m 30 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" \
+  # Directory-scoped fetch first; a session rooted elsewhere (or a server that
+  # ignores the param) falls back to a bare fetch — the session id is unique
+  # server-wide, the directory is only a scoping hint.
+  HIST_RAW="$(curl -sf -m 30 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" 2>/dev/null)" \
+    || HIST_RAW="$(curl -sf -m 30 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" 2>/dev/null)" \
+    || { echo "error: session $SID not found (server unreachable or no such session)" >&2; exit 5; }
+  printf '%s' "$HIST_RAW" \
     | TAIL="$TAIL" TAIL_SET="$TAIL_SET" TURNS="$TURNS" SINCE="$SINCE" node -e '
       let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
         let msgs; try{msgs=JSON.parse(d)}catch(e){console.error("bad JSON from server");process.exit(1)}
@@ -396,11 +1062,12 @@ if [ "$MODE" = "history" ]; then
           for(const l of text.split("\n")) lines.push(l);
           lines.push("");
         }
-        // 4) line cap: explicit --tail always applies; otherwise default 100 UNLESS
-        //    --turns was given (then show whole turns un-truncated).
+        // 4) line cap: --tail always applies; otherwise default 100. The cap
+        //    applies AFTER the --turns window, so a giant single turn (the norm
+        //    for worker sessions) can never dump unbounded output — previously
+        //    turns>0 disabled the cap, making --turns look broken.
         const tailSet=!!process.env.TAIL_SET;
-        const cap = tailSet ? (parseInt(process.env.TAIL,10)||100)
-                            : (turns>0 ? Infinity : 100);
+        const cap = tailSet ? (parseInt(process.env.TAIL,10)||100) : 100;
         const out = lines.length>cap ? lines.slice(-cap) : lines;
         if(lines.length>cap) console.log(`… showing last ${cap} of ${lines.length} lines (raise --tail) …`);
         process.stdout.write(out.join("\n")+"\n");
@@ -414,43 +1081,75 @@ if [ "$MODE" = "status" ]; then
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
   if [ -z "$SID" ]; then
-    # No session ID: show one-line summary for every session, sorted newest first.
-    # Fetch the pending-permission session ids once so a parked ask can mark its
-    # session instead of a misleading plain "WORKING".
-    permsids="$(curl -sf -m 5 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/permission" 2>/dev/null \
-      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{for(const p of JSON.parse(d)){if(p.sessionID)console.log(p.sessionID)}}catch(e){}})' 2>/dev/null || true)"
+    # No session ID: one-line summary for every session. opencode's session JSON
+    # has NO lastMessage in 1.18.x, so "working" cannot come from the list —
+    # probe each shown session's last message (limit=1) concurrently, plus the
+    # two ask queues (/permission, /question) for parked state.
+    AUTH_B64=""
+    [ -n "${SERVE_PASSWORD:-}" ] && AUTH_B64="$(printf '%s' "${SERVER_USERNAME}:${SERVE_PASSWORD}" | base64)"
     curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" \
-      | BN="$(basename "$0")" PERMSIDS="$permsids" LIMIT="$TAIL" node -e '
-        let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+      | BASE_URL="$BASE_URL" AUTH_B64="$AUTH_B64" BN="$(basename "$0")" LIMIT="$TAIL" node -e '
+        let d=""; process.stdin.on("data",c=>d+=c).on("end",async()=>{
           let a; try{a=JSON.parse(d)}catch(e){console.error("bad JSON from server");process.exit(1)}
+          const base=process.env.BASE_URL, auth=process.env.AUTH_B64;
+          const hdr=auth?{authorization:"Basic "+auth}:{};
+          const jget=async(u)=>{const r=await fetch(base+u,{headers:hdr,signal:AbortSignal.timeout(5000)});if(!r.ok)throw new Error("http "+r.status);return r.json();};
+          let perms=new Map(), questions=new Map();
+          try{ for(const p of await jget("/permission")) if(p?.sessionID) perms.set(p.sessionID,"PERMASK ("+p.id+" "+p.permission+")"); }catch(e){}
+          try{ for(const q of await jget("/question")){ if(q?.sessionID){ const h=(q.questions||[])[0]; questions.set(q.sessionID,"QUESTION ("+q.id+" "+((h?.header||h?.question||"").slice(0,40))+")"); } } }catch(e){}
           const norm=t=>t&&t<1e12?t*1000:t;
+          const now=Date.now();
+          const fmt=ms=>{let x=Math.floor(ms/1000);const h=Math.floor(x/3600);x%=3600;const mi=Math.floor(x/60);const se=x%60;return (h?h+"h ":"")+(h||mi?mi+"m ":"")+se+"s";};
           a.sort((x,y)=>(norm(y?.time?.updated)||0)-(norm(x?.time?.updated)||0));
           const lim=parseInt(process.env.LIMIT,10)||50;
           const shown=a.slice(0,lim);
-          const now=Date.now();
-          const permset=new Set((process.env.PERMSIDS||"").split("\n").filter(Boolean));
-          const fmt=ms=>{let x=Math.floor(ms/1000);const h=Math.floor(x/3600);x%=3600;const mi=Math.floor(x/60);const se=x%60;return (h?h+"h ":"")+(h||mi?mi+"m ":"")+se+"s";};
-          let nperm=0;
-          for(const s of shown){
+          // working = last assistant message without time.completed; parked queues win.
+          // Also capture a stuck tool part (durable signal) so a WORKING row names
+          // the tool, and flag turns frozen >30m as STALE.
+          const states=await Promise.all(shown.map(async s=>{
+            if(perms.has(s.id)) return "PERMASK";
+            if(questions.has(s.id)) return "QUESTION";
+            try{
+              const dir=encodeURIComponent(s.directory||"");
+              const msgs=await jget("/session/"+s.id+"/message?directory="+dir+"&limit=1");
+              const m=(msgs||[])[(msgs||[]).length-1];
+              const li=m?.info||{};
+              const working=li.role==="assistant" && !(li.time&&li.time.completed);
+              if(!working) return "idle";
+              const parts=(m?.parts)||[];
+              let runPart=null;
+              for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){runPart=p;break;}}
+              const dur=runPart?.state?.time?.start?fmt(Math.max(0,now-runPart.state.time.start)):"";
+              const idle=now-(norm(s?.time?.updated)||0);
+              const tool=(runPart?("("+runPart.tool+(dur?"·"+dur:"")+")"):"");
+              return (idle>30*60*1000?"STALE":"WORKING")+tool;
+            }catch(e){ return "idle"; }
+          }));
+          let nparked=0, nwork=0;
+          shown.forEach((s,i)=>{
             const u=norm(s?.time?.updated)||0;
             const idle=now-u;
-            const li=s?.lastMessage?.info||{};
-            const working=li.role==="assistant"&&!(li.time&&li.time.completed);
-            const parked=permset.has(s.id);
-            if(parked) nperm++;
-            const state=working?(parked?"PERMASK":"WORKING"):"idle";
+            const state=states[i];
+            if(state==="PERMASK"||state==="QUESTION") nparked++;
+            if(state.startsWith("WORKING")) nwork++;
             const age=u?fmt(idle)+" ago":"?";
-            console.log(`${s.id}  ${state.padEnd(7)}  ${age.padStart(12)}  ${s.title||""}`);
-          }
-          if(nperm) console.log(`… ${nperm} session(s) parked on a permission prompt (see: ${process.env.BN} permissions / allow)`);
+            console.log(`${s.id}  ${state.padEnd(14)}  ${age.padStart(12)}  ${s.title||""}`);
+          });
+          if(nparked) console.log(`… ${nparked} session(s) parked on an ask (see: ${process.env.BN} permissions / allow)`);
+          if(nwork) console.log(`… ${nwork} session(s) working`);
           if(a.length>shown.length) console.log(`… ${a.length-shown.length} older session(s) not shown (raise --tail).`);
         });'
     exit 0
   fi
-  sess="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID?$DIR_Q")" || { echo "error: session not found" >&2; exit 5; }
-  msgs="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" || echo '[]')"
+  # Directory-scoped fetch first, bare fetch as fallback (see history mode).
+  sess="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID?$DIR_Q" 2>/dev/null)" \
+    || sess="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID" 2>/dev/null)" \
+    || { echo "error: session not found" >&2; exit 5; }
+  msgs="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" 2>/dev/null)" \
+    || msgs="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" 2>/dev/null)" \
+    || msgs="[]"
   parked="$(parked_permission "$SID")"
-  printf '{"session":%s,"messages":%s}' "$sess" "$msgs" | PARKED="$parked" node -e '
+  printf '{"session":%s,"messages":%s}' "$sess" "$msgs" | PARKED="$parked" BN="$(basename "$0")" node -e '
     let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
       const {session:s,messages:m}=JSON.parse(d);
       const parked=process.env.PARKED||"";
@@ -461,18 +1160,31 @@ if [ "$MODE" = "status" ]; then
       const last=Array.isArray(m)&&m.length?m[m.length-1]:null;
       const li=last?.info||{};
       const working = li.role==="assistant" && !(li.time&&li.time.completed);
+      // Durable stuck-tool signal: the newest assistant turn holds a tool part
+      // stuck in state.status "running" with no time.end. The ask queues are
+      // in-memory and die with a server restart while the session stays stuck,
+      // so this is what still names the stuck-ness after the queue is gone.
+      const parts=(last?.parts)||[];
+      let runPart=null;
+      for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){runPart=p;break;}}
       const lastErr = (Array.isArray(m)?m:[]).map(x=>x?.info?.error).filter(Boolean).pop();
       console.log("session:  "+s.id);
       console.log("title:    "+(s.title||""));
       console.log("model:    "+(s?.model?.providerID||"?")+"/"+(s?.model?.id||"?"));
       console.log("messages: "+(Array.isArray(m)?m.length:0)+"   cost: $"+(s.cost??0));
       console.log("updated:  "+(upd?new Date(upd).toISOString().replace("T"," ").slice(0,19):"?")+"  ("+fmt(idle)+" ago)");
-      // A WORKING flag with a long-frozen `updated` is a parked turn (typically
-      // an unanswerable permission ask on a headless server), not live work.
       const stale = working && idle > 30*60*1000;
       let state;
-      if (parked) state = "WORKING — PERMISSION PROMPT ("+parked+") — approve: opencode-dispatch.sh allow <requestID> [--always]";
-      else if (stale) state = "WORKING — STALE ("+fmt(idle)+" without activity; likely a dead turn — try 'abort')";
+      if (parked) {
+        const head=parked.startsWith("per_")?"PERMISSION PROMPT":"QUESTION ASK";
+        const act=parked.startsWith("per_")
+          ? "approve: "+process.env.BN+" allow <requestID> [--always]"
+          : "no reply path on a headless server (the agent is waiting on a human)";
+        state = "WORKING — "+head+" ("+parked+") — "+act+"   |   abort: "+process.env.BN+" abort "+s.id;
+      } else if (working && runPart) {
+        const d=runPart.state?.time?.start?fmt(Math.max(0,now-runPart.state.time.start)):"?";
+        state = "WORKING — TOOL RUNNING ("+(runPart.tool||"?")+" · "+d+", no ask in queue — likely parked on a lost prompt or a dead turn; abort if it never finishes)";
+      } else if (stale) state = "WORKING — STALE ("+fmt(idle)+" without activity; likely a dead turn — try "+process.env.BN+" abort "+s.id+")";
       else state = working ? "WORKING (turn in progress)" : "idle";
       console.log("state:    "+state);
       if(lastErr) console.log("lastError: "+(lastErr.name||"?")+" "+(lastErr.data?.statusCode||"")+" "+(lastErr.data?.message||""));
@@ -480,22 +1192,198 @@ if [ "$MODE" = "status" ]; then
   exit 0
 fi
 
+# ---- completion loops (shared by run modes and send) --------------------------
+# Two wait loops over a session's message stream. Run modes use them for
+# --follow / --background; send uses the SAME loops for its delivery modes
+# (--wait/--background select await_turn, the default is follow_turn) instead of
+# a hard-capped synchronous POST. ONE copy of each loop. $2 is the message count
+# that proves the turn finished: a fresh run-mode session reaches 2 (user prompt
+# + assistant reply); an EXISTING send session must count past its pre-submit
+# total (precount + 2), or the loop could break on the session's OLD idle state
+# the instant after submit and print a stale reply.
+follow_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits (0)
+  local SID="$1" minmsgs="${2:-2}"
+  local deadline last_beat now n st fails line tp ts qh ask prev_ask=""
+  echo "[$MODE] session $SID started; following (timeout ${FOLLOW_TIMEOUT}s)…" >&2
+  deadline=$(( $(date +%s) + FOLLOW_TIMEOUT ))
+  last_beat=0; fails=0
+  while :; do
+    line="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
+      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const a=JSON.parse(d);const l=a[a.length-1]?.info;const w=l&&l.role==="assistant"&&!(l.time&&l.time.completed);let tp="-",ts=0,qh="-";if(w){const parts=(a[a.length-1]?.parts)||[];for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){tp=p.tool||"-";ts=p.state?.time?.start||0;const q=(p.state?.input||{}).questions;if(q&&q[0])qh=(q[0].header||q[0].question||"").replace(/ /g,"_").slice(0,40)||"-";break;}}}process.stdout.write(a.length+" "+(w?"working":"idle")+" "+tp+" "+ts+" "+qh+"\n")});' 2>/dev/null)" || line=""
+    if [ -z "$line" ]; then
+      # dead server: fail fast like await_turn (exit 7) instead of spinning
+      # silently to the deadline looking hung.
+      fails=$((fails+1))
+      if [ "$fails" -ge 20 ]; then
+        echo "[$MODE] server unreachable for ~40s; giving up on $SID (may still be running server-side)." >&2
+        exit 7
+      fi
+      sleep 2; continue
+    fi
+    fails=0
+    read -r n st tp ts qh <<<"$line" || true
+    tp="${tp:--}"; qh="${qh:--}"
+    [ "${n:-0}" -ge "$minmsgs" ] && [ "$st" = "idle" ] && break
+    now=$(date +%s)
+    # Per-iteration ask polling while the turn works: announce a parked
+    # permission/question the MOMENT it appears (transition detection), not at
+    # the next 30s heartbeat. pending_ask falls back to the durable
+    # message-stream signal when the in-memory queues are empty/lost.
+    ask=""
+    if [ "$st" = "working" ]; then ask="$(pending_ask "$SID" "$tp" "$ts" "$qh")"; fi
+    if [ -n "$ask" ] && [ "$ask" != "$prev_ask" ]; then
+      echo "[$MODE] $SID PARKED on an ask (request $ask)" >&2
+      echo "        approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      prev_ask="$ask"; last_beat=$now
+    elif [ -z "$ask" ] && [ -n "$prev_ask" ]; then
+      echo "[$MODE] $SID ask resolved — resuming." >&2
+      prev_ask=""; last_beat=$now
+    fi
+    # Heartbeat every ~30s REGARDLESS of state — an idle-but-not-done wait
+    # (submit still landing, or a slow server) used to be silent and read as
+    # hung. While parked, the ask is repeated; while working, name the tool
+    # that has been running longest. Follow has no stall guard.
+    if [ $(( now - last_beat )) -ge 30 ]; then
+      if [ -n "$ask" ]; then
+        echo "[$MODE] $SID still parked on ask (request $ask) — approve: $(basename "$0") allow <requestID> [--always] | abort: $(basename "$0") abort $SID" >&2
+      elif [ "$st" = "working" ]; then
+        local tooltxt=""
+        [ "$tp" != "-" ] && tooltxt=" (tool: $tp · $(( now - ${ts:-0}/1000 ))s)"
+        echo "[$MODE] $SID working… ${n:-0} msgs$tooltxt" >&2
+      else
+        echo "[$MODE] $SID waiting… ${n:-0} msgs (turn not started or no new activity yet)" >&2
+      fi
+      last_beat=$now
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      if [ -n "$ask" ]; then
+        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s (parked on an ask: $ask)." >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      else
+        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s." >&2
+        echo "watch: $(basename "$0") status $SID | $(basename "$0") history $SID --turns 1 | $(basename "$0") abort $SID" >&2
+      fi
+      exit 0
+    fi
+    sleep 1.5
+  done
+  curl -sf -m 15 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
+    | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let a;try{a=JSON.parse(d)}catch(ex){console.error("error: invalid response from server ("+ex.message+")");process.exit(1);}const asst=a.filter(m=>m.info?.role==="assistant");const last=asst[asst.length-1];const e=last?.info?.error;if(e){console.error("ERROR "+(e.data?.statusCode||"")+" "+(e.data?.message||e.name||""));process.exit(1);}const t=(last?.parts||[]).filter(p=>p.type==="text"&&p.text).map(p=>p.text).join("\n").trim();console.log(t);});'
+  echo "(session: $SID)" >&2
+  exit 0
+}
+
+# ---- --background/--wait: block to COMPLETION, print distilled result, then EXIT ----
+# Unlike follow_turn (bounded, then leaves it running), await_turn lives exactly
+# as long as the turn: it exits 0 the moment the turn completes. Launch it as a
+# background task and the caller is re-invoked on that exit — wake-on-complete.
+# Exit codes: 3 = backstop timeout (still running server-side), 7 = server
+# unreachable, 8 = stall (hung turn / parked ask).
+await_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits
+  local SID="$1" minmsgs="${2:-2}"
+  local unbounded deadline fails prev_mx last_change last_beat now line n st he mx
+  local tp ts qh ask prev_ask=""
+  local sinfo qdir sbody got=""
+  echo "[$MODE] session $SID started in the background; waiting for completion (stall guard ${STALL_SECS}s)…" >&2
+  unbounded=0; [ "$FOLLOW_TIMEOUT" = "0" ] && unbounded=1
+  deadline=$(( $(date +%s) + FOLLOW_TIMEOUT ))
+  fails=0
+  # Progress/stall tracking: `mx` is the newest message timestamp the server
+  # reports; while it advances the turn is doing work. If it freezes for
+  # STALL_SECS we bail (hung turn). A throttled heartbeat to stderr every ~30s
+  # makes a backgrounded run tailable instead of silent.
+  prev_mx=""; last_change=$(date +%s); last_beat=0
+  while :; do
+    line="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
+      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const l=a[a.length-1]&&a[a.length-1].info;const w=l&&l.role==="assistant"&&!(l.time&&l.time.completed);const e=(l&&l.role==="assistant"&&l.error)?1:0;let mx=0;for(const m of a){const t=m.info&&m.info.time;if(t)for(const k in t){const v=t[k];if(typeof v==="number"&&v>mx)mx=v;}}let tp="-",ts=0,qh="-";if(w){const parts=(a[a.length-1]?.parts)||[];for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){tp=p.tool||"-";ts=p.state?.time?.start||0;const q=(p.state?.input||{}).questions;if(q&&q[0])qh=(q[0].header||q[0].question||"").replace(/ /g,"_").slice(0,40)||"-";break;}}}process.stdout.write(a.length+" "+(w?"working":"idle")+" "+e+" "+mx+" "+tp+" "+ts+" "+qh+"\n")}catch(x){process.exit(1)}})' 2>/dev/null)" || line=""
+    if [ -z "$line" ]; then
+      fails=$((fails+1))
+      if [ "$fails" -ge 20 ]; then
+        echo "[$MODE] server unreachable for ~40s; giving up on $SID (may still be running server-side)." >&2
+        exit 7
+      fi
+      sleep 2; continue
+    fi
+    fails=0
+    read -r n st he mx tp ts qh <<<"$line" || true
+    tp="${tp:--}"; qh="${qh:--}"
+    [ "${he:-0}" = "1" ] && break
+    { [ "${n:-0}" -ge "$minmsgs" ] && [ "$st" = "idle" ]; } && break
+    now=$(date +%s)
+    # reset the stall clock whenever the newest timestamp moves
+    if [ "${mx:-0}" != "${prev_mx:-}" ]; then prev_mx="${mx:-0}"; last_change=$now; fi
+    # Per-iteration ask polling while the turn works: announce a parked
+    # permission/question the MOMENT it appears (transition detection), not at
+    # the next 30s heartbeat. pending_ask falls back to the durable
+    # message-stream signal when the in-memory queues are empty/lost.
+    ask=""
+    if [ "$st" = "working" ]; then ask="$(pending_ask "$SID" "$tp" "$ts" "$qh")"; fi
+    if [ -n "$ask" ] && [ "$ask" != "$prev_ask" ]; then
+      echo "[$MODE] $SID PARKED on an ask (request $ask)" >&2
+      echo "        approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      prev_ask="$ask"; last_beat=$now
+    elif [ -z "$ask" ] && [ -n "$prev_ask" ]; then
+      echo "[$MODE] $SID ask resolved — resuming." >&2
+      prev_ask=""; last_beat=$now
+    fi
+    # Heartbeat every ~30s REGARDLESS of state — an idle-but-not-done wait
+    # (submit still landing, or a slow server) used to be silent and read as
+    # hung. While parked, the ask is repeated; while working, name the tool
+    # that has been running longest. The stall guard still governs hung turns.
+    if [ $(( now - last_beat )) -ge 30 ]; then
+      if [ -n "$ask" ]; then
+        echo "[$MODE] $SID still parked on ask (request $ask) — approve: $(basename "$0") allow <requestID> [--always] | abort: $(basename "$0") abort $SID" >&2
+      elif [ "$st" = "working" ]; then
+        local tooltxt=""
+        [ "$tp" != "-" ] && tooltxt=" (tool: $tp · $(( now - ${ts:-0}/1000 ))s)"
+        echo "[$MODE] $SID working… ${n:-0} msgs, $(( now - last_change ))s since last activity$tooltxt" >&2
+      else
+        echo "[$MODE] $SID waiting… ${n:-0} msgs (turn not started or no new activity yet)" >&2
+      fi
+      last_beat=$now
+    fi
+    # stall bail: newest timestamp frozen for STALL_SECS → hung turn. Name the
+    # parked-ask case explicitly — it is NOT hung, just waiting on a human.
+    if [ "${STALL_SECS:-0}" -gt 0 ] && [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
+      if [ -n "$ask" ]; then
+        echo "[$MODE] session $SID STALLED: parked on an ask for ${STALL_SECS}s (request $ask)." >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      else
+        echo "[$MODE] session $SID STALLED: no activity for ${STALL_SECS}s (likely a hung turn); giving up." >&2
+        echo "watch: $(basename "$0") status $SID   |   abort: $(basename "$0") abort $SID" >&2
+      fi
+      exit 8
+    fi
+    if [ "$unbounded" -eq 0 ] && [ "$now" -ge "$deadline" ]; then
+      if [ -n "$ask" ]; then
+        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s (parked on an ask: $ask)." >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      else
+        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s; exiting non-zero (still running server-side)." >&2
+        echo "watch: $(basename "$0") status $SID" >&2
+      fi
+      exit 3
+    fi
+    sleep 2
+  done
+
+  # default distilled output: the final assistant message (reviews/plans are already tight)
+  curl -sf -m 15 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
+    | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let a;try{a=JSON.parse(d)}catch(ex){console.error("error: invalid response from server ("+ex.message+")");process.exit(1);}const asst=a.filter(m=>m.info?.role==="assistant");const last=asst[asst.length-1];const e=last?.info?.error;if(e){console.error("ERROR "+(e.data?.statusCode||"")+" "+(e.data?.message||e.name||""));process.exit(1);}const t=(last?.parts||[]).filter(p=>p.type==="text"&&p.text).map(p=>p.text).join("\n").trim();console.log(t);});'
+  echo "(session: $SID)" >&2
+  exit 0
+}
+
 # ---- send --------------------------------------------------------------------
 if [ "$MODE" = "send" ]; then
   require_server
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
-  [ -z "$SID" ] && { echo "error: send needs a <sessionID> and --prompt-file <path>" >&2; exit 2; }
-  # PROMPT FILES EXCLUSIVELY: inline message words would sit in this process's
-  # argv for the whole (possibly minutes-long) run, visible to every user via
-  # `ps` — and inline text can't be re-read by the worker after context
-  # pruning. Write the message to a file and pass --prompt-file.
-  if [ "${#MSG_PARTS[@]}" -gt 1 ]; then
-    echo "error: inline send messages are no longer accepted (argv leaks to the OS process list)." >&2
-    echo "  Write the message to a file and run: $(basename "$0") send $SID --prompt-file <path>" >&2
-    exit 2
-  fi
-  [ -n "$PROMPT_FILE" ] || { echo "error: send needs --prompt-file <path> after the sessionID" >&2; exit 2; }
+  [ -z "$SID" ] && { echo "error: send needs a <sessionID> and a message (positional or --prompt-file <path>)" >&2; exit 2; }
+  # The positional message (if any) was already converted to --prompt-file by
+  # the re-exec at the top of this script, so the message text never stays in
+  # this process's argv for the run.
+  [ -n "$PROMPT_FILE" ] || { echo "error: send needs a message after the sessionID (or --prompt-file <path>)" >&2; exit 2; }
   [ -r "$PROMPT_FILE" ] || { echo "error: --prompt-file not readable: $PROMPT_FILE" >&2; exit 2; }
   MSG="$(cat "$PROMPT_FILE")"
   [ -n "$MSG" ] && MSG="$MSG
@@ -511,11 +1399,29 @@ if [ "$MODE" = "send" ]; then
       | DELIVERY="$delivery" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);console.log(`${process.env.DELIVERY} admitted: seq=${j.data?.admittedSeq} id=${j.data?.id}`);}catch(e){console.log(d);}});'
     echo "(poll with: $(basename "$0") status $SID   /   history $SID --turns 1)"
   else
-    # default: blocking send, return the reply text
-    MSG="$MSG" node -e 'process.stdout.write(JSON.stringify({parts:[{type:"text",text:process.env.MSG}]}));' \
-      | curl -sf -m 300 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/session/$SID/message?$DIR_Q" \
-          -H 'content-type: application/json' --data-binary @- \
-      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let j;try{j=JSON.parse(d)}catch(ex){console.error("error: invalid response from server ("+ex.message+")");process.exit(1);}const e=j.info?.error;if(e){console.error("ERROR: "+(e.name||"?")+" "+(e.data?.statusCode||"")+" "+(e.data?.message||""));process.exit(1);}const t=(j.parts||[]).filter(p=>p.type==="text"&&p.text).map(p=>p.text).join("\n").trim();console.log(t);});'
+    # Default delivery (and --wait/--background/--follow): async submit via
+    # prompt_async (same as the run modes), then the shared completion loop —
+    # no more hard 300s curl cap that died on long turns. --wait/--background
+    # select await_turn (24h backstop, stall guard, parked-permission heartbeat,
+    # exit codes 3/7/8); the default is follow_turn (300s bounded, exits 0 on
+    # timeout and leaves the turn running, matching --follow).
+    msgfile="$(mktemp "${TMPDIR:-/tmp}/opencode-msg.XXXXXX")"
+    trap 'rm -f "$msgfile"' EXIT
+    printf '%s' "$MSG" > "$msgfile"
+    # Pre-submit message count: the loops break on idle + N messages, and an
+    # existing session is already idle with history — without counting past the
+    # pre-submit total the loop could break on the OLD idle state and print a
+    # stale reply before the new turn even starts.
+    precount="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" 2>/dev/null \
+      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).length))}catch(e){process.stdout.write("0")}});')"
+    precount="${precount:-0}"
+    oc_submit_async "$SID" "$msgfile" || { echo "error: could not submit message to $SID" >&2; exit 5; }
+    if [ -n "$AWAIT" ]; then
+      await_turn "$SID" "$((precount + 2))"
+    else
+      follow_turn "$SID" "$((precount + 2))"
+    fi
+    exit 0
   fi
   exit 0
 fi
@@ -571,8 +1477,13 @@ if [ "$MODE" = "allow" ]; then
   RID="${MSG_PARTS[0]:-}"
   [ -z "$RID" ] && { echo "error: allow needs a <requestID> (see: $(basename "$0") permissions)" >&2; exit 2; }
   REPLY="once"; [ -n "$ALWAYS" ] && REPLY="always"
+  # NO ?directory= here: the reply endpoint VALIDATES it against the session's
+  # own directory and 404s (PermissionNotFoundError) on any mismatch — verified
+  # on 1.18.9 — so passing the wrapper's cwd made `allow` flaky whenever the
+  # parked session lived in another directory (e.g. --task resolution, or a
+  # server started elsewhere). The bare POST is the working contract.
   REPLY="$REPLY" node -e 'process.stdout.write(JSON.stringify({reply:process.env.REPLY}));' \
-    | curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/permission/$RID/reply?$DIR_Q" \
+    | curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/permission/$RID/reply" \
         -H 'content-type: application/json' --data-binary @- -o /dev/null \
     || { echo "error: reply failed (request not found, already resolved, or server unreachable)" >&2; exit 5; }
   echo "allowed $RID ($REPLY)"
@@ -581,17 +1492,11 @@ fi
 
 # ---- run modes (review|plan|ask|task|bulk) -----------------------------------
 # DEFAULT: server-backed + async (observable via status/history, killable via
-# abort). Opt into a one-shot, non-server, blocking run with --synchronous.
-# PROMPT FILES EXCLUSIVELY (run modes): inline prompt words would sit in this
-# process's argv for the whole run (visible via `ps` to every user of the host)
-# and can't be re-read by the worker after opencode's context pruning truncates
-# old tool output. All run-mode messages come from --prompt-file; positional
-# prompt text is rejected with guidance.
-if [ "${#MSG_PARTS[@]}" -gt 0 ]; then
-  echo "error: inline prompt text is no longer accepted for run modes (argv leaks to the OS process list; pruned contexts can't re-read it)." >&2
-  echo "  Write the prompt to a file and run: $(basename "$0") $MODE [flags] --prompt-file <path>" >&2
-  exit 2
-fi
+# abort). Opt into a one-shot, non-server, blocking run with --direct.
+# The message comes from --prompt-file, or from positional prompt text that the
+# re-exec at the top of this script already converted to a prompt file — so the
+# prompt never sits in this process's argv for the run, and a pruned session
+# context can always re-read the file.
 MSG=""
 if [ -n "$PROMPT_FILE" ]; then
   [ -r "$PROMPT_FILE" ] || { echo "error: --prompt-file not readable: $PROMPT_FILE" >&2; exit 2; }
@@ -599,7 +1504,7 @@ if [ -n "$PROMPT_FILE" ]; then
 fi
 # review may run with no message (default intro); every other run mode needs one.
 if [ "$MODE" != "review" ] && [ -z "$MSG" ]; then
-  echo "error: $MODE needs --prompt-file <path> (inline prompts are not accepted)" >&2; exit 2
+  echo "error: $MODE needs a prompt (positional text or --prompt-file <path>)" >&2; exit 2
 fi
 
 case "$MODE" in
@@ -617,6 +1522,9 @@ AGENT_USE="${AGENT:-$AGENT_DEF}"
 if [ -n "$PR" ] && [ "$MODE" != "review" ]; then
   echo "error: --pr is only valid for 'review'" >&2; exit 2
 fi
+if [ -n "$SCOPE" ] && [ "$MODE" != "review" ]; then
+  echo "error: --scope is only valid for 'review' (edit workers always operate on their allocated worktree)" >&2; exit 2
+fi
 diff=""
 if [ "$MODE" = "review" ]; then
   diff="$(mktemp "${TMPDIR:-/tmp}/opencode-diff.XXXXXX")"
@@ -627,10 +1535,31 @@ if [ "$MODE" = "review" ]; then
       echo "error: --pr needs the GitHub CLI (gh). Install: brew install gh; then: gh auth login" >&2
       exit 4
     fi
-    if ! ( cd "$DIR" 2>/dev/null && gh pr diff "$PR" ) > "$diff" 2>/dev/null; then
-      echo "error: could not fetch diff for PR #$PR (gh pr diff failed — check the number, repo, and 'gh auth status')." >&2
+    # gh resolves a bare PR number from the CURRENT repo's git remote. The
+    # dispatch can run from a directory with no remotes (e.g. a skill repo),
+    # where gh dies with "no git remotes found" — take an explicit --repo
+    # owner/repo, or infer it from $DIR's origin remote.
+    if [ -z "$REPO" ]; then
+      REPO="$(git -C "$DIR" config --get remote.origin.url 2>/dev/null \
+        | sed -E 's#^(https?://[^/]+/|ssh://[^/]+/|git@[^:]+:)##; s#\.git$##' || true)"
+    fi
+    if [ -z "$REPO" ]; then
+      echo "error: could not determine the GitHub repo for PR #$PR (no git remote in $DIR)." >&2
+      echo "  Pass --repo owner/repo explicitly." >&2
       exit 5
     fi
+    if ! ( cd "$DIR" 2>/dev/null && gh pr diff "$PR" --repo "$REPO" ) > "$diff" 2>/dev/null; then
+      echo "error: could not fetch diff for PR #$PR from $REPO (gh pr diff failed — check --repo, the PR number, and 'gh auth status')." >&2
+      exit 5
+    fi
+  elif [ "$SCOPE" = "working-tree" ]; then
+    # --scope working-tree: uncommitted changes only, whatever --base says.
+    [ -n "$BASE" ] && { echo "error: --scope working-tree conflicts with --base" >&2; exit 2; }
+    git -C "$DIR" diff HEAD > "$diff" 2>/dev/null || git -C "$DIR" diff > "$diff"
+  elif [ "$SCOPE" = "branch" ]; then
+    # --scope branch: the branch range --base<ref>...HEAD — the job's base branch.
+    [ -n "$BASE" ] || { echo "error: --scope branch needs --base <ref> (the base branch for the job)" >&2; exit 2; }
+    git -C "$DIR" diff "$BASE"...HEAD > "$diff" 2>/dev/null || git -C "$DIR" diff "$BASE" > "$diff"
   elif [ -n "$BASE" ]; then
     git -C "$DIR" diff "$BASE"...HEAD > "$diff" 2>/dev/null || git -C "$DIR" diff "$BASE" > "$diff"
   else
@@ -641,7 +1570,7 @@ else
   [ -z "$MSG" ] && { echo "error: a message/task is required" >&2; exit 2; }
 fi
 
-if [ -n "$SYNC" ]; then
+if [ -n "$DIRECT" ]; then
   # ---- OPT-IN: one-shot, non-server, blocking (returns output inline) ----
   COMMON=( run --dir "$DIR" )
   [ -n "$MODEL" ]   && COMMON+=( -m "$MODEL" )
@@ -651,13 +1580,22 @@ if [ -n "$SYNC" ]; then
       review)
         prompt="${MSG:-Review the attached ${PR:+GitHub PR #$PR }diff.} Report concrete issues only; cite file:line."
         # -f is a greedy array flag: prompt BEFORE it, -f terminal with one value.
+        # --auto kept for review: its config EXPLICITLY denies edit/webfetch, so
+        # --auto cannot unlock them (auto only approves what is not denied);
+        # bash is explicitly allowed (git reads). Verified on opencode 1.18.9.
         exec opencode "${COMMON[@]}" --agent "$AGENT_USE" --auto "$prompt" -f "$diff"
         ;;
       plan|ask)
-        exec opencode "${COMMON[@]}" --agent "$AGENT_USE" --auto "$MSG"
+        # NO --auto for plan/ask: the plan agent's bash is already allowed by
+        # opencode's default (`*` allow; no bash rule in the plan agent), so
+        # --auto adds nothing — it would only auto-approve the external_directory
+        # and doom_loop asks that are plan's remaining read-only guards. Verified
+        # on opencode 1.18.9 (agent list + live bash probe). --auto IS kept for
+        # review below, whose edit/webfetch are explicitly denied.
+        exec opencode "${COMMON[@]}" --agent "$AGENT_USE" "$MSG"
         ;;
     task|bulk)
-      echo "error: --synchronous is not supported for edit-capable task/bulk workers; use the isolated server-backed path" >&2
+      echo "error: --direct is not supported for edit-capable task/bulk workers; use the isolated server-backed path" >&2
       exit 2
       ;;
   esac
@@ -753,7 +1691,7 @@ SID="$(oc_create_session "$AGENT_USE" "$MODEL" "$VARIANT" "$title" "$perm")" || 
 oc_submit_async "$SID" "$msgfile" "$AGENT_USE" || { echo "error: could not submit prompt to $SID" >&2; exit 5; }
 
 # Early worktree-mismatch guard. Server-backed sessions run in the SERVER's cwd,
-# not --dir; --follow/--await exit before the final banner's NOTE, so warn up
+# not --dir; --follow/--background exit before the final banner's NOTE, so warn up
 # front for those. Only task/bulk edit the tree (review uploads a diff captured
 # from --dir), so scope it to them. Catches the "N subagents, one shared tree"
 # mistake — they all edit the SAME server cwd; they do NOT get separate worktrees.
@@ -775,152 +1713,17 @@ fi
 fi
 
 if [ -n "$FOLLOW" ]; then
-  echo "[$MODE] session $SID started; following (timeout ${FOLLOW_TIMEOUT}s)…" >&2
-  deadline=$(( $(date +%s) + FOLLOW_TIMEOUT ))
-  last_beat=0
-  while :; do
-    read -r n st < <(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
-      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const a=JSON.parse(d);const l=a[a.length-1]?.info;const w=l&&l.role==="assistant"&&!(l.time&&l.time.completed);process.stdout.write(a.length+" "+(w?"working":"idle")+"\n")});' 2>/dev/null) || true
-    [ "${n:-0}" -ge 2 ] && [ "$st" = "idle" ] && break
-    now=$(date +%s)
-    # follow has no stall guard, so a parked permission ask would otherwise sit
-    # silent until timeout: heartbeat the parked state at ~30s while working.
-    if [ "$st" = "working" ] && [ $(( now - last_beat )) -ge 30 ]; then
-      parked="$(parked_permission "$SID")"
-      if [ -n "$parked" ]; then
-        echo "[$MODE] $SID Permissions prompt (request $parked) — approve: $(basename "$0") allow <requestID> [--always]" >&2
-      else
-        echo "[$MODE] $SID working… ${n:-0} msgs" >&2
-      fi
-      last_beat=$now
-    fi
-    if [ "$now" -ge "$deadline" ]; then
-      if [ -n "${parked:-}" ]; then
-        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s (parked on a permission prompt: $parked)." >&2
-        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
-      else
-        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s." >&2
-        echo "watch: $(basename "$0") status $SID | $(basename "$0") history $SID --turns 1 | $(basename "$0") abort $SID" >&2
-      fi
-      exit 0
-    fi
-    sleep 1.5
-  done
-  curl -sf -m 15 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
-    | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let a;try{a=JSON.parse(d)}catch(ex){console.error("error: invalid response from server ("+ex.message+")");process.exit(1);}const asst=a.filter(m=>m.info?.role==="assistant");const last=asst[asst.length-1];const e=last?.info?.error;if(e){console.error("ERROR "+(e.data?.statusCode||"")+" "+(e.data?.message||e.name||""));process.exit(1);}const t=(last?.parts||[]).filter(p=>p.type==="text"&&p.text).map(p=>p.text).join("\n").trim();console.log(t);});'
-  echo "(session: $SID)" >&2
+  follow_turn "$SID"   # always exits (reply print, or timeout -> exit 0)
   exit 0
 fi
 
-# ---- --await: block to COMPLETION, print distilled result, then EXIT ----------
-# Unlike --follow (bounded, then leaves it running), --await lives exactly as long
-# as the turn: it exits 0 the moment the turn completes. Launch it as a background
-# task and the caller (Claude Code) is re-invoked on that exit — wake-on-complete.
+# ---- --background/--wait: block to COMPLETION, print distilled result, then EXIT ----
+# Unlike --follow (bounded, then leaves it running), --background/--wait live
+# exactly as long as the turn: they exit 0 the moment the turn completes. Launch
+# the wrapper as a background task and the caller (Claude Code) is re-invoked on
+# that exit — wake-on-complete.
 if [ -n "$AWAIT" ]; then
-  echo "[$MODE] session $SID started; awaiting completion (stall guard ${STALL_SECS}s)…" >&2
-  unbounded=0; [ "$FOLLOW_TIMEOUT" = "0" ] && unbounded=1
-  deadline=$(( $(date +%s) + FOLLOW_TIMEOUT ))
-  fails=0
-  # Progress/stall tracking: `mx` is the newest message timestamp the server
-  # reports; while it advances the turn is doing work. If it freezes for
-  # STALL_SECS we bail (hung turn). A throttled heartbeat to stderr every ~30s
-  # makes a backgrounded run tailable instead of silent.
-  prev_mx=""; last_change=$(date +%s); last_beat=0
-  while :; do
-    line="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
-      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const l=a[a.length-1]&&a[a.length-1].info;const w=l&&l.role==="assistant"&&!(l.time&&l.time.completed);const e=(l&&l.role==="assistant"&&l.error)?1:0;let mx=0;for(const m of a){const t=m.info&&m.info.time;if(t)for(const k in t){const v=t[k];if(typeof v==="number"&&v>mx)mx=v;}}process.stdout.write(a.length+" "+(w?"working":"idle")+" "+e+" "+mx+"\n")}catch(x){process.exit(1)}})' 2>/dev/null)" || line=""
-    if [ -z "$line" ]; then
-      fails=$((fails+1))
-      if [ "$fails" -ge 20 ]; then
-        echo "[$MODE] server unreachable for ~40s; giving up on $SID (may still be running server-side)." >&2
-        exit 7
-      fi
-      sleep 2; continue
-    fi
-    fails=0
-    read -r n st he mx <<<"$line" || true
-    [ "${he:-0}" = "1" ] && break
-    { [ "${n:-0}" -ge 2 ] && [ "$st" = "idle" ]; } && break
-    now=$(date +%s)
-    # reset the stall clock whenever the newest timestamp moves
-    if [ "${mx:-0}" != "${prev_mx:-}" ]; then prev_mx="${mx:-0}"; last_change=$now; fi
-    # tailable heartbeat, throttled to every ~30s. While working, ALSO poll the
-    # server's pending-permission list for THIS session: a turn parked on an
-    # unanswered ask (headless server, no TUI) reads as "working" forever, so
-    # say "Permissions prompt" instead of "working" and point at `allow`.
-    if [ "$st" = "working" ] && [ $(( now - last_beat )) -ge 30 ]; then
-      parked="$(parked_permission "$SID")"
-      if [ -n "$parked" ]; then
-        echo "[$MODE] $SID Permissions prompt (request $parked) — approve: $(basename "$0") allow <requestID> [--always]" >&2
-      else
-        echo "[$MODE] $SID working… ${n:-0} msgs, $(( now - last_change ))s since last activity" >&2
-      fi
-      last_beat=$now
-    fi
-    # stall bail: newest timestamp frozen for STALL_SECS → hung turn. Name the
-    # parked-permission case explicitly — it is NOT hung, just waiting on a human.
-    if [ "${STALL_SECS:-0}" -gt 0 ] && [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
-      parked="$(parked_permission "$SID")"
-      if [ -n "$parked" ]; then
-        echo "[$MODE] session $SID STALLED: parked on a permission prompt for ${STALL_SECS}s (request $parked)." >&2
-        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
-      else
-        echo "[$MODE] session $SID STALLED: no activity for ${STALL_SECS}s (likely a hung turn); giving up." >&2
-        echo "watch: $(basename "$0") status $SID   |   abort: $(basename "$0") abort $SID" >&2
-      fi
-      exit 8
-    fi
-    if [ "$unbounded" -eq 0 ] && [ "$now" -ge "$deadline" ]; then
-      parked="$(parked_permission "$SID")"
-      if [ -n "$parked" ]; then
-        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s (parked on a permission prompt: $parked)." >&2
-        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
-      else
-        echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s; exiting non-zero (still running server-side)." >&2
-        echo "watch: $(basename "$0") status $SID" >&2
-      fi
-      exit 3
-    fi
-    sleep 2
-  done
-
-  # --summarize: produce a REMOTE summary on the delegate model; print only that.
-  # /summarize requires ?directory=<sessiondir> and a body {providerID,modelID};
-  # it appends an ASSISTANT message with summary:true whose text is the digest.
-  # (A user message's `summary` is a diff-stats object — must NOT match it.)
-  if [ -n "$SUMMARIZE" ]; then
-    sinfo="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID" 2>/dev/null || echo '{}')"
-    qdir=""; sbody=""
-    { IFS= read -r qdir; IFS= read -r sbody; } < <(printf '%s' "$sinfo" | SMODEL="$MODEL" node -e '
-      let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
-        let o={};try{o=JSON.parse(d)}catch(e){}
-        let prov=(o.model&&o.model.providerID)||"", mod=(o.model&&o.model.id)||"";
-        const sm=process.env.SMODEL||""; const i=sm.indexOf("/");
-        if(i>0){prov=sm.slice(0,i);mod=sm.slice(i+1);}
-        process.stdout.write(encodeURIComponent(o.directory||"")+"\n"+JSON.stringify({providerID:prov,modelID:mod})+"\n");
-      });') || true
-    if [ -n "$qdir" ] && [ -n "$sbody" ]; then
-      curl -sf -m 30 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/session/$SID/summarize?directory=$qdir" \
-        -H 'content-type: application/json' --data-binary "$sbody" -o /dev/null 2>/dev/null || true
-      got=""
-      for _ in $(seq 1 30); do
-        got="$(curl -sf -m 15 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
-          | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const a=JSON.parse(d);const s=a.filter(m=>m.info&&m.info.role==="assistant"&&m.info.summary===true);const pick=s.length?s[s.length-1]:null;if(!pick)process.exit(2);const t=(pick.parts||[]).filter(p=>p.type==="text"&&p.text).map(p=>p.text).join("\n").trim();if(!t)process.exit(2);process.stdout.write(t)})' 2>/dev/null)" && [ -n "$got" ] && break
-        sleep 1.5
-      done
-      if [ -n "$got" ]; then
-        printf '%s\n' "$got"
-        echo "(remote summary of session: $SID)" >&2
-        exit 0
-      fi
-    fi
-    echo "(summarize unavailable; printing final message instead)" >&2
-  fi
-
-  # default distilled output: the final assistant message (reviews/plans are already tight)
-  curl -sf -m 15 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
-    | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let a;try{a=JSON.parse(d)}catch(ex){console.error("error: invalid response from server ("+ex.message+")");process.exit(1);}const asst=a.filter(m=>m.info?.role==="assistant");const last=asst[asst.length-1];const e=last?.info?.error;if(e){console.error("ERROR "+(e.data?.statusCode||"")+" "+(e.data?.message||e.name||""));process.exit(1);}const t=(last?.parts||[]).filter(p=>p.type==="text"&&p.text).map(p=>p.text).join("\n").trim();console.log(t);});'
-  echo "(session: $SID)" >&2
+  await_turn "$SID"   # always exits: 0 done, 3 timeout, 7 unreachable, 8 stall
   exit 0
 fi
 
@@ -931,6 +1734,6 @@ echo "  agent:   $AGENT_USE    model: ${MODEL:-<opencode default>}"
 echo "  dir:     ${sdir:-?}"
 if { [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; } && [ -n "$sdir" ] && [ "$sdir" != "$DIR" ]; then
   echo "  NOTE: session runs in the SERVER's dir, which differs from --dir ($DIR)."
-  echo "        Edits land in the session dir. Start the server there, or use --synchronous."
+  echo "        Edits land in the session dir. Start the server there, or use --direct."
 fi
 echo "  watch:   $(basename "$0") status $SID   |   $(basename "$0") history $SID --turns 1   |   $(basename "$0") abort $SID"
