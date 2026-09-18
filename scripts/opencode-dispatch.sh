@@ -252,7 +252,12 @@ Modes:
   abort       Interrupt a session's in-progress turn.
   permissions List pending permission requests on the server.
   allow       Approve a pending permission request (--always remembers it).
+  follow      Watch an existing session read-only; prints new output until the
+              turn completes (sends nothing; --timeout <N> to bound the wait).
   setup       Show executable, server, auth, and model diagnostics.
+  identify    Print this agent session's identity (session id, slug, agent).
+  claim       Atomically claim a unit of work (claim <unit>).
+  release     Release a claim owned by this session (release <unit>).
 
 Run-mode flags (review|plan|ask|task|bulk):
   --background        DEFAULT: the job runs in the background on the server;
@@ -345,7 +350,7 @@ EOF
 
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
-  echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|status|history|send|abort|permissions|allow|setup)" >&2
+  echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|status|history|send|abort|permissions|allow|follow|setup|identify|claim|release)" >&2
   echo "  Run: $(basename "$0") --help" >&2
   exit 2
 fi
@@ -917,6 +922,232 @@ EOF
   exit 0
 fi
 
+# ---- follow ------------------------------------------------------------------
+# READ-ONLY watch on an existing session: poll the transcript, print new text
+# parts as they land, exit 0 when the last assistant turn completes. Sends
+# nothing — never resumes, steers, or prompts the session.
+if [ "$MODE" = "follow" ]; then
+  require_server
+  SID="${MSG_PARTS[0]:-}"
+  [ -n "$TASK_ID" ] && { resolve_task_context; }
+  if [ -z "$SID" ]; then
+    echo "error: follow needs a <sessionID> (or --task <taskID>)" >&2; exit 2
+  fi
+  if ! curl -sf -m 5 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID" -o /dev/null 2>/dev/null; then
+    echo "error: session not found: $SID" >&2; exit 5
+  fi
+  AUTH_B64=""
+  [ -n "${SERVE_PASSWORD:-}" ] && AUTH_B64="$(printf '%s' "${SERVER_USERNAME}:${SERVE_PASSWORD}" | base64)"
+  # Bounded only when the caller explicitly passed --timeout (FOLLOW_TIMEOUT
+  # defaults to 300 for run modes; a passive follow waits indefinitely).
+  [ -n "$TIMEOUT_SET" ] || FOLLOW_TIMEOUT="0"
+  BASE_URL="$BASE_URL" AUTH_B64="$AUTH_B64" SID="$SID" FOLLOW_TIMEOUT="${FOLLOW_TIMEOUT:-0}" node -e '
+    const base = process.env.BASE_URL, sid = process.env.SID;
+    const auth = process.env.AUTH_B64;
+    const hdr = auth ? { authorization: "Basic " + auth } : {};
+    const timeout = parseInt(process.env.FOLLOW_TIMEOUT, 10);
+    const deadline = timeout > 0 ? Date.now() + timeout * 1000 : 0;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const jget = async (u) => { const r = await fetch(base + u, { headers: hdr, signal: AbortSignal.timeout(10000) }); if (!r.ok) throw new Error("http " + r.status); return r.json(); };
+    console.log("following " + sid + " (read-only; Ctrl-C to detach)");
+    (async () => {
+      let dir = "";
+      try { const s = await jget("/session/" + sid); dir = (s.directory || ""); } catch (e) {}
+      const dirQ = dir ? "?directory=" + encodeURIComponent(dir) : "";
+      let lastSeen = 0, done = false, first = true;
+      const noticed = new Set();
+      while (!done) {
+        try {
+          const msgs = await jget("/session/" + sid + "/message" + dirQ);
+          for (let i = lastSeen; i < msgs.length; i++) {
+            const m = msgs[i] || {}, li = m.info || {};
+            for (const p of (m.parts || [])) {
+              if (p.type === "text" && p.text) process.stdout.write(p.text.replace(/\n+$/, "") + "\n");
+              else if (p.type === "reasoning" && p.text && !first) console.log("· " + p.text.split("\n")[0].slice(0, 120));
+              else if (p.type === "tool" && p.state && p.state.status === "running") console.log("(tool: " + p.tool + " running)");
+            }
+          }
+          lastSeen = Math.max(lastSeen, msgs.length);
+          const li = ((msgs[msgs.length - 1] || {}).info) || {};
+          done = li.role === "assistant" && !!(li.time && li.time.completed);
+          // parked-ask notice: the session is waiting on a human, not working.
+          // Print once per request id, not every poll.
+          if (!done) {
+            try {
+              for (const q of await jget("/permission")) {
+                if (q.sessionID === sid && !noticed.has(q.id)) {
+                  noticed.add(q.id);
+                  console.log("(parked: permission ask " + q.id + " — " + q.permission + " " + (q.patterns || []).join(" ") + ")");
+                }
+              }
+              for (const q of await jget("/question")) {
+                if (q.sessionID === sid && !noticed.has(q.id)) {
+                  noticed.add(q.id);
+                  console.log("(parked: question ask " + q.id + " — waiting on a human)");
+                }
+              }
+            } catch (e) {}
+          }
+          first = false;
+        } catch (e) { /* transient poll failure — keep waiting */ }
+        if (deadline && Date.now() >= deadline) {
+          console.log("(timeout after " + timeout + "s — session still running; follow again or watch: " + base + ")");
+          process.exit(3);
+        }
+        if (!done) await sleep(2000);
+      }
+      console.log("(done — " + sid + " completed)");
+    })();
+  '
+  exit 0
+fi
+
+# ---- identify / claim / release ----------------------------------------------
+# Agent identity for delegation. Authoritative source: $OPENCODE_SESSION_ID,
+# injected into every tool shell by the opencode-identity plugin's shell.env
+# hook — each agent (parent OR subagent) sees its OWN session id, with no env
+# inheritance or directory guessing. The DB fallback (newest session in $PWD)
+# covers interactive shells without the plugin.
+identity_record() {  # echoes JSON; exits 2 when unresolved
+  if [ -n "${OPENCODE_SESSION_ID:-}" ]; then
+    node - <<'EOF'
+      process.stdout.write(JSON.stringify({
+        sessionId: process.env.OPENCODE_SESSION_ID,
+        slug: process.env.OPENCODE_SESSION_SLUG || "",
+        title: process.env.OPENCODE_SESSION_TITLE || "",
+        agent: process.env.OPENCODE_SESSION_AGENT || "",
+        model: process.env.OPENCODE_SESSION_MODEL || "",
+        directory: process.env.OPENCODE_SESSION_DIRECTORY || process.cwd(),
+        taskId: process.env.AGENT_TASK_ID || "",
+      }) + "\n")
+EOF
+    return 0
+  fi
+  # DB fallback: newest session rooted in $PWD (opencode.db is shared by every
+  # instance — TUI, run, serve — so this resolves self-started sessions too).
+  local out
+  out="$(DB="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}" PWD_DIR="$PWD" node - <<'EOF'
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(process.env.DB, { readOnly: true });
+    const r = db.prepare("SELECT id,slug,directory,title,agent,model FROM session WHERE directory=? ORDER BY time_created DESC LIMIT 1").get(process.env.PWD_DIR);
+    if (!r) process.exit(1);
+    let m = {}; try { m = JSON.parse(r.model || "{}"); } catch (e) {}
+    process.stdout.write(JSON.stringify({
+      sessionId: r.id, slug: r.slug, title: r.title,
+      agent: r.agent, model: (m.providerID || "") + "/" + (m.id || ""),
+      directory: r.directory, taskId: process.env.AGENT_TASK_ID || "",
+      dbResolved: true,
+    }) + "\n");
+EOF
+)" || { echo "error: no identity resolvable — run inside an opencode session (plugin env) or from a directory opencode has a session in" >&2; exit 2; }
+  printf '%s\n' "$out"
+  return 0
+}
+
+if [ "$MODE" = "identify" ]; then
+  JSON_OUT=""
+  [ "$FORMAT" = "json" ] && JSON_OUT=1
+  SID_EXPLICIT="${MSG_PARTS[0]:-}"
+  if [ -n "$SID_EXPLICIT" ]; then
+    # Explicit session id: emit a record from the DB for that id (verifies existence).
+    srec="$(DB="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}" SID="$SID_EXPLICIT" node - <<'EOF'
+      const { DatabaseSync } = require("node:sqlite");
+      const db = new DatabaseSync(process.env.DB, { readOnly: true });
+      const r = db.prepare("SELECT id,slug,directory,title,agent,model FROM session WHERE id=?").get(process.env.SID);
+      if (!r) process.exit(1);
+      let m = {}; try { m = JSON.parse(r.model || "{}"); } catch (e) {}
+      process.stdout.write(JSON.stringify({ sessionId: r.id, slug: r.slug, title: r.title, agent: r.agent, model: (m.providerID||"")+"/"+(m.id||""), directory: r.directory }) + "\n");
+EOF
+)" || { echo "error: session not found in DB: $SID_EXPLICIT" >&2; exit 1; }
+    printf '%s\n' "$srec"
+    exit 0
+  fi
+  rec="$(identity_record)" || exit $?
+  if [ -n "$JSON_OUT" ]; then
+    printf '%s\n' "$rec"
+  else
+    printf '%s\n' "$rec" | node -e '
+      let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+        const r=JSON.parse(d);
+        console.log("sessionId:   "+r.sessionId);
+        console.log("slug:        "+r.slug);
+        console.log("title:       "+r.title);
+        console.log("agent:       "+r.agent);
+        console.log("model:       "+r.model);
+        console.log("directory:   "+r.directory);
+        if(r.taskId) console.log("taskId:      "+r.taskId);
+        if(r.dbResolved) console.log("note:        db-resolved (newest session in this directory) — set OPENCODE_SESSION_ID explicitly if ambiguous");
+      });'
+  fi
+  exit 0
+fi
+
+if [ "$MODE" = "claim" ] || [ "$MODE" = "release" ]; then
+  UNIT="${MSG_PARTS[0]:-}"
+  if [ -z "$UNIT" ]; then
+    echo "error: $MODE needs a <unit> (e.g. claim gate-42)" >&2; exit 2
+  fi
+  case "$UNIT" in
+    *[!A-Za-z0-9._-]*) echo "error: unit must be letters/digits/._- (got: $UNIT)" >&2; exit 2 ;;
+  esac
+  rec="$(identity_record)" || exit $?
+  IDENT_DIR="$(printf '%s' "$rec" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).directory||""))')"
+  IDENT_SESSION="$(printf '%s' "$rec" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).sessionId||""))')"
+  [ -n "$IDENT_DIR" ] || { echo "error: identity has no directory to anchor claims in" >&2; exit 2; }
+  CLAIM_DIR="${CLAIM_ROOT:-$IDENT_DIR/.opencode-claims}"
+  mkdir -p "$CLAIM_DIR"
+  CLAIM_FILE="$CLAIM_DIR/$UNIT.json"
+  if [ "$MODE" = "claim" ]; then
+    CLAIM_FILE="$CLAIM_FILE" REC="$rec" BASE_URL="$BASE_URL" UNIT="$UNIT" node - <<'EOF'
+      const fs = require("fs");
+      const file = process.env.CLAIM_FILE;
+      const unit = process.env.UNIT;
+      const r = JSON.parse(process.env.REC);
+      let fd;
+      try { fd = fs.openSync(file, "wx", 0o644); }
+      catch (e) {
+        if (e.code === "EEXIST") {
+          let prev = {}; try { prev = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+          console.error("ALREADY CLAIMED: " + file);
+          console.error("  by session: " + (prev.sessionId || "?") + " (" + (prev.slug || "?") + ") since " + (prev.claimedAt || "?"));
+          if (prev.agent) console.error("  agent: " + prev.agent + (prev.taskId ? "   taskId: " + prev.taskId : ""));
+          console.error("  release: opencode-dispatch.sh release " + unit + " (owner only)");
+          process.exit(3);
+        }
+        console.error("error: " + e.message); process.exit(1);
+      }
+      const claim = {
+        unit,
+        sessionId: r.sessionId,
+        slug: r.slug,
+        agent: r.agent,
+        model: r.model,
+        taskId: r.taskId || "",
+        worktree: r.directory,
+        serverUrl: process.env.BASE_URL,
+        claimedAt: new Date().toISOString(),
+      };
+      fs.writeSync(fd, JSON.stringify(claim, null, 2) + "\n");
+      fs.closeSync(fd);
+      console.log("claimed " + file);
+      console.log("  session: " + claim.sessionId + " (" + claim.slug + ")");
+EOF
+    exit 0
+  else
+    # release <unit> — owner-only removal
+    if [ ! -f "$CLAIM_FILE" ]; then
+      echo "no claim at $CLAIM_FILE" >&2; exit 3
+    fi
+    OWNER="$(node -e 'const fs=require("fs");try{const c=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(c.sessionId||"")}catch(e){}' "$CLAIM_FILE")"
+    if [ -z "$OWNER" ] || [ "$OWNER" != "$IDENT_SESSION" ]; then
+      echo "error: claim on $UNIT is owned by $OWNER, not $IDENT_SESSION — only the owner may release" >&2; exit 3
+    fi
+    rm -f "$CLAIM_FILE"
+    echo "released $CLAIM_FILE"
+    exit 0
+  fi
+fi
+
 # ---- serve -------------------------------------------------------------------
 # Temp prompt/diff files (opencode-msg.* / opencode-diff.*) are left behind by
 # design (prune-recovery: a re-exec'd run re-reads its prompt file), and a
@@ -1062,12 +1293,14 @@ if [ "$MODE" = "history" ]; then
           for(const l of text.split("\n")) lines.push(l);
           lines.push("");
         }
-        // 4) line cap: --tail always applies; otherwise default 100. The cap
-        //    applies AFTER the --turns window, so a giant single turn (the norm
-        //    for worker sessions) can never dump unbounded output — previously
-        //    turns>0 disabled the cap, making --turns look broken.
+        // 4) line cap: --tail always applies; otherwise the default 100 UNLESS
+        //    --turns was given — then the window is shown UNBOUNDED (a fixed
+        //    cap silently ate whole turns, and any per-turn allowance (100,
+        //    turns*200) was still too small for tool-heavy turns). The caller
+        //    bounds volume explicitly with --tail when they want less.
         const tailSet=!!process.env.TAIL_SET;
-        const cap = tailSet ? (parseInt(process.env.TAIL,10)||100) : 100;
+        const cap = tailSet ? (parseInt(process.env.TAIL,10)||100)
+                            : (turns>0 ? Infinity : 100);
         const out = lines.length>cap ? lines.slice(-cap) : lines;
         if(lines.length>cap) console.log(`… showing last ${cap} of ${lines.length} lines (raise --tail) …`);
         process.stdout.write(out.join("\n")+"\n");
@@ -1201,15 +1434,34 @@ fi
 # + assistant reply); an EXISTING send session must count past its pre-submit
 # total (precount + 2), or the loop could break on the session's OLD idle state
 # the instant after submit and print a stale reply.
+# emit_heartbeat <state> <msgs> <idle-secs> [detail] — the recurring ~30s status
+# line. The one-time banner already names $MODE and $SID, so this line omits
+# them: a tailed background log stays short, and the fields that change (state,
+# message count, idle seconds, running tool or parked ask) keep a stable order.
+emit_heartbeat() {
+  local state="$1" n="$2" idle="$3" detail="${4:-}"
+  local msg="$state · ${n} msgs · ${idle}s idle"
+  [ -n "$detail" ] && msg="$msg · $detail"
+  printf '%s\n' "$msg" >&2
+}
+# nudge_hint — the recover-a-stuck-turn command appended to PARKED/STALLED
+# diagnostics. `send --steer` injects into the running turn, and the server
+# accepts it for ANY session id — including subagent sessions, which are
+# otherwise not meant to be messaged. It recovers the turn in place instead of
+# aborting and redoing it. Reads $SID from the calling loop (bash dynamic scope).
+nudge_hint() {
+  printf '%s' "nudge: $(basename "$0") send $SID \"<message>\" --steer"
+}
 follow_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits (0)
   local SID="$1" minmsgs="${2:-2}"
   local deadline last_beat now n st fails line tp ts qh ask prev_ask=""
+  local mx prev_mx last_change askid askrest
   echo "[$MODE] session $SID started; following (timeout ${FOLLOW_TIMEOUT}s)…" >&2
   deadline=$(( $(date +%s) + FOLLOW_TIMEOUT ))
-  last_beat=0; fails=0
+  last_beat=0; fails=0; prev_mx=""; last_change=$(date +%s)
   while :; do
     line="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" \
-      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const a=JSON.parse(d);const l=a[a.length-1]?.info;const w=l&&l.role==="assistant"&&!(l.time&&l.time.completed);let tp="-",ts=0,qh="-";if(w){const parts=(a[a.length-1]?.parts)||[];for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){tp=p.tool||"-";ts=p.state?.time?.start||0;const q=(p.state?.input||{}).questions;if(q&&q[0])qh=(q[0].header||q[0].question||"").replace(/ /g,"_").slice(0,40)||"-";break;}}}process.stdout.write(a.length+" "+(w?"working":"idle")+" "+tp+" "+ts+" "+qh+"\n")});' 2>/dev/null)" || line=""
+      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const a=JSON.parse(d);const l=a[a.length-1]?.info;const w=l&&l.role==="assistant"&&!(l.time&&l.time.completed);let mx=0;for(const m of a){const t=m.info&&m.info.time;if(t)for(const k in t){const v=t[k];if(typeof v==="number"&&v>mx)mx=v;}}let tp="-",ts=0,qh="-";if(w){const parts=(a[a.length-1]?.parts)||[];for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){tp=p.tool||"-";ts=p.state?.time?.start||0;const q=(p.state?.input||{}).questions;if(q&&q[0])qh=(q[0].header||q[0].question||"").replace(/ /g,"_").slice(0,40)||"-";break;}}}process.stdout.write(a.length+" "+(w?"working":"idle")+" "+mx+" "+tp+" "+ts+" "+qh+"\n")});' 2>/dev/null)" || line=""
     if [ -z "$line" ]; then
       # dead server: fail fast like await_turn (exit 7) instead of spinning
       # silently to the deadline looking hung.
@@ -1221,10 +1473,12 @@ follow_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits (0)
       sleep 2; continue
     fi
     fails=0
-    read -r n st tp ts qh <<<"$line" || true
+    read -r n st mx tp ts qh <<<"$line" || true
     tp="${tp:--}"; qh="${qh:--}"
     [ "${n:-0}" -ge "$minmsgs" ] && [ "$st" = "idle" ] && break
     now=$(date +%s)
+    # reset the stall/idle clock whenever the newest timestamp moves
+    if [ "${mx:-0}" != "${prev_mx:-}" ]; then prev_mx="${mx:-0}"; last_change=$now; fi
     # Per-iteration ask polling while the turn works: announce a parked
     # permission/question the MOMENT it appears (transition detection), not at
     # the next 30s heartbeat. pending_ask falls back to the durable
@@ -1233,7 +1487,7 @@ follow_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits (0)
     if [ "$st" = "working" ]; then ask="$(pending_ask "$SID" "$tp" "$ts" "$qh")"; fi
     if [ -n "$ask" ] && [ "$ask" != "$prev_ask" ]; then
       echo "[$MODE] $SID PARKED on an ask (request $ask)" >&2
-      echo "        approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      echo "        approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID   |   $(nudge_hint)" >&2
       prev_ask="$ask"; last_beat=$now
     elif [ -z "$ask" ] && [ -n "$prev_ask" ]; then
       echo "[$MODE] $SID ask resolved — resuming." >&2
@@ -1241,24 +1495,28 @@ follow_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits (0)
     fi
     # Heartbeat every ~30s REGARDLESS of state — an idle-but-not-done wait
     # (submit still landing, or a slow server) used to be silent and read as
-    # hung. While parked, the ask is repeated; while working, name the tool
-    # that has been running longest. Follow has no stall guard.
+    # hung. emit_heartbeat drops the mode/SID the banner already printed; while
+    # parked it repeats the ask, while working it names the tool that has been
+    # running longest. Follow has no stall guard.
     if [ $(( now - last_beat )) -ge 30 ]; then
       if [ -n "$ask" ]; then
-        echo "[$MODE] $SID still parked on ask (request $ask) — approve: $(basename "$0") allow <requestID> [--always] | abort: $(basename "$0") abort $SID" >&2
+        askid="${ask%% *}"; askrest="${ask#* }"; [ "$askrest" = "$askid" ] && askrest=""
+        emit_heartbeat "parked on ask [$askid]" "${n:-0}" "$(( now - last_change ))" "$askrest"
       elif [ "$st" = "working" ]; then
-        local tooltxt=""
-        [ "$tp" != "-" ] && tooltxt=" (tool: $tp · $(( now - ${ts:-0}/1000 ))s)"
-        echo "[$MODE] $SID working… ${n:-0} msgs$tooltxt" >&2
+        if [ "$tp" != "-" ]; then
+          emit_heartbeat working "${n:-0}" "$(( now - last_change ))" "tool $tp $(( now - ${ts:-0}/1000 ))s"
+        else
+          emit_heartbeat working "${n:-0}" "$(( now - last_change ))"
+        fi
       else
-        echo "[$MODE] $SID waiting… ${n:-0} msgs (turn not started or no new activity yet)" >&2
+        emit_heartbeat waiting "${n:-0}" "$(( now - last_change ))"
       fi
       last_beat=$now
     fi
     if [ "$now" -ge "$deadline" ]; then
       if [ -n "$ask" ]; then
         echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s (parked on an ask: $ask)." >&2
-        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID   |   $(nudge_hint)" >&2
       else
         echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s." >&2
         echo "watch: $(basename "$0") status $SID | $(basename "$0") history $SID --turns 1 | $(basename "$0") abort $SID" >&2
@@ -1283,6 +1541,7 @@ await_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits
   local SID="$1" minmsgs="${2:-2}"
   local unbounded deadline fails prev_mx last_change last_beat now line n st he mx
   local tp ts qh ask prev_ask=""
+  local askid askrest
   local sinfo qdir sbody got=""
   echo "[$MODE] session $SID started in the background; waiting for completion (stall guard ${STALL_SECS}s)…" >&2
   unbounded=0; [ "$FOLLOW_TIMEOUT" = "0" ] && unbounded=1
@@ -1320,7 +1579,7 @@ await_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits
     if [ "$st" = "working" ]; then ask="$(pending_ask "$SID" "$tp" "$ts" "$qh")"; fi
     if [ -n "$ask" ] && [ "$ask" != "$prev_ask" ]; then
       echo "[$MODE] $SID PARKED on an ask (request $ask)" >&2
-      echo "        approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+      echo "        approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID   |   $(nudge_hint)" >&2
       prev_ask="$ask"; last_beat=$now
     elif [ -z "$ask" ] && [ -n "$prev_ask" ]; then
       echo "[$MODE] $SID ask resolved — resuming." >&2
@@ -1328,17 +1587,21 @@ await_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits
     fi
     # Heartbeat every ~30s REGARDLESS of state — an idle-but-not-done wait
     # (submit still landing, or a slow server) used to be silent and read as
-    # hung. While parked, the ask is repeated; while working, name the tool
-    # that has been running longest. The stall guard still governs hung turns.
+    # hung. emit_heartbeat drops the mode/SID the banner already printed; while
+    # parked it repeats the ask, while working it names the tool that has been
+    # running longest. The stall guard still governs hung turns.
     if [ $(( now - last_beat )) -ge 30 ]; then
       if [ -n "$ask" ]; then
-        echo "[$MODE] $SID still parked on ask (request $ask) — approve: $(basename "$0") allow <requestID> [--always] | abort: $(basename "$0") abort $SID" >&2
+        askid="${ask%% *}"; askrest="${ask#* }"; [ "$askrest" = "$askid" ] && askrest=""
+        emit_heartbeat "parked on ask [$askid]" "${n:-0}" "$(( now - last_change ))" "$askrest"
       elif [ "$st" = "working" ]; then
-        local tooltxt=""
-        [ "$tp" != "-" ] && tooltxt=" (tool: $tp · $(( now - ${ts:-0}/1000 ))s)"
-        echo "[$MODE] $SID working… ${n:-0} msgs, $(( now - last_change ))s since last activity$tooltxt" >&2
+        if [ "$tp" != "-" ]; then
+          emit_heartbeat working "${n:-0}" "$(( now - last_change ))" "tool $tp $(( now - ${ts:-0}/1000 ))s"
+        else
+          emit_heartbeat working "${n:-0}" "$(( now - last_change ))"
+        fi
       else
-        echo "[$MODE] $SID waiting… ${n:-0} msgs (turn not started or no new activity yet)" >&2
+        emit_heartbeat waiting "${n:-0}" "$(( now - last_change ))"
       fi
       last_beat=$now
     fi
@@ -1347,17 +1610,17 @@ await_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits
     if [ "${STALL_SECS:-0}" -gt 0 ] && [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
       if [ -n "$ask" ]; then
         echo "[$MODE] session $SID STALLED: parked on an ask for ${STALL_SECS}s (request $ask)." >&2
-        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID   |   $(nudge_hint)" >&2
       else
         echo "[$MODE] session $SID STALLED: no activity for ${STALL_SECS}s (likely a hung turn); giving up." >&2
-        echo "watch: $(basename "$0") status $SID   |   abort: $(basename "$0") abort $SID" >&2
+        echo "watch: $(basename "$0") status $SID   |   abort: $(basename "$0") abort $SID   |   $(nudge_hint)" >&2
       fi
       exit 8
     fi
     if [ "$unbounded" -eq 0 ] && [ "$now" -ge "$deadline" ]; then
       if [ -n "$ask" ]; then
         echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s (parked on an ask: $ask)." >&2
-        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID" >&2
+        echo "approve: $(basename "$0") allow <requestID> [--always]   |   abort: $(basename "$0") abort $SID   |   $(nudge_hint)" >&2
       else
         echo "[$MODE] session $SID still running after ${FOLLOW_TIMEOUT}s; exiting non-zero (still running server-side)." >&2
         echo "watch: $(basename "$0") status $SID" >&2

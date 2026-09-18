@@ -47,4 +47,8 @@ Run:
 bash "$HOME/.claude/scripts/opencode-hang-diag.sh" $ARGUMENTS
 ```
 
+**Never pipe this command's output through `tail`** — the installed PreToolUse
+hook blocks `| tail` on `opencode-dispatch.sh` invocations, and `hangdiag`
+already prints only the stalled call plus log evidence.
+
 Return the output verbatim.

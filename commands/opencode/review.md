@@ -1,6 +1,6 @@
 ---
 description: Review local git changes or a GitHub PR via opencode (waits to completion; wakes on done)
-argument-hint: '[--pr <n>] [--base <ref>] [--model provider/model] [--effort <name>] [--timeout <N>] [--follow] [--synchronous]'
+argument-hint: '[--server <name>] [--pr <n>] [--repo <owner/repo>] [--base <ref>] [--scope auto|working-tree|branch] [--model provider/model] [--effort low|medium|high|xhigh|max] [--timeout <N>] [--wait|--background] [--follow] [--direct]'
 allowed-tools: Bash(bash:*), Bash(opencode:*), Bash(git:*), Bash(gh:*), Read
 ---
 
@@ -18,23 +18,32 @@ findings come back. So `--pr` costs Claude nothing to read the PR.
 Raw slash-command arguments:
 `$ARGUMENTS`
 
-**Run this in the BACKGROUND** (Bash `run_in_background: true`). `--await` blocks
-for the whole turn, and a large-diff review can outlast the foreground Bash-tool
+**Run this in the BACKGROUND** (Bash `run_in_background: true`). `--background`
+blocks for the whole turn, and a large-diff review can outlast the foreground Bash-tool
 timeout (which would clip the run at a few minutes). Backgrounded, there is no
 foreground timeout — the harness wakes you when the process exits (wake-on-complete),
-bounded only by the script's own 24h `--await` backstop.
+bounded only by the script's own 24h `--background` backstop.
 
 Run:
 ```bash
-bash "$HOME/.claude/scripts/opencode-dispatch.sh" review --await $ARGUMENTS
+bash "$HOME/.claude/scripts/opencode-dispatch.sh" review --background $ARGUMENTS
 ```
 
 - Return the findings verbatim. **Review-only — do not fix issues or apply patches.**
 - `--pr <n>` reviews GitHub PR #n (via `gh pr diff <n>`, needs gh + `gh auth login`),
   independent of the current branch/worktree. Mutually exclusive with `--base`.
+  `gh` resolves the bare PR number from the current directory's git remote, so
+  when the session's `--dir` has no remote (e.g. a skill repo), pass
+  `--repo <owner/repo>` explicitly — otherwise gh fails with "no git remotes found".
 - `--base <ref>` scopes to `<ref>...HEAD`; default is the working tree.
-- `--await` exits non-zero only on a turn error or if the server goes unreachable;
+- `--scope <auto|working-tree|branch>` — what to diff: `auto` = `--base` range
+  when given, else the working tree; `working-tree` = uncommitted changes only;
+  `branch` = `--base <ref>...HEAD` (requires `--base`).
+- `--background` exits non-zero only on a turn error or if the server goes unreachable;
   otherwise it waits (up to ~24h backstop; `--timeout 0` = unbounded). If it does
   exit early, report the session id and `/opencode:status <id>`.
 - `--follow` = bounded foreground wait (300s) that leaves the session running on
-  timeout; `--synchronous` = quick inline one-shot on a tiny diff (non-server).
+  timeout; `--direct` = one-shot inline review on a tiny diff that invokes the
+  opencode CLI directly (no server session, unobservable).
+- **Never pipe this command's output through `tail`** — the installed PreToolUse
+  hook blocks it, and tail can clip the findings the script prints whole.

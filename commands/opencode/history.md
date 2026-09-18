@@ -1,6 +1,6 @@
 ---
 description: Print an opencode session transcript, with tail / time / turn limits
-argument-hint: '[<sessionID> | --task <taskID>] [--tail <N>] [--turns <N>] [--since <1d|6h|10m|30s>] [--port <N>]'
+argument-hint: '[<sessionID> | --task <taskID>] [--tail <N>] [--turns <N>] [--since <1d|6h|10m|30s>] [--server <name>] [--port <N>]'
 allowed-tools: Bash(bash:*), Bash(opencode:*)
 ---
 
@@ -27,9 +27,13 @@ bash "$HOME/.claude/scripts/opencode-dispatch.sh" history $ARGUMENTS
 
 Limits (combine freely):
 - `--tail N` — keep only the last N lines (default 100).
-- `--turns N` — keep only the last N user prompts and their responses; shown
-  un-truncated unless `--tail` is also given.
+- `--turns N` — keep only the last N user prompts and their responses; the
+  window is shown in full (unbounded), with `--tail` as the explicit bound.
 - `--since <range>` — only messages newer than now minus the range (e.g. `1d`,
   `6h`, `10m`, `30s`, `2w`).
+
+**Never pipe the output through `tail`** — the installed PreToolUse hook blocks
+it; use `--tail`/`--turns`/`--since` instead, which trim server-side before
+anything reaches Claude's context.
 
 Return the output verbatim.

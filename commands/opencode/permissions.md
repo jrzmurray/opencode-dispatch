@@ -19,4 +19,7 @@ Run:
 bash "$HOME/.claude/scripts/opencode-dispatch.sh" permissions $ARGUMENTS
 ```
 
+**Never pipe this command's output through `tail`** — the installed PreToolUse
+hook blocks it; pending asks are few, print them all.
+
 Return the output verbatim.

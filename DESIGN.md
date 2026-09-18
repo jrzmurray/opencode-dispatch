@@ -1,4 +1,4 @@
-# claude-skill-opencode — Design & Inter-Agent Roadmap
+# opencode-dispatch — Design & Inter-Agent Roadmap
 
 Delegate work from inside the Claude Code harness to **opencode** driving a
 cheaper model (default **DeepSeek**), so heavy reading/drafting/reviewing runs on
@@ -56,9 +56,7 @@ Grouped by purpose. ⚙️ = native opencode endpoint exists; 🔧 = wrapper/MCP
   `format: json_schema`. The delegate returns *validated JSON*, not prose. Single
   biggest lever for cheap, reliable agent-to-agent handoff.
 - **Cheap outcome inspection (no transcript)** ⚙️ — `GET /session/:id/diff`
-  (files changed), `/session/:id/todo` (task list/progress), plus a
-  **summarize-remotely** tool (opencode `POST /session/:id/summarize` summarizes
-  server-side on DeepSeek; return only the summary).
+  (files changed), `/session/:id/todo` (task list/progress).
 - **Cost/token readout** ⚙️ (already in the session object) → a budget guard so a
   delegate can't silently run up cost.
 
@@ -93,15 +91,13 @@ The three that most change day-to-day, in order:
 
 1. **Structured returns** (`format: json_schema`) — makes delegation cheap and
    reliable; everything downstream benefits.
-2. **Summarize-remotely** — the canonical "read a big session for pennies, Claude
-   sees only the summary" tool.
-3. **Completion-notify (SSE → Claude Code hook)** — removes polling; delivers the
+2. **Completion-notify (SSE → Claude Code hook)** — removes polling; delivers the
    hands-off, Fable-like feel.
 
 Everything else in §2 is refinement layered on top.
 
 Suggested minimal MCP tool surface:
-`start_session`, `send` (with `steer|queue|wait`), `status`, `summarize_session`,
+`start_session`, `send` (with `steer|queue|wait`), `status`,
 `get_diff`, `delegate_task` (returns a tight typed report), `list_sessions`.
 Each contract-designed to return distilled output.
 
@@ -113,30 +109,21 @@ Each contract-designed to return distilled output.
   and async: submit → get a session id → observe (`status`/`history`) → kill
   (`abort`). This replaced the original one-shot `opencode run` default, which was
   an unobservable blocking subprocess with no timeout — the cause of an 8-hour
-  "review" that no one could see into. One-shot is now opt-in via `--synchronous`;
+  "review" that no one could see into. One-shot is now opt-in via `--direct`
+  (a one-shot `opencode run` that bypasses the server);
   `--follow [--timeout N]` waits (bounded) and prints the reply inline.
-- **Wake-on-complete = `--await`, not the delegate calling back.** Don't have
+- **Wake-on-complete = `--background`, not the delegate calling back.** Don't have
   opencode invoke `claude --resume` — that forks a *new* Opus process (costs the
-  tokens we're saving, can't target the live session). Instead the caller blocks:
-  `--await` submits async then lives exactly as long as the turn, prints the
+  tokens we're saving, can't target the live session). Instead the wrapper
+  blocks (the job itself runs in the background on the server):
+  `--background` submits async then lives exactly as long as the turn, prints the
   distilled result, and **exits 0** the moment it completes. Launched as a
   background task, that exit is what re-invokes Claude Code. No fixed deadline
   (default ~24h backstop, `--timeout 0` = unbounded); exits non-zero on turn error
   or if the server goes unreachable (~40s). `--follow` is the older bounded (300s)
-  foreground wait that *leaves the session running* on timeout. The run-mode slash
-  commands default to `--await` (task/bulk add `--summarize`).
-- **`--summarize` contract (verified v1.18.x).** `POST /session/:id/summarize`
-  **requires** `?directory=<session.directory>` AND a body `{providerID,modelID}`
-  (the doc marks the body absent and directory optional — both are actually
-  required; a bare POST 400s "Expected object, got undefined"). It returns a bare
-  `true` and *appends* an **assistant** message with `summary:true` whose text
-  parts are the digest — read that back (poll; it takes a few s on the delegate).
-  A **user** message also carries a `summary` field, but it's a diff-stats object —
-  match `role==="assistant" && summary===true`, never just truthy. Summarize runs
-  on the delegate model, so Claude reads a paragraph, not the transcript. Its
-  output is opencode's compaction template (Objective/Work State/Files) — good for
-  agentic task/bulk, overkill for a one-line ask (so ask/plan/review print the
-  final message instead).
+  foreground wait that *leaves the session running* on timeout.   **`--background`
+  is the default for every run mode** in the dispatch script itself (`--wait`
+  is the foreground blocking form); the slash commands pass it explicitly (task/bulk).
 - **529 "Overloaded" is an Anthropic code; DeepSeek uses 503/429.** A consistent
   529 means the work was NOT going to DeepSeek — an unconfigured/fallback Anthropic
   model, or the Claude subagents' own calls during a capacity event. Pin the model
@@ -147,11 +134,33 @@ Each contract-designed to return distilled output.
   directory-bound session on the single persistent server, verifies the returned
   directory, and launches `opencode run --attach ... --auto`. Edit/bash are
   pre-authorized (`permission:[{edit/bash,**,allow}]`).
-- **A server inherits env only at launch.** If `opencode serve` starts before
-  `DEEPSEEK_API_KEY` is exported, every turn 401s ("Authentication Fails
-  (governor)") even though the key is valid. Export the key in your shell profile;
-  start/restart the server from a shell that has it. Verify a key directly:
-  `curl -s -o /dev/null -w '%{http_code}' https://api.deepseek.com/models -H "Authorization: Bearer $DEEPSEEK_API_KEY"` → `200`.
+- **A server reads opencode's auth store at launch.** Credentials come from
+  `opencode auth login` (opencode's own storage — never environment variables or
+  config files). If `opencode serve` starts before auth is set up (or you add a
+  provider afterwards), every turn 401s ("Authentication Fails (governor)") even
+  though the key is valid. Authenticate first, then start/restart the server.
+  Verify with `opencode auth list` or `/opencode:setup`.
+- **Agent configs live in `~/.config/opencode/opencode.json`** under the `agent`
+  key (project-level `./opencode.json` overrides it). This repo ships the sample
+  in `config/opencode.json` (build/review/auto agents + permissions); `install.sh`
+  copies it only when no config exists and `/opencode:model` edits it by merge —
+  an existing config is never overwritten.
+- **Permission surfacing lives in TWO volatile queues + one durable signal.**
+  `GET /permission` (`{id, sessionID, permission, patterns, tool}`) and
+  `GET /question` (`{id, sessionID, questions[], tool}`) are in-memory — a
+  server restart loses them while the session stays stuck. The durable signal is
+  the message stream: the last assistant message lacks `time.completed` and the
+  newest tool part sits in `state.status:"running"` with no `time.end`. `status`
+  checks all three: the queues give the precise `PERMASK`/`QUESTION` verdict
+  with the request id; the message stream names the stuck tool (`WORKING — TOOL
+  RUNNING (bash · 4m)`) when the queue is gone, and a >30m frozen `updated`
+  flags `STALE`. Note the session JSON in 1.18.x has **no `lastMessage`**, so
+  list views must probe each session's `message?limit=1` (returns the last
+  message) rather than trust a field that never exists.
+- **Never pipe `opencode-dispatch.sh` through `tail`.** install.sh registers a
+  PreToolUse hook (`opencode-guard.sh`) that throws on `| tail`; the scripts
+  bound their own output, and tail can clip the distilled result that keeps the
+  token math positive.
 - **BSD/macOS `mktemp` only expands `X`s at the END of the template.** A template
   like `foo-XXXXXX.diff` (suffix after the X's) is used *literally* on macOS — so
   every run (and any concurrent run) collides with `mkstemp failed: File exists`.
@@ -183,7 +192,6 @@ Each contract-designed to return distilled output.
 | `POST /session/:id/prompt_async` | send prompt, non-blocking |
 | `POST /api/session/:id/prompt` | send with `delivery:steer\|queue`, `resume` |
 | `GET /session/:id/message` | full transcript (messages → `parts[]` text) |
-| `POST /session/:id/summarize` | server-side summarize/compact on the session model |
 | `GET /session/:id/diff` | files changed by the session |
 | `GET /session/:id/todo` | session todo list |
 | `POST /session/:id/fork` | branch the session |
@@ -193,3 +201,124 @@ Each contract-designed to return distilled output.
 | `GET /doc` | OpenAPI 3.1 spec (auto-generated SDK source) |
 
 Models on this DeepSeek account: `deepseek-v4-pro` (default), `deepseek-v4-flash`.
+
+---
+
+## 6. Multiple server definitions (named profiles)
+
+One persistent server is the right default — but "one server" is a *per-profile*
+fact, not a global one. The dispatcher resolves a **named profile** for every
+server-backed mode; the default profile preserves the historical single-server
+behavior exactly.
+
+### The listen/address split (the one rule that matters)
+
+A profile carries two distinct addresses, and conflating them is the failure
+mode this design removes:
+
+| Field | Meaning | Allowed values |
+|---|---|---|
+| `listen` | Bind interface passed to `opencode serve --hostname` | `127.0.0.1`, `0.0.0.0`, `::`, or a specific interface IP |
+| `host` | Addressable host the dispatcher curls (and what stop/restart probe) | loopback, `localhost`, or a concrete interface IP/hostname — **never `0.0.0.0`/`::`** (nothing is reachable there) |
+
+Resolution rules (enforced at resolve time, exit 2):
+- `host` defaults to `listen` when the listen address is concrete (loopback or
+  an interface IP). A wildcard bind (`0.0.0.0`) has **no** addressable form and
+  requires an explicit `host` — the dispatcher refuses to guess.
+- Binding a non-loopback interface requires a `password` (profile field or
+  `OPENCODE_SERVER_PASSWORD`). Without it the dispatcher refuses to start: an
+  unauthenticated server on a network interface is a security hole, not a
+  convenience.
+- opencode's basic auth is user **`opencode`** + the password (verified against
+  1.18.9; `:<password>` and bare `password` both 401). The historical
+  `--user ":<password>"` worked only against unauthenticated servers.
+  Since 1.18.9 the server also honors **`OPENCODE_SERVER_USERNAME`** at launch
+  (verified: with it set, `customuser:pw` → 200 and even `opencode:pw` → 401),
+  so the username is configurable on both sides of the wire.
+
+### Local credentials: `.env.local`
+
+A `.env.local` in the skill directory (gitignored; `.env.local.example` ships
+the template) can carry `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`.
+Every dispatch mode loads it (only those two keys; only when the variable is
+not already set in the real environment — dotenv semantics, an exported shell
+var wins). Resolution is `$OPENCODE_DISPATCH_ENV_FILE`, else a walk up from the
+script's own directory (repo copy: the repo root; installed copy:
+`~/.claude/scripts/.env.local`, refreshed by install.sh). The loaded pair is
+fed into the SAME resolved credential slot as the profile password, so the
+launched server and every client always use one pair, and removing the file
+reverts to the defaults. The loader parses `KEY=VALUE` lines only — it never
+sources the file, so it cannot execute code.
+
+### Definition file and precedence
+
+`~/.config/opencode-dispatch/servers.json` (sample: `config/servers.json`,
+copied by install.sh only when none exists; keys starting with `_` are ignored
+as documentation). Per-field precedence:
+
+```
+CLI flag (--port/--host/--listen) > env (OPENCODE_DISPATCH_*) > definition > default
+```
+
+- `--server <name>` / `$OPENCODE_DISPATCH_SERVER` / `serve <name>` select the
+  profile (default `default`).
+- `OPENCODE_DISPATCH_PORT`/`HOST`/`LISTEN`/`SERVER_PASSWORD` remain valid
+  overrides — the whole env-var contract from the single-server era still works,
+  now layered over the profile file. No definitions file = the historical
+  defaults (127.0.0.1:4096), zero-config backward compat.
+- Profile `model` slots between `OPENCODE_DISPATCH_MODEL` and the opencode
+  config default (a "pro" profile can pin `deepseek-v4-pro`); profile `dir`
+  feeds the default session directory when `--dir` is absent (the launch cwd for
+  a remote profile, and the project-root `opencode.json` it should read).
+
+### Lifecycle
+
+- Launch records are **per profile** (`serve-<name>.args` in the temp dir), so
+  `--stop`/`--restart` on one profile can never touch another. `default` falls
+  back to the legacy `serve.args` so a server started by a pre-names install is
+  still stoppable.
+- Stop/restart use `lsof` on the local machine — local operations only. A
+  remote profile's lifecycle is managed on the machine it runs on; the
+  dispatcher's `--stop` correctly finds nothing local.
+- `setup` lists every profile with its bind→address split and live UP/down
+  state, marking the resolved one.
+
+### Why profiles are the right unit (vs servers-per-worktree)
+
+The original design note still holds: sessions are directory-bound, so one
+server serves every worktree. Profiles add *isolation of identity*, not
+worktree multiplicity — a cheap flash server for churn, a pro server for deep
+tasks, a remote box for heavy jobs — while keeping the "one server per profile,
+sessions routed by directory" invariant inside each.
+
+
+## 7. Agent identity & claims (delegation)
+
+Every agent session — spawned by a launcher OR started from opencode itself —
+gets a persistent, authoritative identity via the **opencode-identity plugin**
+(`plugins/opencode-identity.js`, loaded from `~/.config/opencode/plugins/` or
+`<project>/.opencode/plugins/` in every instance: TUI, `opencode run`, serve).
+
+Two hooks, two problems solved:
+
+- **`shell.env`** — injects the *executing* session's own
+  `OPENCODE_SESSION_ID` / `_SLUG` / `_TITLE` / `_AGENT` / `_MODEL` /
+  `_DIRECTORY` into every tool shell (verified on 1.18.9: a `general` subagent
+  spawned via the task tool sees ITS OWN id, not the parent's). No env
+  inheritance, no directory matching, no collisions. The id comes from the
+  server's own hook context, so it is authoritative.
+- **`event: session.created`** — idempotently appends ` — <slug>` to the
+  session title (`PATCH /session/{id}`, verified), so every session carries a
+  stable human-readable label in all listings and claim records.
+
+`identify` (env → DB fallback via the shared `opencode.db`: newest session
+rooted in `$PWD`) prints the identity; `claim <unit>` writes
+`<worktree>/.opencode-claims/<unit>.json` with an exclusive create
+(`O_EXCL`), so claims can never double-assign; `release <unit>` is owner-only.
+The claim file records sessionId, slug, agent, taskId (delegation env), worktree,
+server URL, and timestamp — every unit traces back to the exact session that
+did it.
+
+Known limitation: the env-injected `OPENCODE_SESSION_TITLE` may lag the
+patched title by one hook (the cache captures the pre-suffix title at
+creation); the title is informational, the id/slug are authoritative.

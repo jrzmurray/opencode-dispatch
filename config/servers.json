@@ -1,0 +1,14 @@
+{
+  "default": {
+    "listen": "127.0.0.1",
+    "port": 4096
+  },
+  "_example-remote": {
+    "listen": "0.0.0.0",
+    "host": "192.0.2.50",
+    "port": 4096,
+    "dir": "~/Code/your-project",
+    "password": "REPLACE_ME",
+    "model": "deepseek/deepseek-v4-pro"
+  }
+}

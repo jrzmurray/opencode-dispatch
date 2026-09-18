@@ -20,4 +20,7 @@ Run:
 bash "$HOME/.claude/scripts/opencode-dispatch.sh" allow $ARGUMENTS
 ```
 
+**Never pipe this command's output through `tail`** — the installed PreToolUse
+hook blocks it; the output is already one line.
+
 Return the output verbatim.
