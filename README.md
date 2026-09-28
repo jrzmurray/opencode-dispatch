@@ -24,8 +24,8 @@ repository's `scripts/README.md` for the launcher and worker-script reference.
 | `scripts/opencode-set-model.sh` | `~/.claude/scripts/opencode-set-model.sh` | Sets the default model/effort (overall, per agent, or for tasks) by merging `~/.config/opencode/opencode.json`; backs up before writing and never overwrites an existing config. |
 | `scripts/opencode-guard.sh` | `~/.claude/scripts/opencode-guard.sh` | PreToolUse hook (Bash matcher) that throws if `opencode-dispatch.sh` output is piped through `tail`. |
 | `commands/opencode/*.md` | `~/.claude/commands/opencode/` | Claude Code slash-command instructions. |
-| `install.sh` | not installed | Installs the surfaces above, registers the tail-guard hook in `~/.claude/settings.json` (merged, never clobbered), and copies `config/opencode.json` to `~/.config/opencode/opencode.json` only when no config exists there yet. It never reads or writes provider credentials. |
-| Repository orchestration scripts | `<repository>/scripts/` or `OPENCODE_ORCHESTRATION_ROOT` | Allocates worktrees, bootstraps children, verifies sessions, reports status, and cleans up. |
+| `install.sh` | not installed | Installs the surfaces above, registers the tail-guard hook in `~/.claude/settings.json` (merged, never clobbered), and copies the config samples (`config/opencode.json`, `config/servers.json.example`) into `~/.config/…` only when no file exists there yet. It never reads or writes provider credentials. |
+| Repository orchestration scripts | `<repository>/scripts/` or `OPENCODE_ORCHESTRATION_ROOT` | Allocates worktrees, bootstraps children, verifies sessions, reports status, and cleans up. External — not part of this repository. |
 
 The skill repository is not the worker repository. The dispatch script discovers
 the orchestration scripts from `<--dir>/scripts` by default. If the skill is
@@ -34,20 +34,32 @@ installed globally or the current repository stores the scripts elsewhere, set
 
 ## Prerequisites
 
-- Claude Code with support for installed slash commands.
-- OpenCode on `PATH` (`brew install sst/tap/opencode` or the installation method
-  appropriate to your system).
-- Node.js with built-in `fetch` support (Node 18+; Node 20+ recommended).
-- A clean source worktree for every edit task. Uncommitted source changes are not
-  copied into a new worker worktree.
-- The repository's orchestration scripts, including:
-  `spawn-agent.mjs`, `bootstrap-worktree.mjs`, `worktree-utils.mjs`,
-  `opencode-server.mjs`, `agent-worker-guard.mjs`, `agent-status.mjs`, and
-  `agent-cleanup.mjs`.
-- An authenticated OpenCode provider: run `opencode auth login` once per
-  provider. opencode stores credentials itself — never set API keys in
-  environment variables or in `~/.config/opencode/opencode.json` (or any other
-  config file).
+What each item is actually needed for:
+
+- **OpenCode CLI on `PATH`** — every mode; the wrapper exits 4 when it is
+  missing (`brew install sst/tap/opencode`, or `npm i -g opencode-ai`).
+- **Node.js** — the wrapper needs Node 18+ (the `follow` mode uses built-in
+  `fetch`). Two features need newer Node: `identify`'s database fallback uses
+  `node:sqlite` (Node 22.5+) and the Codex skill generator uses native
+  TypeScript stripping (Node 22.6+, install time only). Node 22.6+ covers
+  everything.
+- **A Claude Code or Codex install** — pick the surface(s) you install:
+  `--claude` needs Claude Code with support for installed slash commands;
+  `--codex` needs Codex with plugin support. The read-only Claude modes need
+  only OpenCode + Node.
+- **An authenticated OpenCode provider** — run `opencode auth login` once per
+  provider. opencode stores credentials itself; never set API keys in
+  environment variables or config files.
+- **The orchestration scripts (external — not in this repo)** — only the
+  edit-capable `task` and `bulk` modes need them: `spawn-agent.mjs`,
+  `bootstrap-worktree.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`,
+  `agent-worker-guard.mjs`, `agent-status.mjs`, and `agent-cleanup.mjs` live
+  in the orchestration repository. Point the wrapper at them with
+  `OPENCODE_ORCHESTRATION_ROOT` or `--orchestration-root` (default:
+  `<--dir>/scripts`). Read-only and control modes (`review`, `plan`, `ask`,
+  `follow`, `status`, `history`, `send`, `abort`, …) run without them.
+- **A clean source worktree for edit tasks** — enforced by the external
+  launcher; uncommitted source changes are not copied into a worker worktree.
 
 ## Installation
 
@@ -62,17 +74,33 @@ nothing):
 ./install.sh --codex --no-marketplace       # Codex direct drop, no marketplace
 ```
 
-`-s|--scope <profile|repo>` picks where the skills go: `profile` (default) —
-the user profile dirs (`~/.claude`, `~/.codex`); `repo` — a repository's own
-dirs (`<repo>/.claude/`, `<repo>/.codex/`), so the skills travel with the
-project instead of the user. `-r|--repo <path>` gives the repository and
-implies `--scope repo`. **Without `--repo`, the installer installs in place**:
-if the current working directory is a git repo that is not this skill repo, the
-skills land in that repo (resolved from its git top-level, so a subdirectory
-CWD works too); an explicit `-s profile` always stays profile. In repo scope
-the machine-level config samples (`opencode.json`, `servers.json` →
-`~/.config/…`) are skipped, and Codex installs are always the direct drop (no
-marketplace — that is a user-profile concept).
+Install arguments:
+
+```text
+./install.sh [--claude] [--codex] [options]
+
+  --claude                Install the Claude Code surface: dispatch,
+                          set-model, tail-guard hook, /opencode:* commands.
+  --codex                 Install the Codex surface: plugin + generated
+                          skills (or a direct drop with --no-marketplace).
+  -s, --scope <profile|repo>
+                          profile (default): the user dirs ~/.claude, ~/.codex.
+                          repo: <repo>/.claude and <repo>/.codex, so the
+                          skills travel with the project instead of the user.
+  -r, --repo <path>       Repository for repo scope (implies --scope repo).
+                          Without it the installer installs in place: when
+                          the CWD is a git repo that is not this skill repo,
+                          the skills land there (resolved from its git
+                          top-level, so a subdirectory CWD works too). An
+                          explicit -s profile always stays profile.
+  --no-marketplace        Codex only: skip the plugin + marketplace and drop
+                          skills straight into ~/.codex/skills with a merged
+                          ~/.codex/hooks.json.
+```
+
+In repo scope the machine-level config samples (`opencode.json`,
+`servers.json.example` → `~/.config/…`) are skipped, and Codex installs are
+always the direct drop (the marketplace is a user-profile concept).
 
 For Claude Code, the installer copies the dispatch script, the set-model
 script, the tail-guard hook, and the slash commands into the Claude directory
@@ -97,23 +125,105 @@ and guard hook are then dropped directly into Codex's auto-discovered paths
 (`~/.codex/skills/<opencode-*>/SKILL.md` and `~/.codex/hooks.json`, merged) —
 no marketplace registration needed, same one-time `/hooks` trust step.
 
-Agent configs go in `~/.config/opencode/opencode.json` under the `agent` key
-(global config; opencode also reads project-level `./opencode.json`, which
-overrides the global one). This repo ships a working sample in
-`config/opencode.json` — the `build`, `review`, and `auto` agents it defines are
-what the `/opencode:*` commands rely on. Manage the config by hand or with
-`/opencode:model`; the installer never modifies it beyond the initial
-copy-if-absent step.
+Agent config, server profiles, credentials, and the orchestration-script root
+are covered in [Configuration](#configuration).
 
-If the orchestration scripts are in the current project checkout, no additional
-setting is required. Otherwise point the installed skill at them:
+## Configuration
+
+### Server profiles (`servers.json`)
+
+Named server profiles live in `~/.config/opencode-dispatch/servers.json`. This
+repository ships `config/servers.json.example`; keep your real definitions in
+either place:
+
+```bash
+cp config/servers.json.example config/servers.json   # local copy, gitignored
+$EDITOR config/servers.json                          # hosts, ports, passwords
+./install.sh --claude                                # copies it to ~/.config/…
+```
+
+`install.sh` copies `config/servers.json` when it exists, otherwise
+`config/servers.json.example`, and only when the installed file does not exist
+yet — re-installs never overwrite it. Keys starting with `_` are documentation
+and ignored. Each profile separates:
+
+```text
+listen      bind interface passed to `opencode serve --hostname`
+            (127.0.0.1 | 0.0.0.0 | an interface IP)
+host        addressable host the dispatcher reaches the server at
+            (never 0.0.0.0/::; binding a non-loopback interface requires
+            a password)
+port        server port (default 4096)
+dir         server working directory
+password    basic-auth password (username defaults to `opencode`)
+model       default provider/model for dispatch through this profile
+```
+
+`--server <name>` (or `$OPENCODE_DISPATCH_SERVER`, or `serve <name>`) selects a
+profile; per-field precedence is CLI flag > env (`OPENCODE_DISPATCH_*`) >
+definition. Default profile: `default` (127.0.0.1:4096) — the single-server
+behavior when no definitions file exists.
+
+### Credentials (`.env.local`)
+
+```bash
+cp .env.local.example .env.local    # gitignored; install.sh copies it next
+$EDITOR .env.local                  # to the installed scripts
+```
+
+Only `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD` are read; an
+exported shell variable always wins over the file. The resolved pair
+authenticates every HTTP request and is exported to servers the dispatcher
+starts, so server and clients always share one credential. Binding a
+non-loopback interface requires a password.
+
+### Agent config (`opencode.json`)
+
+Agent configs go in `~/.config/opencode/opencode.json` under the `agent` key
+(opencode also reads project-level `./opencode.json`, which overrides the
+global one). This repo ships a working sample in `config/opencode.json` — the
+`build`, `review`, and `auto` agents it defines are what the `/opencode:*`
+commands rely on. The installer copies it to `~/.config/opencode/opencode.json`
+only when no config exists there yet; it never modifies it beyond that
+copy-if-absent step. Manage it by hand or with `/opencode:model`; restart the
+server for changes to take effect.
+
+### Orchestration scripts
+
+Only `task` and `bulk` need the external orchestration scripts. If they are in
+the current project checkout, no additional setting is required. Otherwise:
 
 ```bash
 export OPENCODE_ORCHESTRATION_ROOT=/absolute/path/to/repository/scripts
 ```
 
-The value must contain `spawn-agent.mjs` and the other lifecycle helpers. Keep it
-on a trusted local filesystem; it is executable orchestration code.
+The value must contain `spawn-agent.mjs` and the other lifecycle helpers. Keep
+it on a trusted local filesystem; it is executable orchestration code.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENCODE_ORCHESTRATION_ROOT` | Directory containing the orchestration scripts. |
+| `OPENCODE_SERVER_URL` | Existing persistent server URL for direct launcher use. |
+| `OPENCODE_DISPATCH_HOST` / `OPENCODE_DISPATCH_PORT` | Dispatch server endpoint parts (override the resolved profile). |
+| `OPENCODE_DISPATCH_LISTEN` | Bind interface override for launches (same as `--listen`). |
+| `OPENCODE_DISPATCH_SERVER` | Server profile name (default `default`; same as `--server`). |
+| `OPENCODE_DISPATCH_SERVERS` | Server definitions file (default `~/.config/opencode-dispatch/servers.json`). |
+| `OPENCODE_SERVER_PASSWORD` | Server password for HTTP requests; exported to launched servers. |
+| `OPENCODE_SERVER_USERNAME` | Server basic-auth username (default `opencode`); exported to launched servers. |
+| `OPENCODE_DISPATCH_ENV_FILE` | Explicit path to a `.env.local`-style credential file. |
+| `OPENCODE_SESSION_ID` / `_SLUG` / `_TITLE` / `_AGENT` / `_MODEL` / `_DIRECTORY` | The **executing** session's own identity, injected into every tool shell by the `opencode-identity` plugin (`plugins/opencode-identity.js`, installed to `~/.config/opencode/plugins/`). Parents and subagents each see their own id — the basis for `identify` / `claim`. |
+| `OPENCODE_STALENESS_FETCH_TTL` / `OPENCODE_STALENESS_NUDGE_AT` / `OPENCODE_STALENESS_HOT_PATHS` | Tuning for the `opencode-branch-staleness` plugin: seconds between real `git fetch`es (default 300), commits-behind threshold for escalated wording (default 25), and optional comma-separated paths whose changes are called out explicitly. |
+| `OPENCODE_DISPATCH_MODEL` | Default `provider/model` for dispatch. |
+| `AGENT_WORKTREE_ROOT` | Generic allocation root. |
+| `AGENT_BRANCH_PREFIX` | Generic worker branch prefix. |
+| `AGENT_LOCK_TIMEOUT_MS` | Allocation lock wait timeout. |
+| `OPENCODE_DISPATCH_STALL_SECS` | Default `--background` inactivity threshold; `0` disables it. |
+
+The child launcher also passes task metadata to the worker through
+`AGENT_TASK_ID`, `AGENT_WORKTREE_PATH`, `AGENT_WORKTREE_BRANCH`,
+`AGENT_METADATA_PATH`, `OPENCODE_SESSION_ID`, and `OPENCODE_SERVER_URL`.
 
 ## One-server execution model
 
@@ -123,15 +233,11 @@ Each session receives an explicit `directory=<worktree>` query, so multiple
 workers can share the server without sharing a checkout.
 
 Profiles are named definitions in `~/.config/opencode-dispatch/servers.json`
-(installed from `config/servers.json` when none exists; keys starting with `_`
-are ignored). Each profile separates the **bind interface** (`listen`, passed to
-`opencode serve --hostname`) from the **addressable host** the dispatcher
-reaches it at (`host`) — the address can never be `0.0.0.0`/`::`, and binding a
-non-loopback interface requires a `password` (basic-auth user `opencode`).
-`--server <name>` (or `$OPENCODE_DISPATCH_SERVER`, or `serve <name>`) selects a
-profile; per-field precedence is CLI flag > env (`OPENCODE_DISPATCH_*`) >
-definition. Default profile: `default` (127.0.0.1:4096) — the historical
-single-server behavior, unchanged when no definitions file exists.
+(see [Configuration](#configuration)). Each profile separates the **bind
+interface** (`listen`, passed to `opencode serve --hostname`) from the
+**addressable host** the dispatcher reaches it at (`host`); `--server <name>`
+(or `$OPENCODE_DISPATCH_SERVER`, or `serve <name>`) selects one. Default:
+`default` (127.0.0.1:4096).
 
 Start or verify a profile with:
 
@@ -153,7 +259,7 @@ each worktree. If no server is reachable, the dispatch wrapper may start one at
 the configured endpoint; it still routes each created session to its explicit
 directory.
 
-## Slash commands
+## Claude slash commands
 
 | Command | Behavior |
 | --- | --- |
@@ -180,6 +286,45 @@ directory.
 Use `--task <task-id>` after an isolated launch when you have the task record but
 not the session ID. The lifecycle helper resolves the recorded session and exact
 worktree path; it does not search arbitrary directories.
+
+## Codex skills
+
+`./install.sh --codex` generates one Codex skill per Claude command with
+`scripts/sync-claude-commands-to-skills.ts --name-prefix=opencode` (needs Node
+22.6+). Codex selects skills by description, so the same workflows are available
+without slash syntax:
+
+| Skill | Behavior |
+| --- | --- |
+| `opencode-review` | Read-only review of a local diff or GitHub PR diff. |
+| `opencode-plan` | Read-only planning through the `plan` agent. |
+| `opencode-ask` | Read-only question answering/drafting. |
+| `opencode-task` | Allocates, bootstraps, and launches one isolated edit worker using agent `auto`. |
+| `opencode-bulk` | Same isolated lifecycle, intended for background/batch work. |
+| `opencode-serve` | Start, confirm, stop, or restart the one persistent server. |
+| `opencode-sessions` | List server sessions. |
+| `opencode-status` | Show liveness and server state. |
+| `opencode-follow` | Read-only watch on a running session (sends nothing; `--timeout <N>` bounds the wait). |
+| `opencode-history` | Read a bounded transcript. |
+| `opencode-hangdiag` | Diagnose why a session hung — stalled tool call, duration, permission ask. |
+| `opencode-permissions` | List pending permission requests (parked asks). |
+| `opencode-allow` | Approve a pending permission request, resuming its turn. |
+| `opencode-send` | Send, steer, or queue a prompt. |
+| `opencode-abort` | Stop an active turn. |
+| `opencode-model` | Set the default model/effort overall, per agent, or for tasks. |
+| `opencode-setup` | Show executable, server, auth, and model diagnostics. |
+| `opencode-identify` | Print this agent session's identity (session id, slug, agent, model, worktree). |
+| `opencode-claim` | Atomically claim a unit of work keyed by this session's identity (`release <unit>` removes a claim). |
+
+Codex-skill argument aliases:
+
+```text
+--background   background the job and wake on completion (the default)
+--wait         foreground blocking wait (mutually exclusive; last one wins)
+--effort       low|medium|high|xhigh|max maps to the provider's variant
+--scope        auto|working-tree|branch selects what a review diffs
+               (branch requires --base)
+```
 
 ## Typical workflows
 
@@ -237,6 +382,40 @@ bash ~/.claude/scripts/opencode-dispatch.sh task \
   --background
 ```
 
+Dispatch arguments:
+
+```text
+opencode-dispatch.sh <mode> [arguments]
+
+Run modes:
+  review | plan | ask        read-only (no worktree allocation)
+  task | bulk                edit-capable (isolated worker + worktree)
+
+Run-mode flags:
+  --server <name>            server profile (default: default)
+  --model provider/model     model override
+  --effort low|medium|high|xhigh|max
+  --timeout <N>              wait bound in seconds (0 = unbounded)
+  --wait                     foreground blocking wait
+  --background               background job; wrapper waits (default)
+  --follow                   bounded follow (300s default)
+  --direct                   one-shot `opencode run` (read-only modes only)
+  --dir <path>               session routing directory
+  --prompt-file <path>       prompt source (alias: --brief)
+  --orchestration-root <p>   spawn-agent.mjs + helpers (task/bulk)
+
+Server selection:
+  --port <N>                 server port (profile/env/default 4096)
+  --host <addr>              addressable host (never 0.0.0.0/::)
+  --listen <addr>            (serve) bind interface for `opencode serve`
+  --stop | --restart         (serve) stop or restart the profile's server
+
+Control modes:
+  sessions | status | follow | history | send | abort | permissions | allow
+  setup | identify | claim | release
+  send: --steer injects into the running turn; --queue appends after it
+```
+
 **`--background` is the default for every run mode** (`review`, `plan`, `ask`,
 `task`, `bulk`). The job runs in the background on the persistent opencode
 server (detached, no terminal); the wrapper then waits for the turn to complete,
@@ -253,12 +432,6 @@ never stays in the process argv for the run (`--prompt-file` remains the
 preferred, fully-clean path; the two are mutually exclusive). Positional
 arguments are space-joined into one line — line breaks appear only when an
 argument itself contains one.
-
-Codex-skill argument aliases: `--background` = background the job and wake on
-completion (the default), `--wait` = foreground blocking wait (mutually
-exclusive, last one wins), `--effort low|medium|high|xhigh|max` maps to the
-provider's variant, and `--scope auto|working-tree|branch` selects what a
-`review` diffs (`branch` requires `--base`).
 
 `--direct` is the one-shot escape hatch: it invokes the opencode CLI directly
 (a non-server `opencode run`, blocking, output inline) instead of creating a
@@ -326,31 +499,6 @@ the worktree, optionally deletes the branch, and archives the ownership record.
 - Authenticate providers with `opencode auth login`; opencode stores credentials
   itself. Never put API keys in environment variables, prompts, task records,
   logs, or config files (`~/.config/opencode/opencode.json` included).
-
-## Environment variables
-
-| Variable | Purpose |
-| --- | --- |
-| `OPENCODE_ORCHESTRATION_ROOT` | Directory containing the orchestration scripts. |
-| `OPENCODE_SERVER_URL` | Existing persistent server URL for direct launcher use. |
-| `OPENCODE_DISPATCH_HOST` / `OPENCODE_DISPATCH_PORT` | Dispatch server endpoint parts (override the resolved profile). |
-| `OPENCODE_DISPATCH_LISTEN` | Bind interface override for launches (same as `--listen`). |
-| `OPENCODE_DISPATCH_SERVER` | Server profile name (default `default`; same as `--server`). |
-| `OPENCODE_DISPATCH_SERVERS` | Server definitions file (default `~/.config/opencode-dispatch/servers.json`). |
-| `OPENCODE_SERVER_PASSWORD` | Server password for HTTP requests; exported to launched servers. |
-| `OPENCODE_SERVER_USERNAME` | Server basic-auth username (default `opencode`); exported to launched servers. |
-| `OPENCODE_DISPATCH_ENV_FILE` | Explicit path to a `.env.local`-style credential file. |
-| `OPENCODE_SESSION_ID` / `_SLUG` / `_TITLE` / `_AGENT` / `_MODEL` / `_DIRECTORY` | The **executing** session's own identity, injected into every tool shell by the `opencode-identity` plugin (`plugins/opencode-identity.js`, installed to `~/.config/opencode/plugins/`). Parents and subagents each see their own id — the basis for `identify` / `claim`. |
-| `OPENCODE_STALENESS_FETCH_TTL` / `OPENCODE_STALENESS_NUDGE_AT` / `OPENCODE_STALENESS_HOT_PATHS` | Tuning for the `opencode-branch-staleness` plugin: seconds between real `git fetch`es (default 300), commits-behind threshold for escalated wording (default 25), and optional comma-separated paths whose changes are called out explicitly. |
-| `OPENCODE_DISPATCH_MODEL` | Default `provider/model` for dispatch. |
-| `AGENT_WORKTREE_ROOT` | Generic allocation root. |
-| `AGENT_BRANCH_PREFIX` | Generic worker branch prefix. |
-| `AGENT_LOCK_TIMEOUT_MS` | Allocation lock wait timeout. |
-| `OPENCODE_DISPATCH_STALL_SECS` | Default `--background` inactivity threshold; `0` disables it. |
-
-The child launcher also passes task metadata to the worker through
-`AGENT_TASK_ID`, `AGENT_WORKTREE_PATH`, `AGENT_WORKTREE_BRANCH`,
-`AGENT_METADATA_PATH`, `OPENCODE_SESSION_ID`, and `OPENCODE_SERVER_URL`.
 
 ## Troubleshooting
 
