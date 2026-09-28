@@ -6,7 +6,8 @@ allowed-tools: Bash(bash:*), Bash(opencode:*)
 
 Start, stop, or restart a persistent `opencode serve`. Server definitions are
 **named profiles** in `~/.config/opencode-dispatch/servers.json` (sample:
-`config/servers.json` in the repo; keys starting with `_` are ignored). Each
+`config/servers.json.example` in the repo; copy it to `config/servers.json` or
+edit the installed file directly; keys starting with `_` are ignored). Each
 profile separates the **bind interface** (`listen` — what `opencode serve
 --hostname` binds: `127.0.0.1`, `0.0.0.0`, or an interface IP) from the
 **addressable host** the dispatcher reaches it at (`host` — never `0.0.0.0`).

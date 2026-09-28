@@ -2,3 +2,4 @@
 *.bak-*
 .env.local
 .opencode-claims/
+servers.json

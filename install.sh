@@ -67,8 +67,10 @@ Claude install (--claude):
                                        blocks '| tail' on opencode-dispatch.sh
   config/opencode.json              -> ~/.config/opencode/opencode.json
                                        (profile scope ONLY; machine-level)
-  config/servers.json               -> ~/.config/opencode-dispatch/servers.json
-                                       (profile scope ONLY; machine-level)
+  config/servers.json.example       -> ~/.config/opencode-dispatch/servers.json
+                                       (profile scope ONLY; machine-level; a
+                                       local config/servers.json, gitignored,
+                                       is used instead when present)
   .env.local (if present)           -> $CLAUDE/scripts/.env.local
                                        (server credentials; gitignored in the
                                        repo; re-installs refresh the copy)
@@ -245,15 +247,19 @@ EOF
     fi
 
     # 5) sample server definitions — copy only when none exists. Named profiles
-    # (listen interface vs addressable host) live here; see config/servers.json.
+    # (listen interface vs addressable host) live here; see
+    # config/servers.json.example. A local config/servers.json (gitignored,
+    # possibly carrying real hosts/credentials) wins over the shipped sample.
     SRVDIR="$HOME/.config/opencode-dispatch"
     SRVFILE="$SRVDIR/servers.json"
+    SRCSRV="$REPO/config/servers.json"
+    [ -f "$SRCSRV" ] || SRCSRV="$REPO/config/servers.json.example"
     mkdir -p "$SRVDIR"
     if [ -f "$SRVFILE" ]; then
-      echo "existing server definitions left untouched: $SRVFILE (profiles live here; see config/servers.json)"
-    elif [ -f "$REPO/config/servers.json" ]; then
-      cp "$REPO/config/servers.json" "$SRVFILE"
-      echo "created:  $SRVFILE (from config/servers.json sample; re-installs never overwrite it)"
+      echo "existing server definitions left untouched: $SRVFILE (profiles live here; see config/servers.json.example)"
+    elif [ -f "$SRCSRV" ]; then
+      cp "$SRCSRV" "$SRVFILE"
+      echo "created:  $SRVFILE (from ${SRCSRV#$REPO/}; re-installs never overwrite it)"
     else
       echo "no sample server definitions found; skipped creating $SRVFILE"
     fi

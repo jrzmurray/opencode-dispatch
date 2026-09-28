@@ -252,9 +252,9 @@ sources the file, so it cannot execute code.
 
 ### Definition file and precedence
 
-`~/.config/opencode-dispatch/servers.json` (sample: `config/servers.json`,
-copied by install.sh only when none exists; keys starting with `_` are ignored
-as documentation). Per-field precedence:
+`~/.config/opencode-dispatch/servers.json` (sample:
+`config/servers.json.example`, copied by install.sh only when none exists; keys
+starting with `_` are ignored as documentation). Per-field precedence:
 
 ```
 CLI flag (--port/--host/--listen) > env (OPENCODE_DISPATCH_*) > definition > default
