@@ -175,7 +175,7 @@
 #                             $OPENCODE_DISPATCH_SERVER). Definitions live in
 #                             $OPENCODE_DISPATCH_SERVERS (default
 #                             ~/.config/opencode-dispatch/servers.json; sample in
-#                             config/servers.json). Keys starting with _ are
+#                             config/servers.json.example). Keys starting with _ are
 #                             ignored. Per-field precedence:
 #                             CLI flag > env (OPENCODE_DISPATCH_*) > definition.
 #   --stop                    (serve) stop the running opencode server (needs
@@ -466,7 +466,7 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- server definition resolution --------------------------------------------
-# Named profiles in $SERVERS_FILE (sample: config/servers.json). Each profile
+# Named profiles in $SERVERS_FILE (sample: config/servers.json.example). Each profile
 # separates the BIND interface ('listen', passed to `opencode serve
 # --hostname`) from the ADDRESSABLE host the dispatcher reaches it at
 # ('host') — the address can never be 0.0.0.0/::, and binding a non-loopback
@@ -866,11 +866,21 @@ oc_create_session() {  # $1=agent $2=model $3=variant $4=title $5=permJson(optio
 # and parked forever on an external_directory prompt no one could answer.
 # Verified via `select json_extract(data,'$.agent') from message` — every review
 # session pre-fix reads `build`.
-oc_submit_async() {  # $1=sessionId $2=path-to-message-text-file $3=agent(optional)
-  MSGFILE="$2" AGENT_ID="${3:-}" node -e '
+# Same bug, other half: the model/effort passed to POST /session is likewise
+# not inherited by the turn — the turn runs on the agent's configured model
+# from opencode.json unless prompt_async's own `model`/`variant` fields are
+# set. Confirmed against the running server's OpenAPI doc (GET /doc) for
+# POST /session/{id}/prompt_async: model is {providerID, modelID} (note:
+# modelID here, NOT `id` as on session create), and variant is a top-level
+# sibling field, not nested under model.
+oc_submit_async() {  # $1=sessionId $2=path-to-message-text-file $3=agent(optional) $4=model(optional provider/model) $5=variant(optional)
+  MSGFILE="$2" AGENT_ID="${3:-}" MODEL_ID="${4:-}" VARIANT_ID="${5:-}" node -e '
     const fs=require("fs");
     const b={parts:[{type:"text",text:fs.readFileSync(process.env.MSGFILE,"utf8")}]};
     if(process.env.AGENT_ID) b.agent=process.env.AGENT_ID;
+    if(process.env.MODEL_ID){const m=process.env.MODEL_ID,i=m.indexOf("/");
+      b.model={providerID:m.slice(0,i), modelID:m.slice(i+1)};}
+    if(process.env.VARIANT_ID) b.variant=process.env.VARIANT_ID;
     process.stdout.write(JSON.stringify(b));' \
   | curl -sf -m 20 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/session/$1/prompt_async?$DIR_Q" -H 'content-type: application/json' --data-binary @-
 }
@@ -1655,6 +1665,13 @@ if [ "$MODE" = "send" ]; then
   [ -z "$MSG" ] && { echo "error: prompt file is empty: $PROMPT_FILE" >&2; exit 2; }
   if [ -n "$STEER" ] || [ -n "$QUEUE" ]; then
     delivery="steer"; [ -n "$QUEUE" ] && delivery="queue"
+    # /api/session/{id}/prompt (steer/queue delivery) has no model/variant/agent
+    # field in its schema (confirmed via GET /doc) — unlike prompt_async, there
+    # is no way to apply --model/--effort/--agent on this path. Warn rather than
+    # silently drop them.
+    if [ -n "$MODEL" ] || [ -n "$VARIANT" ] || [ -n "$AGENT" ]; then
+      echo "warning: --model/--effort/--agent have no effect with --steer/--queue (the $delivery API has no model field); the turn runs on the session's configured model" >&2
+    fi
     MSG="$MSG" DELIVERY="$delivery" node -e '
       process.stdout.write(JSON.stringify({prompt:{text:process.env.MSG},delivery:process.env.DELIVERY}));' \
           | curl -sf -m 20 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/api/session/$SID/prompt?$DIR_Q" \
@@ -1678,7 +1695,7 @@ if [ "$MODE" = "send" ]; then
     precount="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" 2>/dev/null \
       | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).length))}catch(e){process.stdout.write("0")}});')"
     precount="${precount:-0}"
-    oc_submit_async "$SID" "$msgfile" || { echo "error: could not submit message to $SID" >&2; exit 5; }
+    oc_submit_async "$SID" "$msgfile" "$AGENT" "$MODEL" "$VARIANT" || { echo "error: could not submit message to $SID" >&2; exit 5; }
     if [ -n "$AWAIT" ]; then
       await_turn "$SID" "$((precount + 2))"
     else
@@ -1951,7 +1968,7 @@ perm=""
 { [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; } && perm='[{"permission":"edit","pattern":"**","action":"allow"},{"permission":"bash","pattern":"**","action":"allow"}]'
 
 SID="$(oc_create_session "$AGENT_USE" "$MODEL" "$VARIANT" "$title" "$perm")" || { echo "error: could not create session" >&2; exit 5; }
-oc_submit_async "$SID" "$msgfile" "$AGENT_USE" || { echo "error: could not submit prompt to $SID" >&2; exit 5; }
+oc_submit_async "$SID" "$msgfile" "$AGENT_USE" "$MODEL" "$VARIANT" || { echo "error: could not submit prompt to $SID" >&2; exit 5; }
 
 # Early worktree-mismatch guard. Server-backed sessions run in the SERVER's cwd,
 # not --dir; --follow/--background exit before the final banner's NOTE, so warn up
