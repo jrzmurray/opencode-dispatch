@@ -932,6 +932,14 @@ EOF
   opencode auth list 2>/dev/null | sed 's/^/  /' || echo "  (none — run: opencode auth login)"
   echo "models available:"
   opencode models 2>/dev/null | sed 's/^/  - /' | head -40 || echo "  (run after auth to list)"
+  # Install drift: is this installed copy still what the checkout has?
+  if [ -f "$SELF_DIR/opencode-install-check.mjs" ]; then
+    echo "install:"
+    node "$SELF_DIR/opencode-install-check.mjs" "$SELF_DIR" 2>&1 | sed 's/^/  /' \
+      || true
+    node "$SELF_DIR/opencode-install-check.mjs" "$SELF_DIR" >/dev/null 2>&1 \
+      || echo "  WARNING: installed opencode-dispatch is stale or unverifiable; re-run ./install.sh" >&2
+  fi
   exit 0
 fi
 

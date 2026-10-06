@@ -100,7 +100,9 @@ Install arguments:
 
 In repo scope the machine-level config samples (`opencode.json`,
 `servers.json.example` → `~/.config/…`) are skipped, and Codex installs are
-always the direct drop (the marketplace is a user-profile concept).
+always the direct drop (the marketplace is a user-profile concept). Repo scope
+is otherwise unchanged apart from now also carrying the launcher scripts; see
+[Known issues](#known-issues--follow-ups).
 
 For Claude Code, the installer copies the dispatch script, the set-model
 script, the tail-guard hook, and the slash commands into the Claude directory
@@ -124,6 +126,22 @@ To skip the plugin + marketplace entirely, add `--no-marketplace`: the skills
 and guard hook are then dropped directly into Codex's auto-discovered paths
 (`~/.codex/skills/<opencode-*>/SKILL.md` and `~/.codex/hooks.json`, merged) —
 no marketplace registration needed, same one-time `/hooks` trust step.
+
+Profile Codex installs are **self-contained**: the dispatch wrapper, agent
+launcher, and guard are installed into the plugin's `scripts/`
+(`~/.codex/plugins/opencode-dispatch/scripts/`) or, with `--no-marketplace`,
+`~/.codex/scripts/`, and the generated skills call them there. `--codex` alone
+never touches `~/.claude`, and a Codex-only developer needs no Claude install.
+
+### Install stamp, drift, and updates
+
+Every profile install writes `.opencode-dispatch-install.json` next to its
+scripts (source SHA, checkout path, installed file list). Re-installing removes
+scripts a previous install put there that are no longer part of the set.
+`./install.sh --check` (optionally with `--claude`/`--codex`) compares each
+stamp and every installed script against this checkout and exits 1 on drift;
+`/opencode:setup` runs the same check and warns. To update an install, `git pull`
+this checkout and re-run `./install.sh`.
 
 Agent config, server profiles, credentials, and the orchestration-script root
 are covered in [Configuration](#configuration).
@@ -581,6 +599,20 @@ distilled `--background` result), and piping through tail can clip the final res
 Rerun without the pipe and use the script's own flags instead. If you need the
 hook gone, remove the `opencode-guard.sh` entry from the `PreToolUse` array in
 `~/.claude/settings.json`.
+
+## Known issues / follow-ups
+
+Repo scope (`--scope repo`) is deliberately left at its original behaviour.
+Known problems, to fix separately:
+
+- **Credential copy into the repo:** `.env.local` (server credentials) is copied
+  into `<repo>/.claude/scripts/`, where it can be committed.
+- **Absolute hook paths:** the PreToolUse hook command written to
+  `<repo>/.claude/settings.json` and `<repo>/.codex/hooks.json` is an absolute
+  path on the installing machine, so a committed file is not portable.
+- **Profile script paths in skills:** the slash commands and the generated
+  Codex skills still call `$HOME/.claude/scripts/…`, so they do not use the
+  repo-local copy. Repo scope has no stamp, drift check, or stale-file cleanup.
 
 ## Validation
 
