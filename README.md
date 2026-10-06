@@ -13,8 +13,8 @@ Git worktree, one branch, one task record, and one directory-bound OpenCode
 session. Workers never edit the primary checkout or another worker's worktree by
 default.
 
-See [DESIGN.md](DESIGN.md) for the delegation architecture and the orchestration
-repository's `scripts/README.md` for the launcher and worker-script reference.
+See [DESIGN.md](DESIGN.md) for the delegation architecture; the launcher and
+worker scripts are documented under "Agent launcher scripts" below.
 
 ## What is installed
 
@@ -25,12 +25,13 @@ repository's `scripts/README.md` for the launcher and worker-script reference.
 | `scripts/opencode-guard.sh` | `~/.claude/scripts/opencode-guard.sh` | PreToolUse hook (Bash matcher) that throws if `opencode-dispatch.sh` output is piped through `tail`. |
 | `commands/opencode/*.md` | `~/.claude/commands/opencode/` | Claude Code slash-command instructions. |
 | `install.sh` | not installed | Installs the surfaces above, registers the tail-guard hook in `~/.claude/settings.json` (merged, never clobbered), and copies the config samples (`config/opencode.json`, `config/servers.json.example`) into `~/.config/…` only when no file exists there yet. It never reads or writes provider credentials. |
-| Repository orchestration scripts | `<repository>/scripts/` or `OPENCODE_ORCHESTRATION_ROOT` | Allocates worktrees, bootstraps children, verifies sessions, reports status, and cleans up. External — not part of this repository. |
+| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`) | run in place from this checkout (not copied by `install.sh`) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, and cleans up. |
 
-The skill repository is not the worker repository. The dispatch script discovers
-the orchestration scripts from `<--dir>/scripts` by default. If the skill is
-installed globally or the current repository stores the scripts elsewhere, set
-`OPENCODE_ORCHESTRATION_ROOT` or pass `--orchestration-root <path>`.
+The skill repository is not the worker repository. The launcher scripts live in
+this repository's `scripts/` and are not installed; the dispatch script looks
+for them in `<--dir>/scripts` by default, so point it at this checkout with
+`OPENCODE_ORCHESTRATION_ROOT=<this checkout>/scripts` or
+`--orchestration-root <path>`.
 
 ## Prerequisites
 
@@ -50,13 +51,12 @@ What each item is actually needed for:
 - **An authenticated OpenCode provider** — run `opencode auth login` once per
   provider. opencode stores credentials itself; never set API keys in
   environment variables or config files.
-- **The orchestration scripts (external — not in this repo)** — only the
+- **The launcher scripts (`scripts/*.mjs`, in this repo)** — only the
   edit-capable `task` and `bulk` modes need them: `spawn-agent.mjs`,
-  `bootstrap-worktree.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`,
-  `agent-worker-guard.mjs`, `agent-status.mjs`, and `agent-cleanup.mjs` live
-  in the orchestration repository. Point the wrapper at them with
+  `worktree-utils.mjs`, `opencode-server.mjs`, `agent-worker-guard.mjs`,
+  `agent-status.mjs`, and `agent-cleanup.mjs`. Point the wrapper at them with
   `OPENCODE_ORCHESTRATION_ROOT` or `--orchestration-root` (default:
-  `<--dir>/scripts`). Read-only and control modes (`review`, `plan`, `ask`,
+  `<--dir>/scripts`). A per-repo bootstrap hook is optional (see below). Read-only and control modes (`review`, `plan`, `ask`,
   `follow`, `status`, `history`, `send`, `abort`, …) run without them.
 - **A clean source worktree for edit tasks** — enforced by the external
   launcher; uncommitted source changes are not copied into a worker worktree.
@@ -190,15 +190,49 @@ server for changes to take effect.
 
 ### Orchestration scripts
 
-Only `task` and `bulk` need the external orchestration scripts. If they are in
-the current project checkout, no additional setting is required. Otherwise:
+Only `task` and `bulk` need the launcher scripts. Unless the target project
+vendors them in its own `scripts/`, point at this checkout:
 
 ```bash
-export OPENCODE_ORCHESTRATION_ROOT=/absolute/path/to/repository/scripts
+export OPENCODE_ORCHESTRATION_ROOT=/absolute/path/to/opencode-dispatch/scripts
 ```
 
 The value must contain `spawn-agent.mjs` and the other lifecycle helpers. Keep
 it on a trusted local filesystem; it is executable orchestration code.
+
+### Agent launcher scripts
+
+Standalone commands (run from the clean source worktree of the target repo, or
+pass `--from <path>`):
+
+| Command | Purpose |
+| --- | --- |
+| `node <scripts>/spawn-agent.mjs [--label n] [--base ref] [--bootstrap-cmd cmd] [--no-bootstrap] [--prepare-only\|--dry-run] -- <prompt>` | Allocate a task, create a locked worktree and branch, run the bootstrap hook, create a directory-bound session on the persistent server, run the guard, and launch the attached worker. Prints one JSON record. |
+| `node <scripts>/agent-status.mjs [--task <id>] [--json]` | Read-only report of local process, worktree, and server-session state. |
+| `node <scripts>/agent-cleanup.mjs --task <id> [--dry-run] [--delete-branch] [--force]` | Fail-closed stop/remove/archive of one task. |
+| `node <scripts>/agent-worker-guard.mjs --metadata <task.json>` | Preflight assertion of repository, path, branch, and record. |
+
+Run `spawn-agent.mjs --help` for every flag.
+
+#### Per-repo bootstrap hook
+
+After the child worktree is created, `spawn-agent.mjs` runs one shell command in
+it (cwd = the child worktree). The command is chosen by, in order:
+
+1. `--bootstrap-cmd "<cmd>"`
+2. the `bootstrap` string in `<source repo>/.opencode-dispatch.json`:
+
+   ```json
+   { "bootstrap": "node scripts/agent/bootstrap-worktree.mjs" }
+   ```
+3. otherwise no bootstrap runs.
+
+`--no-bootstrap` disables the hook entirely. The command receives
+`AGENT_*` (task id, worktree path, branch, record) plus `WORKTREE_TASK_ID`,
+`WORKTREE_SOURCE_PATH`, `WORKTREE_ORIGIN=spawned-agent`,
+`WORKTREE_BOOTSTRAP_CHILD=0`, and `WORKTREE_SESSION_START=0`. A non-zero exit
+rolls the task back. The config file is read from the clean source checkout and
+executed as shell, so treat it like any other repo-controlled script.
 
 ### Environment variables
 
@@ -442,7 +476,7 @@ ownership.
 
 ## Worktree and task lifecycle
 
-The orchestration scripts keep an ownership record for every worker. The record
+The launcher scripts keep an ownership record for every worker. The record
 contains the task ID, repository identity, branch, worktree path, server URL,
 session ID, process ID, state, and log path. Credentials are not written to task
 records.
@@ -504,8 +538,8 @@ the worktree, optionally deletes the branch, and archives the ownership record.
 
 ### `isolated worker launcher not found`
 
-Set `OPENCODE_ORCHESTRATION_ROOT` to the directory containing `spawn-agent.mjs`,
-or pass `--orchestration-root /absolute/path/to/scripts`. Confirm that the path is
+Set `OPENCODE_ORCHESTRATION_ROOT` to this repository's `scripts/` directory
+(containing `spawn-agent.mjs`), or pass `--orchestration-root /absolute/path/to/scripts`. Confirm that the path is
 the same trusted checkout whose scripts you reviewed.
 
 ### `source worktree is dirty`
@@ -557,11 +591,11 @@ Skill shell checks:
 bash -n scripts/opencode-dispatch.sh scripts/opencode-set-model.sh scripts/opencode-guard.sh install.sh
 ```
 
-Orchestration checks, from the application checkout containing the scripts:
+Launcher checks (from this repository's root):
 
 ```bash
-node --check scripts/spawn-agent.mjs
-node --test scripts/agent-worktree.test.mjs
+npm run check   # node --check on the launcher scripts
+npm test        # node --test scripts/tests/*.test.mjs
 ```
 
 The tests use temporary Git repositories and mocked server requests. They must not

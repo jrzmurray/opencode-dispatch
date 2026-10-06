@@ -1,0 +1,9 @@
+{
+  "name": "opencode-dispatch",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test scripts/tests/*.test.mjs",
+    "check": "node --check scripts/spawn-agent.mjs && node --check scripts/agent-status.mjs && node --check scripts/agent-cleanup.mjs && node --check scripts/agent-worker-guard.mjs"
+  }
+}
