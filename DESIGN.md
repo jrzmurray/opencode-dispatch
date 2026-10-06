@@ -129,8 +129,11 @@ Each contract-designed to return distilled output.
   model, or the Claude subagents' own calls during a capacity event. Pin the model
   (`--model deepseek/...`) and check `status`'s `lastError` / the error's
   `metadata.url` to see which backend actually failed.
-- **Edit workers are isolated:** task/bulk call the repository's
-  `spawn-agent.mjs`, which allocates and bootstraps one locked worktree, creates a
+- **Edit workers are isolated:** task/bulk call `scripts/spawn-agent.mjs` (this
+  repo; helpers `worktree-utils.mjs`, `opencode-server.mjs`, `agent-worker-guard.mjs`,
+  `agent-status.mjs`, `agent-cleanup.mjs`), which allocates one locked worktree,
+  runs the target repo's optional bootstrap hook (`--bootstrap-cmd` or
+  `.opencode-dispatch.json`), creates a
   directory-bound session on the single persistent server, verifies the returned
   directory, and launches `opencode run --attach ... --auto`. Edit/bash are
   pre-authorized (`permission:[{edit/bash,**,allow}]`).
