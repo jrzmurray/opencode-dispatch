@@ -382,6 +382,9 @@ REPO=""
 PR=""
 SCOPE=""
 DIR="$PWD"
+# Directory this script runs from. The agent launcher (spawn-agent.mjs and its
+# helpers) is installed alongside it, so that is the default orchestration root.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 FORMAT=""
 TAIL="100"
 TAIL_SET=""
@@ -563,7 +566,7 @@ refresh_dir_query() {
 
 resolve_task_context() {
   [ -n "$TASK_ID" ] || return 0
-  local orch="${ORCHESTRATION_ROOT:-$DIR/scripts}" status_json
+  local orch="${ORCHESTRATION_ROOT:-$SELF_DIR}" status_json
   [ -f "$orch/agent-status.mjs" ] || { echo "error: task lifecycle helper not found: $orch/agent-status.mjs" >&2; exit 5; }
   status_json="$(node "$orch/agent-status.mjs" --from "$DIR" --worktree-root "${WORKTREE_ROOT:-}" --task "$TASK_ID" --json)" || exit 5
   IFS=$'\t' read -r SID DIR < <(printf '%s' "$status_json" | node -e '
@@ -1919,7 +1922,7 @@ fi
 ISOLATED=0
 if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
   ISOLATED=1
-  orch="${ORCHESTRATION_ROOT:-$DIR/scripts}"
+  orch="${ORCHESTRATION_ROOT:-$SELF_DIR}"
   spawn="$orch/spawn-agent.mjs"
   if [ ! -f "$spawn" ]; then
     echo "error: isolated worker launcher not found: $spawn" >&2
