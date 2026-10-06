@@ -1342,10 +1342,9 @@ if [ "$MODE" = "setup" ]; then
   # Install drift: is this installed copy still what the checkout has?
   if [ -f "$SCRIPT_DIR/opencode-install-check.mjs" ]; then
     echo "install:"
-    node "$SCRIPT_DIR/opencode-install-check.mjs" "$SCRIPT_DIR" 2>&1 | sed 's/^/  /' \
-      || true
-    node "$SCRIPT_DIR/opencode-install-check.mjs" "$SCRIPT_DIR" >/dev/null 2>&1 \
-      || echo "  WARNING: installed opencode-dispatch is stale or unverifiable; re-run ./install.sh" >&2
+    inst_out="$(node "$SCRIPT_DIR/opencode-install-check.mjs" "$SCRIPT_DIR" 2>&1)" && inst_rc=0 || inst_rc=$?
+    printf '%s\n' "$inst_out" | sed 's/^/  /'
+    [ "$inst_rc" = 0 ] || echo "  WARNING: installed opencode-dispatch has drifted from its checkout; re-run ./install.sh" >&2
   fi
   exit 0
 fi
