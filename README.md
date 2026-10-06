@@ -25,7 +25,7 @@ worker scripts are documented under "Agent launcher scripts" below.
 | `scripts/opencode-guard.sh` | `~/.claude/scripts/opencode-guard.sh` | PreToolUse hook (Bash matcher) that throws if `opencode-dispatch.sh` output is piped through `tail`. |
 | `commands/opencode/*.md` | `~/.claude/commands/opencode/` | Claude Code slash-command instructions. |
 | `install.sh` | not installed | Installs the surfaces above, registers the tail-guard hook in `~/.claude/settings.json` (merged, never clobbered), and copies the config samples (`config/opencode.json`, `config/servers.json.example`) into `~/.config/…` only when no file exists there yet. It never reads or writes provider credentials. |
-| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`, `api-dialect.mjs`, `oc-api.mjs`, `agent-config.mjs`, `server-profiles.mjs`, `server-credentials.cjs`, `prune-named-sessions.mjs`) | `~/.claude/scripts/` (installed next to the dispatcher) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, cleans up, prunes old named sessions, resolves profiles/credentials, and owns the v1/v2 API dialect layer. |
+| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`, `api-dialect.mjs`, `oc-api.mjs`, `agent-config.mjs`, `server-profiles.mjs`, `server-credentials.cjs`, `prune-named-sessions.mjs`) | `~/.claude/scripts/` (next to the dispatch script; repo scope: `<repo>/.claude/scripts/` and `<repo>/.codex/scripts/`) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, cleans up, prunes old named sessions, resolves profiles/credentials, and owns the v1/v2 API dialect layer. |
 
 The skill repository is not the worker repository. `install.sh` installs the
 launcher scripts next to `opencode-dispatch.sh`, and the dispatcher finds them
@@ -57,9 +57,9 @@ What each item is actually needed for:
 - **The launcher scripts (`scripts/*.mjs`, in this repo)** — only the
   edit-capable `task` and `bulk` modes need them: `spawn-agent.mjs`,
   `worktree-utils.mjs`, `opencode-server.mjs`, `agent-worker-guard.mjs`,
-  `agent-status.mjs`, and `agent-cleanup.mjs`. `install.sh` puts them next to
-  the dispatcher, which finds them there; `OPENCODE_ORCHESTRATION_ROOT` or
-  `--orchestration-root` overrides (fallback: `<--dir>/scripts`). A per-repo bootstrap hook is optional (see below). Read-only and control modes (`review`, `plan`, `ask`,
+  `agent-status.mjs`, and `agent-cleanup.mjs`. `install.sh` copies them next
+  to `opencode-dispatch.sh`, which finds them in its own directory (override
+  with `OPENCODE_ORCHESTRATION_ROOT` or `--orchestration-root`). A per-repo bootstrap hook is optional (see below). Read-only and control modes (`review`, `plan`, `ask`,
   `follow`, `status`, `history`, `send`, `abort`, …) run without them.
 - **Dirty source worktrees are allowed for edit tasks** — workers start from the
   selected Git ref (`HEAD` by default); uncommitted source changes stay in the
@@ -320,16 +320,13 @@ source labels but never returns key values.
 
 ### Orchestration scripts
 
-Only `task` and `bulk` need the launcher scripts. `install.sh` installs them next
-to the dispatcher, so nothing needs configuring. To run a different copy (for
-example this checkout while developing the launcher), override it:
-
-```bash
-export OPENCODE_ORCHESTRATION_ROOT=/absolute/path/to/opencode-dispatch/scripts
-```
-
-The value must contain `spawn-agent.mjs` and the other lifecycle helpers. Keep
-it on a trusted local filesystem; it is executable orchestration code.
+Only `task` and `bulk` need the launcher scripts. `install.sh` installs them
+next to `opencode-dispatch.sh`, and the wrapper looks in its own directory by
+default, so no setup is needed. Run `./install.sh --check` (profile scope) to
+see whether the installed copy has drifted from this checkout (it compares the
+install stamp `.opencode-dispatch-install.json` and every script byte for
+byte); re-run `./install.sh` to update. `OPENCODE_ORCHESTRATION_ROOT` remains
+as an override for a trusted alternative location.
 
 ### Agent launcher scripts
 
@@ -810,9 +807,10 @@ or `~/.claude/scripts/.env.local`; exported variables always win.
 
 ### `isolated worker launcher not found`
 
-Set `OPENCODE_ORCHESTRATION_ROOT` to this repository's `scripts/` directory
-(containing `spawn-agent.mjs`), or pass `--orchestration-root /absolute/path/to/scripts`. Confirm that the path is
-the same trusted checkout whose scripts you reviewed.
+The launcher is missing next to `opencode-dispatch.sh`: re-run `./install.sh`
+(older installs did not copy it). `./install.sh --check` lists what is missing.
+Or set `OPENCODE_ORCHESTRATION_ROOT` / pass `--orchestration-root <path>` to a
+trusted directory containing `spawn-agent.mjs`.
 
 ### A worker does not include uncommitted source changes
 
