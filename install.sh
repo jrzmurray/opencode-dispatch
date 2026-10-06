@@ -147,8 +147,8 @@ while [ $# -gt 0 ]; do
     --help|--usage|-\?) print_help; exit 0 ;;  # NOTE: \-? escaped — bare ? would glob-match -s/-r
     --claude) DO_CLAUDE=1; shift ;;
     --codex) CODEX=1; shift ;;
-    -s|--scope) SCOPE="${2:-}"; SCOPE_SET=1; shift 2 ;;
-    -r|--repo) TARGET_REPO="${2:-}"; shift 2 ;;
+    -s|--scope) [ $# -ge 2 ] || { echo "error: $1 needs a value (profile|repo)" >&2; exit 2; }; SCOPE="$2"; SCOPE_SET=1; shift 2 ;;
+    -r|--repo) [ $# -ge 2 ] || { echo "error: $1 needs a path" >&2; exit 2; }; TARGET_REPO="$2"; shift 2 ;;
     --no-marketplace) NO_MARKETPLACE=1; shift ;;
     --check) CHECK=1; shift ;;
     *) echo "error: unknown argument: $1 (see: ./install.sh --help)" >&2; exit 2 ;;
@@ -162,7 +162,9 @@ if [ -n "$CHECK" ]; then
   ch_claude="${CLAUDE_HOME:-$HOME/.claude}/scripts"
   checked=0; drift=0
   chk() {  # $1 label, $2 dir, $3 requested(1/"")
-    if [ -f "$2/.opencode-dispatch-install.json" ] || [ -n "$3" ]; then
+    if [ ! -f "$2/.opencode-dispatch-install.json" ] && [ -n "$3" ]; then
+      echo "== $1: $2"; checked=1; echo "no install stamp (not installed, or installed by an older install.sh)"; drift=1
+    elif [ -f "$2/.opencode-dispatch-install.json" ]; then
       echo "== $1: $2"; checked=1
       node "$check_repo/scripts/opencode-install-check.mjs" "$2" "$check_repo" || drift=1
     fi
@@ -258,10 +260,12 @@ EOF
     echo "installed: $dest/$f"
   done
   if [ "$SCOPE" != "repo" ]; then
-    node - "$dest/$STAMP_NAME" "$REPO" "$DISPATCH_SCRIPTS $LAUNCHER_SCRIPTS" "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" <<'EOF'
+    node - "$dest/$STAMP_NAME" "$REPO" "$DISPATCH_SCRIPTS $LAUNCHER_SCRIPTS" "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" "${STAMP_COMMANDS_DIR:-}" <<'EOF'
       const fs = require("fs");
-      const [out, repo, files, sha] = process.argv.slice(2);
-      fs.writeFileSync(out, JSON.stringify({ sourceSha: sha, sourceRepo: repo, installedAt: new Date().toISOString(), files: files.split(/\s+/) }, null, 2) + "\n");
+      const [out, repo, files, sha, commandsDir] = process.argv.slice(2);
+      const stamp = { sourceSha: sha, sourceRepo: repo, installedAt: new Date().toISOString(), files: files.split(/\s+/) };
+      if (commandsDir) stamp.commandsDir = commandsDir;
+      fs.writeFileSync(out, JSON.stringify(stamp, null, 2) + "\n");
 EOF
     echo "stamped:   $dest/$STAMP_NAME"
   fi
@@ -287,8 +291,9 @@ EOF
 install_claude() {  # $1 = install root (profile: $CLAUDE, repo: $REPO/.claude)
   local ROOT="$1"
 
-  # 1) scripts (dispatch + agent launcher, side by side)
-  install_script_set "$ROOT/scripts"
+  # 1) scripts (dispatch + agent launcher, side by side); the stamp also records
+  # the commands dir so --check / setup compare the installed commands too.
+  STAMP_COMMANDS_DIR="$ROOT/commands/opencode" install_script_set "$ROOT/scripts"
 
   # 2) slash commands
   mkdir -p "$ROOT/commands/opencode"

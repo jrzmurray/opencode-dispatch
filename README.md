@@ -25,7 +25,7 @@ worker scripts are documented under "Agent launcher scripts" below.
 | `scripts/opencode-guard.sh` | `~/.claude/scripts/opencode-guard.sh` | PreToolUse hook (Bash matcher) that throws if `opencode-dispatch.sh` output is piped through `tail`. |
 | `commands/opencode/*.md` | `~/.claude/commands/opencode/` | Claude Code slash-command instructions. |
 | `install.sh` | not installed | Installs the surfaces above, registers the tail-guard hook in `~/.claude/settings.json` (merged, never clobbered), and copies the config samples (`config/opencode.json`, `config/servers.json.example`) into `~/.config/…` only when no file exists there yet. It never reads or writes provider credentials. |
-| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`) | `~/.claude/scripts/` (next to the dispatch script; repo scope: `<repo>/.claude/scripts/` and `<repo>/.codex/scripts/`) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, and cleans up. |
+| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`) | `~/.claude/scripts/` (next to the dispatch script; repo scope: `<repo>/.claude/scripts/`; Codex profile: its own scripts dir) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, and cleans up. |
 
 The skill repository is not the worker repository. The launcher scripts live in
 this repository's `scripts/` and are not installed; the dispatch script looks
@@ -139,8 +139,13 @@ Every profile install writes `.opencode-dispatch-install.json` next to its
 scripts (source SHA, checkout path, installed file list). Re-installing removes
 scripts a previous install put there that are no longer part of the set.
 `./install.sh --check` (optionally with `--claude`/`--codex`) compares each
-stamp and every installed script against this checkout and exits 1 on drift;
-`/opencode:setup` runs the same check and warns. To update an install, `git pull`
+stamp and every installed script (and, for Claude, every installed command)
+against this checkout and exits 1 on drift. Drift means differing **content**;
+a newer checkout SHA alone is reported as info, not drift. Generated Codex
+skills and hook registration are not compared (re-run `install.sh` after
+pulling). `/opencode:setup` runs the same check and warns on drift; an install
+with no stamp (repo scope, or running from the checkout) just prints that the
+drift check was skipped. To update an install, `git pull`
 this checkout and re-run `./install.sh`.
 
 Agent config, server profiles, credentials, and the orchestration-script root
@@ -242,6 +247,8 @@ it (cwd = the child worktree). The command is chosen by, in order:
    { "bootstrap": "node scripts/agent/bootstrap-worktree.mjs" }
    ```
 3. otherwise no bootstrap runs.
+
+**Security:** the `bootstrap` command is repo-controlled code execution; it runs with your privileges in every spawned worktree, so trust `.opencode-dispatch.json` exactly as you trust a `package.json` script.
 
 `--no-bootstrap` disables the hook entirely. The command receives
 `AGENT_*` (task id, worktree path, branch, record) plus `WORKTREE_TASK_ID`,
