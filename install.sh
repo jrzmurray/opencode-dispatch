@@ -59,6 +59,10 @@ Claude install (--claude):
   scripts/opencode-hang-diag.sh     -> same dirs
   scripts/opencode-set-model.sh     -> same dirs
   scripts/opencode-guard.sh         -> same dirs
+  scripts/{spawn-agent,agent-status,agent-cleanup,agent-worker-guard,
+          worktree-utils,opencode-server}.mjs
+                                    -> same dirs (task/bulk worker launcher;
+                                       the dispatcher finds it next to itself)
   commands/opencode/*.md            -> $CLAUDE/commands/opencode/ (profile)
                                        <repo>/.claude/commands/opencode/ (repo)
   PreToolUse/Bash hook              -> merged into $CLAUDE/settings.json
@@ -176,6 +180,7 @@ if [ "$SCOPE" = "repo" ]; then
 fi
 
 CLAUDE="${CLAUDE_HOME:-$HOME/.claude}"
+LAUNCHER_FILES=(spawn-agent.mjs agent-status.mjs agent-cleanup.mjs agent-worker-guard.mjs worktree-utils.mjs opencode-server.mjs)
 CONFIG="$HOME/.config/opencode/opencode.json"
 echo "repo:   $REPO"
 echo "claude: $CLAUDE"
@@ -194,6 +199,12 @@ install_claude() {  # $1 = install root (profile: $CLAUDE, repo: $REPO/.claude)
   echo "installed: $ROOT/scripts/opencode-set-model.sh"
   install -m 0755 "$REPO/scripts/opencode-guard.sh" "$ROOT/scripts/opencode-guard.sh"
   echo "installed: $ROOT/scripts/opencode-guard.sh"
+  # Worker launcher for task/bulk: the dispatcher finds it next to itself.
+  # The modules import each other by relative path, so they install together.
+  for f in "${LAUNCHER_FILES[@]}"; do
+    install -m 0755 "$REPO/scripts/$f" "$ROOT/scripts/$f"
+  done
+  echo "installed: $ROOT/scripts/ worker launcher (${LAUNCHER_FILES[*]})"
 
   # 2) slash commands
   mkdir -p "$ROOT/commands/opencode"
