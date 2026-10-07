@@ -149,7 +149,9 @@
 #                             and exit 9 instead of just warning. Use to stop a
 #                             subagent editing the wrong (shared) tree.
 #   --orchestration-root <p>  Directory containing spawn-agent.mjs and the
-#                             worktree lifecycle helpers (task/bulk).
+#                             worktree lifecycle helpers (task/bulk). Default:
+#                             this script's own dir (install.sh puts them
+#                             there), else <--dir>/scripts.
 #   --task <id>               Resolve a worker task record for lifecycle commands.
 #   --json                    (run modes, --direct only) raw JSON events
 #   --tail <N>                (history) keep only the last N lines (default 100)
@@ -304,7 +306,8 @@ Review-only flags:
   --scope <auto|working-tree|branch>  What to diff; branch requires --base.
 
 Task/bulk-only flags:
-  --orchestration-root <p>  Directory with spawn-agent.mjs + worktree helpers.
+  --orchestration-root <p>  Directory with spawn-agent.mjs + worktree helpers
+                      (default: next to this script, where install.sh puts them).
   --worktree-root <p>  Override the worktree allocation root.
   --require-dir       With --follow/--background: abort if the server cwd
                       differs from --dir.
@@ -406,6 +409,13 @@ STALL_SECS="${OPENCODE_DISPATCH_STALL_SECS:-900}"
 # editing one shared server tree when they meant to target separate worktrees.
 REQUIRE_DIR=""
 ORCHESTRATION_ROOT="${OPENCODE_ORCHESTRATION_ROOT:-}"
+# Default: the launcher install.sh puts next to this script. Falls back to
+# <--dir>/scripts only when neither this nor the env/flag supplies one.
+if [ -z "$ORCHESTRATION_ROOT" ]; then
+  _self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  [ -f "$_self_dir/spawn-agent.mjs" ] && ORCHESTRATION_ROOT="$_self_dir"
+  unset _self_dir
+fi
 WORKTREE_ROOT="${AGENT_WORKTREE_ROOT:-}"
 TASK_ID=""
 PROMPT_FILE=""
