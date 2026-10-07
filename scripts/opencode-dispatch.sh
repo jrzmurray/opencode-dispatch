@@ -33,6 +33,9 @@
 #   status    Liveness of sessions. With a <sessionID>: detailed view of that
 #             session (activity, cost, state). Without one: one-line summary of
 #             all sessions, sorted newest first. Cheap — no transcript pulled.
+#             --follow re-polls (every 3s, printing only on change) until the
+#             session is idle; --timeout <N> bounds it (default 300s, 0 =
+#             unbounded). Without a <sessionID> it refreshes until the timeout.
 #   send      Message an existing session. <sessionID> then the message text.
 #             Default delivery: async submit + follow the turn (300s bounded,
 #             --timeout tunable) then print the reply — no more hard 300s curl
@@ -107,11 +110,13 @@
 #                             --auto adds nothing there and would only
 #                             auto-approve plan's remaining read-only guards
 #                             (external_directory/doom_loop asks).
-#   --follow                  (run modes + send) after the async submit, wait
+#   --follow                  (run modes + send + status) after the async submit, wait
 #                             (bounded) for the turn to finish and print the
 #                             reply inline. Run-mode default timeout 300s then
 #                             leaves it running; send's DEFAULT delivery is this
-#                             loop (300s, --timeout tunable).
+#                             loop (300s, --timeout tunable). For status it
+#                             re-polls until the session is idle (see status).
+#                             Ignored (with a warning) by every other mode.
 #   --background              (run modes + send) the job runs in the BACKGROUND
 #                             on the persistent opencode server (detached, no
 #                             terminal; it survives this process). The wrapper
@@ -246,7 +251,8 @@ Modes:
   bulk        Same as task, for background/batch work.
   serve       Start/confirm the persistent server; also --stop / --restart.
   sessions    List sessions from the server (id, updated, title).
-  status      Liveness of a session (or a one-line summary of all sessions).
+  status      Liveness of a session (or a one-line summary of all sessions);
+              --follow keeps polling until the session is idle.
   history     Print a session transcript (bound with --tail/--turns/--since).
   send        Message an existing session (completion-loop reply, or --steer/--queue).
   abort       Interrupt a session's in-progress turn.
@@ -296,6 +302,12 @@ Send flags (send):
                       --timeout tunable); prints the reply and exits 0 on
                       timeout, leaving the turn running.
   --timeout/--stall   As in run-mode flags above.
+
+Status flags (status):
+  --follow            Re-poll every 3s, printing only on change; exits 0 when
+                      the <sessionID> (or --task) goes idle. Without a session
+                      it refreshes the summary until the timeout / Ctrl-C.
+  --timeout <N>       Max seconds to follow (default 300; 0 = unbounded).
 
 Review-only flags:
   --base <ref>        Diff base ref (the job's base branch), e.g. main.
@@ -349,6 +361,7 @@ EOF
 }
 
 MODE="${1:-}"
+ORIG_ARGS=("$@")
 if [ -z "$MODE" ]; then
   echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|status|history|send|abort|permissions|allow|follow|setup|identify|claim|release)" >&2
   echo "  Run: $(basename "$0") --help" >&2
@@ -596,6 +609,15 @@ case "$SCOPE" in
   ""|auto|working-tree|branch) ;;
   *) echo "error: --scope must be one of auto|working-tree|branch (got: $SCOPE)" >&2; exit 2 ;;
 esac
+
+# --follow only means something for run modes, send, status and follow itself;
+# warn rather than silently ignoring it elsewhere.
+if [ -n "$FOLLOW" ]; then
+  case "$MODE" in
+    review|plan|ask|task|bulk|send|status|follow) ;;
+    *) echo "warning: --follow has no effect on '$MODE' (supported: review|plan|ask|task|bulk|send|status|follow); ignoring." >&2 ;;
+  esac
+fi
 
 # Tasks default to --background: every run mode sends the job to the background
 # and blocks until the turn completes (wake-on-complete — the caller's session
@@ -1321,6 +1343,27 @@ fi
 # ---- status ------------------------------------------------------------------
 if [ "$MODE" = "status" ]; then
   require_server
+  # --follow: re-poll (this same status, minus --follow) every few seconds,
+  # printing only when the output changes. With a <sessionID> it stops when the
+  # session goes idle; otherwise (or on a still-working session) it runs until
+  # --timeout (default 300s; 0 = unbounded) or Ctrl-C.
+  if [ -n "$FOLLOW" ] && [ -z "${OPENCODE_STATUS_ONCE:-}" ]; then
+    _once=(); for _a in "${ORIG_ARGS[@]}"; do [ "$_a" = "--follow" ] || _once+=("$_a"); done
+    _deadline=$(( $(date +%s) + FOLLOW_TIMEOUT )); _prev=""
+    while :; do
+      _out="$(OPENCODE_STATUS_ONCE=1 bash "$0" "${_once[@]}" 2>&1)"; _rc=$?
+      # Ages tick every poll ("updated:" line; "N ago" column in the all-sessions
+      # list); strip them so only real changes trigger a reprint.
+      _cmp="$(printf '%s\n' "$_out" | grep -v '^updated: ' | sed -E 's/ +([0-9]+[hms] ?)+ ago//; s/·([0-9]+[hms] ?)+//')"
+      if [ "$_cmp" != "$_prev" ]; then printf '%s\n' "$_out"; _prev="$_cmp"; fi
+      [ "$_rc" -ne 0 ] && exit "$_rc"
+      if [ -n "${MSG_PARTS[0]:-}${TASK_ID:-}" ] && printf '%s\n' "$_out" | grep -q '^state: *idle'; then exit 0; fi
+      if [ "$FOLLOW_TIMEOUT" != "0" ] && [ "$(date +%s)" -ge "$_deadline" ]; then
+        echo "(timeout after ${FOLLOW_TIMEOUT}s — still following stopped; re-run to continue)" >&2; exit 0
+      fi
+      sleep 3
+    done
+  fi
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
   if [ -z "$SID" ]; then
