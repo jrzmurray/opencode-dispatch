@@ -1752,7 +1752,8 @@ if [ "$MODE" = "teardown" ]; then
   [ -n "$TASK_ID" ] || { echo "error: teardown needs --task <taskID>" >&2; exit 2; }
   extra=()
   [ -n "$TEARDOWN_FORCE" ] && extra+=( --force )
-  run_teardown "$TASK_ID" "${extra[@]}" || exit $?
+  # ${extra[@]:+…}: an empty array trips set -u on macOS bash 3.2.
+  run_teardown "$TASK_ID" ${extra[@]:+"${extra[@]}"} || exit $?
   exit 0
 fi
 
@@ -2073,7 +2074,14 @@ if [ -n "$AWAIT" ]; then
     # (set -e: capture the status without letting a non-zero subshell kill us.)
     ( await_turn "$SID" ) && rc=0 || rc=$?
     if [ "$rc" -eq 0 ]; then
-      run_teardown "$TASK_ID" || echo "warning: teardown of $TASK_ID failed; clean up manually: $(basename "$0") teardown --task $TASK_ID" >&2
+      # The attached client may still be exiting right after the turn goes idle
+      # (agent-cleanup refuses while the PID lives), so retry a few times.
+      td_ok=""
+      for _try in 1 2 3 4 5; do
+        if run_teardown "$TASK_ID"; then td_ok=1; break; fi
+        sleep 3
+      done
+      [ -n "$td_ok" ] || echo "warning: teardown of $TASK_ID failed; clean up manually: $(basename "$0") teardown --task $TASK_ID" >&2
     else
       echo "[$MODE] turn did not complete cleanly (exit $rc); NOT tearing down. Inspect, then: $(basename "$0") teardown --task $TASK_ID" >&2
     fi

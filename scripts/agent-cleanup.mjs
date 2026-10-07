@@ -214,7 +214,7 @@ function deleteSessionData(dbPath, sessionId) {
   const before = { session: count(`SELECT count(*) FROM session WHERE id = ${id};`), eventSequence: count(`SELECT count(*) FROM event_sequence WHERE aggregate_id = ${id};`) };
   execFileSync(
     "sqlite3",
-    ["-cmd", "PRAGMA foreign_keys=ON;", "-cmd", ".timeout 60000", dbPath, `BEGIN IMMEDIATE; DELETE FROM session WHERE id = ${id}; DELETE FROM event_sequence WHERE aggregate_id = ${id}; COMMIT;`],
+    ["-bail", "-cmd", "PRAGMA foreign_keys=ON;", "-cmd", ".timeout 60000", dbPath, `BEGIN IMMEDIATE; DELETE FROM session WHERE id = ${id}; DELETE FROM event_sequence WHERE aggregate_id = ${id}; COMMIT;`],
     { encoding: "utf8" },
   );
   return { deleted: true, ...before };
