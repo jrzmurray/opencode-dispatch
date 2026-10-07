@@ -312,6 +312,7 @@ directory.
 | `/opencode:allow <requestID> [--always]` | Approve a pending permission request, resuming its turn. |
 | `/opencode:send <session> \| --task <task> <message>` | Send, steer, or queue a prompt. |
 | `/opencode:abort <session> \| --task <task>` | Stop an active turn. |
+| `/opencode:teardown --task <task> [--force]` | Remove a finished task: list leftover files (80 bytes of the first 5), delete the worktree, and delete the session's `session`/`event_sequence` DB rows. `task`/`bulk --teardown` does this automatically after a clean completion. |
 | `/opencode:model overall \| --agent <name> \| --task <model> [--effort <name>] \| show` | Set the default model/effort overall, per agent, or for tasks by merging `~/.config/opencode/opencode.json` (never overwrites; takes effect after an opencode restart). |
 | `/opencode:setup` | Show executable, server, auth, and model diagnostics. |
 | `/opencode:identify` | Print this agent session's identity (session id, slug, agent, model, worktree) — from the `OPENCODE_SESSION_*` env injected by the opencode-identity plugin, with a DB fallback. |
@@ -513,6 +514,44 @@ node scripts/agent-cleanup.mjs --task <task-id> --delete-branch
 Use `--force` only after reviewing the worker's diff and confirming that no useful
 changes remain. Forced cleanup aborts the session, terminates the process, removes
 the worktree, optionally deletes the branch, and archives the ownership record.
+
+### Teardown (worktree + database)
+
+For a finished task whose leftovers you don't need, `--teardown` prints the files
+left behind (status plus the first 80 bytes of the first 5), removes the worktree
+even if dirty, and deletes the session from the OpenCode database (`session` and
+`event_sequence`; `event`, `message` and `part` cascade). It still refuses while the
+worker process or turn is active. Override the DB path with `--db` or `OPENCODE_DB`.
+
+```bash
+node scripts/agent-cleanup.mjs --task <task-id> --teardown      # direct
+opencode-dispatch.sh teardown --task <task-id>                  # via the dispatcher
+opencode-dispatch.sh task --teardown "…"                        # automatic, after a clean completion
+```
+
+**Conditions for teardown to proceed** (checked in order; any failure aborts with nothing removed):
+
+1. The task is an isolated `task`/`bulk` worker with a registry record (`--task <id>`), in the
+   same repository, whose worktree is a direct child of the managed worktree root and whose
+   branch matches the record.
+2. The worker process is not alive. If the recorded PID is still running (e.g. the client
+   hasn't exited yet) teardown refuses; retry, or use `--force`, which aborts the session
+   and kills the process, but only if the PID matches this session and worktree.
+3. No turn is active, the OpenCode server is reachable (the record's server URL, or `--server`),
+   and the server's session directory matches the worktree. An unreachable server counts as
+   "state unknown" and refuses. `--force` bypasses these checks.
+4. A dirty worktree is fine: that is exactly what the preview reports and then discards.
+5. Database cleanup additionally needs the `sqlite3` CLI and an existing database file. If
+   either is missing, the worktree is still removed and the result reports
+   `database: NOT cleaned (<reason>)`.
+
+Automatic teardown (`--teardown` on `task`/`bulk`) further requires `--background` or `--wait`
+(the default) and a clean exit 0 from the turn. It is skipped with `--follow` or `--direct`,
+and after a timeout (3), unreachable server (7), stall (8) or any other failure; the command
+to run manually is printed instead.
+
+Branch commits are kept unless `--delete-branch` is given to `agent-cleanup.mjs`.
+Uncommitted work is **not** recoverable after teardown; have the worker commit first.
 
 ## Safety rules
 

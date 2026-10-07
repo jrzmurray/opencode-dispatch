@@ -248,3 +248,61 @@ test("spawn-agent documents the --bootstrap-cmd hook in --help", () => {
   const help = spawnSync(process.execPath, [path.resolve(scriptsDir, "spawn-agent.mjs"), "--help"], { encoding: "utf8" });
   assert.match(help.stderr, /--bootstrap-cmd/);
 });
+
+test("agent-cleanup --teardown reports leftovers, removes the worktree, and deletes session rows", { skip: spawnSync("sqlite3", ["-version"]).status !== 0 }, () => {
+  const fixture = fixtureRepository();
+  const dbPath = path.join(fixture.allocationRoot, "opencode.db");
+  try {
+    const prepared = spawnSync(process.execPath, [
+      path.resolve(scriptsDir, "spawn-agent.mjs"),
+      "--from", fixture.repositoryRoot,
+      "--worktree-root", fixture.allocationRoot,
+      "--prepare-only",
+      "--label", "teardown",
+      "--",
+      "test task",
+    ], { encoding: "utf8" });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const record = JSON.parse(prepared.stdout);
+    record.sessionId = "ses_teardown";
+    writeTaskRecord(getAgentLayout(fixture.repository, { AGENT_WORKTREE_ROOT: fixture.allocationRoot }), record);
+
+    for (let index = 0; index < 7; index += 1) fs.writeFileSync(path.join(record.worktreePath, `left-${index}.txt`), `file ${index} ${"x".repeat(200)}`);
+    spawnSync("sqlite3", [dbPath, `
+      PRAGMA foreign_keys=ON;
+      CREATE TABLE session (id text PRIMARY KEY);
+      CREATE TABLE event_sequence (aggregate_id text PRIMARY KEY, seq integer NOT NULL);
+      CREATE TABLE event (id text PRIMARY KEY, aggregate_id text NOT NULL REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE);
+      INSERT INTO session VALUES ('ses_teardown'), ('ses_other');
+      INSERT INTO event_sequence VALUES ('ses_teardown', 1), ('ses_other', 1);
+      INSERT INTO event VALUES ('e1', 'ses_teardown'), ('e2', 'ses_other');`], { encoding: "utf8" });
+
+    const cleanup = spawnSync(process.execPath, [
+      path.resolve(scriptsDir, "agent-cleanup.mjs"),
+      "--from", fixture.repositoryRoot,
+      "--worktree-root", fixture.allocationRoot,
+      "--task", record.taskId,
+      "--teardown", "--force",
+      "--db", dbPath,
+      "--json",
+    ], { encoding: "utf8" });
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.match(cleanup.stderr, /7 file\(s\) left behind/);
+    assert.match(cleanup.stderr, /\| file 0 x{60}/);
+    assert.match(cleanup.stderr, /2 more \(no preview\)/);
+    const result = JSON.parse(cleanup.stdout);
+    assert.equal(result.leftovers.length, 7);
+    assert.equal(result.leftovers[0].preview.length <= 80, true);
+    assert.equal(result.leftovers[5].preview, undefined);
+    assert.deepEqual(result.database, { deleted: true, session: 1, eventSequence: 1 });
+    assert.equal(fs.existsSync(record.worktreePath), false);
+
+    const remaining = (sql) => spawnSync("sqlite3", [dbPath, sql], { encoding: "utf8" }).stdout.trim();
+    assert.equal(remaining("SELECT group_concat(id) FROM session"), "ses_other");
+    assert.equal(remaining("SELECT group_concat(aggregate_id) FROM event_sequence"), "ses_other");
+    assert.equal(remaining("SELECT group_concat(id) FROM event"), "e2");
+  } finally {
+    fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });
+    fs.rmSync(fixture.repositoryRoot, { recursive: true, force: true });
+  }
+});

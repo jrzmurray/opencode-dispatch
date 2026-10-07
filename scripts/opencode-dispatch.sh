@@ -153,6 +153,15 @@
 #                             this script's own dir (install.sh puts them
 #                             there), else <--dir>/scripts.
 #   --task <id>               Resolve a worker task record for lifecycle commands.
+#   --teardown                (task/bulk with --background/--wait) when the turn completes
+#                             successfully, automatically run the teardown described under
+#                             the `teardown` mode. Left-behind files are listed first. On a
+#                             failed/timed-out/stalled turn nothing is removed. The result is
+#                             only the final message — commit or copy anything you need FIRST
+#                             (the worker should commit/push its own work).
+#                             Requires --background/--wait (not --follow/--direct) and a
+#                             clean exit 0; also needs the worker process exited and the
+#                             server reachable (see `teardown`). Uncommitted files are lost.
 #   --json                    (run modes, --direct only) raw JSON events
 #   --tail <N>                (history) keep only the last N lines (default 100)
 #   --turns <N>               (history) keep only the last N prompts + their responses
@@ -252,6 +261,15 @@ Modes:
   history     Print a session transcript (bound with --tail/--turns/--since).
   send        Message an existing session (completion-loop reply, or --steer/--queue).
   abort       Interrupt a session's in-progress turn.
+  teardown    Remove a finished task: print the files left in its worktree (first
+              80 bytes of the first 5), delete the worktree, and delete the session's
+              rows from the OpenCode database (session + event_sequence).
+              Usage: teardown --task <taskID> [--force]
+              Requires: a task/bulk worker record; worker process exited; no active
+              turn; server reachable with a session directory matching the worktree
+              (unreachable = unknown = refused); sqlite3 + the DB file for the DB step
+              (else the worktree is still removed and the DB is reported not cleaned).
+              --force aborts the session and kills the matching process first.
   permissions List pending permission requests on the server.
   allow       Approve a pending permission request (--always remembers it).
   follow      Watch an existing session read-only; prints new output until the
@@ -309,6 +327,12 @@ Task/bulk-only flags:
   --orchestration-root <p>  Directory with spawn-agent.mjs + worktree helpers
                       (default: next to this script, where install.sh puts them).
   --worktree-root <p>  Override the worktree allocation root.
+  --teardown          With --background/--wait: after a clean completion, list
+                      leftover files (80 bytes of the first 5), remove the
+                      worktree, and delete the session's DB rows. Or run it
+                      yourself later: teardown --task <id> [--force].
+                      Needs a clean turn exit (0), worker process exited, server
+                      reachable; skipped for --follow/--direct or failed turns.
   --require-dir       With --follow/--background: abort if the server cwd
                       differs from --dir.
 
@@ -353,7 +377,7 @@ EOF
 
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
-  echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|status|history|send|abort|permissions|allow|follow|setup|identify|claim|release)" >&2
+  echo "error: mode required (review|plan|ask|task|bulk|serve|sessions|status|history|send|abort|teardown|permissions|allow|follow|setup|identify|claim|release)" >&2
   echo "  Run: $(basename "$0") --help" >&2
   exit 2
 fi
@@ -431,6 +455,8 @@ SERVERS_FILE="${OPENCODE_DISPATCH_SERVERS:-$HOME/.config/opencode-dispatch/serve
 DIR_SET=""
 STOP=""
 RESTART=""
+TEARDOWN=""
+TEARDOWN_FORCE=""
 MSG_PARTS=()
 
 while [ $# -gt 0 ]; do
@@ -464,6 +490,8 @@ while [ $# -gt 0 ]; do
     --orchestration-root) ORCHESTRATION_ROOT="${2:-}"; shift 2 ;;
     --worktree-root)     WORKTREE_ROOT="${2:-}"; shift 2 ;;
     --task)              TASK_ID="${2:-}"; shift 2 ;;
+    --teardown)          TEARDOWN=1; shift ;;
+    --force)             TEARDOWN_FORCE=1; shift ;;
     --port)              PORT="${2:-}"; PORT_SET=1; shift 2 ;;
     --host)              HOST="${2:-}"; HOST_SET=1; shift 2 ;;
     --listen)            LISTEN="${2:-}"; LISTEN_SET=1; shift 2 ;;
@@ -663,6 +691,7 @@ prompt_rebuild() {  # $1 = leading positional arg to keep ("" = none); rest = pr
   [ -n "$ORCHESTRATION_ROOT" ] && args+=( --orchestration-root "$ORCHESTRATION_ROOT" )
   [ -n "$WORKTREE_ROOT" ] && args+=( --worktree-root "$WORKTREE_ROOT" )
   [ -n "$TASK_ID" ] && args+=( --task "$TASK_ID" )
+  [ -n "$TEARDOWN" ] && args+=( --teardown )
   # Only re-pass --server when the user EXPLICITLY set it: SERVER_NAME is
   # defaulted to "default" before rebuild runs, so an unconditional re-pass
   # would clobber a $OPENCODE_DISPATCH_SERVER env selection on the re-exec.
@@ -1716,6 +1745,28 @@ if [ "$MODE" = "send" ]; then
   exit 0
 fi
 
+# ---- teardown ----------------------------------------------------------------
+# Delegates to agent-cleanup.mjs --teardown: lists leftover files (with a short
+# preview), removes the worktree, and deletes the session's database rows.
+run_teardown() {  # $1=taskID [extra agent-cleanup args...]
+  local task="$1"; shift
+  local orch="${ORCHESTRATION_ROOT:-$DIR/scripts}"
+  [ -f "$orch/agent-cleanup.mjs" ] || { echo "error: cleanup helper not found: $orch/agent-cleanup.mjs" >&2; return 5; }
+  local cargs=( --task "$task" --from "$DIR" --teardown )
+  [ -n "$WORKTREE_ROOT" ] && cargs+=( --worktree-root "$WORKTREE_ROOT" )
+  node "$orch/agent-cleanup.mjs" "${cargs[@]}" "$@"
+}
+
+if [ "$MODE" = "teardown" ]; then
+  TASK_ID="${TASK_ID:-${MSG_PARTS[0]:-}}"
+  [ -n "$TASK_ID" ] || { echo "error: teardown needs --task <taskID>" >&2; exit 2; }
+  extra=()
+  [ -n "$TEARDOWN_FORCE" ] && extra+=( --force )
+  # ${extra[@]:+…}: an empty array trips set -u on macOS bash 3.2.
+  run_teardown "$TASK_ID" ${extra[@]:+"${extra[@]}"} || exit $?
+  exit 0
+fi
+
 # ---- abort -------------------------------------------------------------------
 if [ "$MODE" = "abort" ]; then
   require_server
@@ -1941,12 +1992,13 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
   [ -n "$VARIANT" ] && spawn_args+=(--variant "$VARIANT")
   [ -n "$WORKTREE_ROOT" ] && spawn_args+=(--worktree-root "$WORKTREE_ROOT")
   worker_json="$(node "${spawn_args[@]}")" || { echo "error: isolated worker launch failed" >&2; exit 5; }
-  IFS=$'\t' read -r SID DIR < <(printf '%s' "$worker_json" | node -e '
+  IFS=$'\t' read -r SID DIR TASK_ID WORKER_BRANCH < <(printf '%s' "$worker_json" | node -e '
     const r=JSON.parse(require("fs").readFileSync(0,"utf8"));
-    process.stdout.write(`${r.sessionId || ""}\t${r.worktreePath || ""}\n`);') || {
+    process.stdout.write(`${r.sessionId || ""}\t${r.worktreePath || ""}\t${r.taskId || ""}\t${r.branch || ""}\n`);') || {
       echo "error: isolated worker returned invalid metadata" >&2; exit 5;
     }
   [ -n "$SID" ] && [ -n "$DIR" ] || { echo "error: isolated worker did not return session/worktree" >&2; exit 5; }
+  WORKER_WORKTREE="$DIR"
   # Land the durable brief copy the submitted message points at. Local-only:
   # excluded from git so it can never ride into a commit. (The submit is
   # async; this cp completes long before the model's first read.)
@@ -1970,6 +2022,19 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
       if(r.logPath) console.log(`  log:     ${r.logPath}`);
     });'
   if [ -z "$FOLLOW" ] && [ -z "$AWAIT" ]; then exit 0; fi
+  # From here the wrapper waits on the worker: however it ends (success, turn
+  # error, timeout, stall, unreachable server, teardown or not), say where the
+  # branch and worktree are. stderr, so the distilled reply on stdout stays clean.
+  print_worker_footer() {
+    local state="kept"
+    [ -d "$WORKER_WORKTREE" ] || state="removed (torn down)"
+    {
+      echo "[$MODE] task:     ${TASK_ID:-?}"
+      echo "[$MODE] branch:   ${WORKER_BRANCH:-?}"
+      echo "[$MODE] worktree: $WORKER_WORKTREE ($state)"
+    } >&2
+  }
+  trap 'rm -f "$diff" "$msgfile"; print_worker_footer' EXIT
 fi
 
 # task/bulk may edit files → pre-authorize edit/bash so the turn doesn't stall on a prompt.
@@ -2013,6 +2078,25 @@ fi
 # the wrapper as a background task and the caller (Claude Code) is re-invoked on
 # that exit — wake-on-complete.
 if [ -n "$AWAIT" ]; then
+  if [ -n "$TEARDOWN" ] && [ "$ISOLATED" -eq 1 ] && [ -n "$TASK_ID" ]; then
+    # await_turn always exits, so run it in a subshell to regain control and tear
+    # the worker down only after a clean completion (exit 0).
+    # (set -e: capture the status without letting a non-zero subshell kill us.)
+    ( await_turn "$SID" ) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      # The attached client may still be exiting right after the turn goes idle
+      # (agent-cleanup refuses while the PID lives), so retry a few times.
+      td_ok=""
+      for _try in 1 2 3 4 5; do
+        if run_teardown "$TASK_ID"; then td_ok=1; break; fi
+        sleep 3
+      done
+      [ -n "$td_ok" ] || echo "warning: teardown of $TASK_ID failed; clean up manually: $(basename "$0") teardown --task $TASK_ID" >&2
+    else
+      echo "[$MODE] turn did not complete cleanly (exit $rc); NOT tearing down. Inspect, then: $(basename "$0") teardown --task $TASK_ID" >&2
+    fi
+    exit "$rc"
+  fi
   await_turn "$SID"   # always exits: 0 done, 3 timeout, 7 unreachable, 8 stall
   exit 0
 fi
