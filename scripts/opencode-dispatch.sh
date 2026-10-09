@@ -759,6 +759,35 @@ if [ -n "$AWAIT" ] && [ -z "$TIMEOUT_SET" ]; then FOLLOW_TIMEOUT="86400"; fi
 
 server_up() { curl -sf -m 3 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" -o /dev/null 2>/dev/null; }
 
+# all_asks </permission|/question> [timeout-s] — print the merged JSON array of
+# open asks across EVERY directory the server has a session in. The ask queues
+# are scoped per directory (instance): a bare GET returns only the asks of the
+# server's own/default directory, so a session working in another repo (or
+# worktree) looked like "WORKING, tool running, no ask in queue" while it sat
+# parked on an external_directory prompt. Verified on 1.18.9.
+all_asks() {
+  local tmo="${2:-5}" ab=""
+  [ -n "${SERVE_PASSWORD:-}" ] && ab="$(printf '%s' "${SERVER_USERNAME}:${SERVE_PASSWORD}" | base64)"
+  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" 2>/dev/null \
+    | BASE_URL="$BASE_URL" AUTH_B64="$ab" QPATH="$1" TMO="$tmo" DIR="$DIR" node -e '
+      let d="";process.stdin.on("data",c=>d+=c).on("end",async()=>{
+        let s=[];try{s=JSON.parse(d)}catch(e){}
+        const dirs=new Set([""]);if(process.env.DIR)dirs.add(process.env.DIR);
+        for(const x of Array.isArray(s)?s:[])if(x&&x.directory)dirs.add(x.directory);
+        const h=process.env.AUTH_B64?{authorization:"Basic "+process.env.AUTH_B64}:{};
+        const out=new Map();
+        await Promise.all([...dirs].map(async dir=>{
+          try{
+            const u=process.env.BASE_URL+process.env.QPATH+(dir?"?directory="+encodeURIComponent(dir):"");
+            const r=await fetch(u,{headers:h,signal:AbortSignal.timeout(+process.env.TMO*1000)});
+            if(!r.ok)return;
+            for(const q of await r.json())if(q&&q.id)out.set(q.id,q);
+          }catch(e){}
+        }));
+        process.stdout.write(JSON.stringify([...out.values()]));
+      });' 2>/dev/null || true
+}
+
 # parked_permission <sessionID> [timeout-s] — echoes a descriptor when the
 # session is parked on an open ask: a permission request ("per_xxx bash ls
 # /tmp") OR a question ask ("que_xxx [question] header"). Both queues are
@@ -769,9 +798,9 @@ server_up() { curl -sf -m 3 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/sessio
 # stuck in state.status "running" with no time.end).
 parked_permission() {
   local tmo="${2:-5}"
-  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/permission" 2>/dev/null \
+  all_asks /permission "$tmo" \
     | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);process.stdout.write(p.id+" "+p.permission+" "+((p.patterns||[]).join(" ")))}catch(e){process.exit(0)}})' 2>/dev/null || true
-  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/question" 2>/dev/null \
+  all_asks /question "$tmo" \
     | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);const q=(p.questions||[])[0]||{};process.stdout.write(p.id+" [question] "+((q.header||q.question||"").slice(0,80)))}catch(e){process.exit(0)}})' 2>/dev/null || true
 }
 
@@ -1020,6 +1049,15 @@ if [ "$MODE" = "follow" ]; then
     const deadline = timeout > 0 ? Date.now() + timeout * 1000 : 0;
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const jget = async (u) => { const r = await fetch(base + u, { headers: hdr, signal: AbortSignal.timeout(10000) }); if (!r.ok) throw new Error("http " + r.status); return r.json(); };
+    // Ask queues are per-directory: also query the directory the session lives in.
+    let sessDir;
+    const jask = async (u) => {
+      if (sessDir === undefined) { try { sessDir = (await jget("/session/" + sid)).directory || ""; } catch (e) { sessDir = ""; } }
+      const out = new Map();
+      for (const q of await jget(u)) out.set(q.id, q);
+      if (sessDir) for (const q of await jget(u + "?directory=" + encodeURIComponent(sessDir))) out.set(q.id, q);
+      return [...out.values()];
+    };
     console.log("following " + sid + " (read-only; Ctrl-C to detach)");
     (async () => {
       let dir = "";
@@ -1045,13 +1083,13 @@ if [ "$MODE" = "follow" ]; then
           // Print once per request id, not every poll.
           if (!done) {
             try {
-              for (const q of await jget("/permission")) {
+              for (const q of await jask("/permission")) {
                 if (q.sessionID === sid && !noticed.has(q.id)) {
                   noticed.add(q.id);
                   console.log("(parked: permission ask " + q.id + " — " + q.permission + " " + (q.patterns || []).join(" ") + ")");
                 }
               }
-              for (const q of await jget("/question")) {
+              for (const q of await jask("/question")) {
                 if (q.sessionID === sid && !noticed.has(q.id)) {
                   noticed.add(q.id);
                   console.log("(parked: question ask " + q.id + " — waiting on a human)");
@@ -1420,8 +1458,11 @@ if [ "$MODE" = "status" ]; then
           const hdr=auth?{authorization:"Basic "+auth}:{};
           const jget=async(u)=>{const r=await fetch(base+u,{headers:hdr,signal:AbortSignal.timeout(5000)});if(!r.ok)throw new Error("http "+r.status);return r.json();};
           let perms=new Map(), questions=new Map();
-          try{ for(const p of await jget("/permission")) if(p?.sessionID) perms.set(p.sessionID,"PERMASK ("+p.id+" "+p.permission+")"); }catch(e){}
-          try{ for(const q of await jget("/question")){ if(q?.sessionID){ const h=(q.questions||[])[0]; questions.set(q.sessionID,"QUESTION ("+q.id+" "+((h?.header||h?.question||"").slice(0,40))+")"); } } }catch(e){}
+          // Ask queues are per-directory: query every directory a session lives in.
+          const dirs=[...new Set([""].concat(a.map(x=>x?.directory).filter(Boolean)))];
+          const jall=async(u)=>{const m=new Map();await Promise.all(dirs.map(async d=>{try{for(const q of await jget(u+(d?"?directory="+encodeURIComponent(d):"")))m.set(q.id,q)}catch(e){}}));return [...m.values()];};
+          try{ for(const p of await jall("/permission")) if(p?.sessionID) perms.set(p.sessionID,"PERMASK ("+p.id+" "+p.permission+")"); }catch(e){}
+          try{ for(const q of await jall("/question")){ if(q?.sessionID){ const h=(q.questions||[])[0]; questions.set(q.sessionID,"QUESTION ("+q.id+" "+((h?.header||h?.question||"").slice(0,40))+")"); } } }catch(e){}
           const norm=t=>t&&t<1e12?t*1000:t;
           const now=Date.now();
           const fmt=ms=>{let x=Math.floor(ms/1000);const h=Math.floor(x/3600);x%=3600;const mi=Math.floor(x/60);const se=x%60;return (h?h+"h ":"")+(h||mi?mi+"m ":"")+se+"s";};
@@ -1492,7 +1533,9 @@ if [ "$MODE" = "status" ]; then
       const parts=(last?.parts)||[];
       let runPart=null;
       for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){runPart=p;break;}}
-      const lastErr = (Array.isArray(m)?m:[]).map(x=>x?.info?.error).filter(Boolean).pop();
+      // Only the newest message error counts: an earlier abort/failure that a
+      // later turn superseded is history, not current state.
+      const lastErr = li.error;
       console.log("session:  "+s.id);
       console.log("title:    "+(s.title||""));
       console.log("model:    "+(s?.model?.providerID||"?")+"/"+(s?.model?.id||"?"));
@@ -1830,7 +1873,7 @@ fi
 # `external_directory`/`bash` ask on a headless server no TUI ever answered.
 if [ "$MODE" = "permissions" ]; then
   require_server
-  curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/permission" \
+  all_asks /permission 10 \
     | node -e '
       let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
         let a;try{a=JSON.parse(d)}catch(e){console.error("bad JSON from server");process.exit(1)}
@@ -1841,7 +1884,8 @@ if [ "$MODE" = "permissions" ]; then
           console.log("  permission: "+(p.permission||"?"));
           console.log("  patterns:   "+((p.patterns||[]).join(" ")||"(none)"));
           console.log("  session:    "+(p.sessionID||"?"));
-          if(p.tool) console.log("  tool:       "+p.tool);
+          if(p.tool) console.log("  tool:       "+(typeof p.tool==="string"?p.tool:(p.tool.callID||JSON.stringify(p.tool))));
+          if(p.metadata&&p.metadata.command) console.log("  command:    "+String(p.metadata.command).slice(0,200));
           if(p.metadata&&p.metadata.title) console.log("  title:      "+p.metadata.title);
           console.log("");
         }
@@ -1861,15 +1905,41 @@ if [ "$MODE" = "allow" ]; then
   RID="${MSG_PARTS[0]:-}"
   [ -z "$RID" ] && { echo "error: allow needs a <requestID> (see: $(basename "$0") permissions)" >&2; exit 2; }
   REPLY="once"; [ -n "$ALWAYS" ] && REPLY="always"
-  # NO ?directory= here: the reply endpoint VALIDATES it against the session's
-  # own directory and 404s (PermissionNotFoundError) on any mismatch — verified
-  # on 1.18.9 — so passing the wrapper's cwd made `allow` flaky whenever the
-  # parked session lived in another directory (e.g. --task resolution, or a
-  # server started elsewhere). The bare POST is the working contract.
-  REPLY="$REPLY" node -e 'process.stdout.write(JSON.stringify({reply:process.env.REPLY}));' \
-    | curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/permission/$RID/reply" \
-        -H 'content-type: application/json' --data-binary @- -o /dev/null \
-    || { echo "error: reply failed (request not found, already resolved, or server unreachable)" >&2; exit 5; }
+  RBODY="$(mktemp)"; trap 'rm -f "$RBODY"' EXIT
+  # The reply is routed per directory like the queue: a bare POST 404s for an
+  # ask whose session lives in another directory, so look up the ask's session
+  # directory and reply there first, then fall back to the bare POST.
+  ASK_DIR="$(all_asks /permission 5 | RID="$RID" BASE_URL="$BASE_URL" AUTH_B64="$([ -n "${SERVE_PASSWORD:-}" ] && printf '%s' "${SERVER_USERNAME}:${SERVE_PASSWORD}" | base64)" node -e '
+    let d="";process.stdin.on("data",c=>d+=c).on("end",async()=>{try{
+      const p=JSON.parse(d).find(x=>x.id===process.env.RID);if(!p)return;
+      const h=process.env.AUTH_B64?{authorization:"Basic "+process.env.AUTH_B64}:{};
+      const r=await fetch(process.env.BASE_URL+"/session/"+p.sessionID,{headers:h,signal:AbortSignal.timeout(5000)});
+      process.stdout.write((await r.json()).directory||"");}catch(e){}});' 2>/dev/null || true)"
+  CODE="000"
+  for q in ${ASK_DIR:+"?directory=$(printf '%s' "$ASK_DIR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(encodeURIComponent(d)))')"} ""; do
+    CODE="$(REPLY="$REPLY" node -e 'process.stdout.write(JSON.stringify({reply:process.env.REPLY}));' \
+      | curl -s -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/permission/$RID/reply$q" \
+          -H 'content-type: application/json' --data-binary @- -o "$RBODY" -w '%{http_code}' 2>/dev/null)" || CODE="000"
+    case "$CODE" in 2??) break ;; esac
+  done
+  case "$CODE" in 2??) ;; *)
+    echo "error: reply to $RID failed (HTTP $CODE) at $BASE_URL" >&2
+    [ -s "$RBODY" ] && echo "  server said: $(head -c 300 "$RBODY")" >&2
+    if [ "$CODE" = "000" ]; then
+      echo "  server unreachable or timed out" >&2
+    else
+      pending="$(all_asks /permission 5 | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{for(const p of JSON.parse(d))console.log("    "+p.id+"  "+p.permission+" "+(p.patterns||[]).join(" ")+"  ("+p.sessionID+")")}catch(e){}})')"
+      if printf '%s\n' "$pending" | grep -q "$RID"; then
+        echo "  the request is still pending, so the reply itself was rejected (see server message above)" >&2
+      else
+        echo "  $RID is not in the pending queue: already answered, its session was aborted/finished, or the server restarted (asks are in-memory)." >&2
+        echo "  check the session with: $(basename "$0") status <sessionID>" >&2
+      fi
+      if [ -n "$pending" ]; then echo "  pending asks:" >&2; printf '%s\n' "$pending" >&2
+      else echo "  no pending asks on this server (server: ${SERVER_NAME:-default}; try --server <name> / --port <N> if the session is on another)" >&2; fi
+    fi
+    exit 5 ;;
+  esac
   echo "allowed $RID ($REPLY)"
   exit 0
 fi
