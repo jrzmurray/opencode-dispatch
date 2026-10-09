@@ -471,22 +471,44 @@ async function collectAsks(client, { directory } = {}) {
     }
     if (scopeDir && (!existing.directory || existing.directory !== scopeDir)) existing.directory = scopeDir;
   };
-  await Promise.all(
-    list.map(async (dir) => {
-      const scope = dir ? { directory: dir } : {};
-      try {
-        for (const raw of await client.listPermissionRequests(scope)) remember(raw, dir);
-      } catch {
-        // a scope that rejects the query is skipped, not fatal
-      }
-      try {
-        for (const raw of await client.listQuestionRequests(scope)) remember(raw, dir);
-      } catch {
-        // as above
-      }
-    }),
-  );
+  for (let index = 0; index < list.length; index += 6) {
+    await Promise.all(
+      list.slice(index, index + 6).map(async (dir) => {
+        const scope = dir ? { directory: dir } : {};
+        try {
+          for (const raw of await client.listPermissionRequests(scope)) remember(raw, dir);
+        } catch {
+          // a scope that rejects the query is skipped, not fatal
+        }
+        try {
+          for (const raw of await client.listQuestionRequests(scope)) remember(raw, dir);
+        } catch {
+          // as above
+        }
+      }),
+    );
+  }
   return [...asks.values()];
+}
+
+/** Pending asks for one known session; avoid listing asks in unrelated directories. */
+async function collectSessionAsks(client, sessionId, directory) {
+  const api = await client.resolveApi();
+  const scope = directory ? { directory } : {};
+  const asks = [];
+  for (const list of [client.listPermissionRequests, client.listQuestionRequests]) {
+    try {
+      for (const raw of await list.call(client, scope)) {
+        const ask = normalizeAsk(raw, api);
+        if (ask?.sessionID !== sessionId) continue;
+        ask.directory = directory || "";
+        asks.push(ask);
+      }
+    } catch {
+      // A queue may be unavailable on this server version; status remains useful.
+    }
+  }
+  return asks;
 }
 
 function askLabel(ask) {
@@ -656,7 +678,7 @@ async function statusSingle(client, options, sessionId) {
     messageCount = Array.isArray(messages) ? messages.length : 0;
     last = messages[messages.length - 1] || null;
   }
-  const asks = await collectAsks(client, { directory: session.directory || options.dir });
+  const asks = await collectSessionAsks(client, sessionId, session.directory || options.dir);
   const parked = asks.find((ask) => ask.sessionID === sessionId);
   const updated = normTime(session.time?.updated);
   const now = Date.now();
