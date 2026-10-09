@@ -759,19 +759,21 @@ if [ -n "$AWAIT" ] && [ -z "$TIMEOUT_SET" ]; then FOLLOW_TIMEOUT="86400"; fi
 
 server_up() { curl -sf -m 3 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" -o /dev/null 2>/dev/null; }
 
-# all_asks </permission|/question> [timeout-s] — print the merged JSON array of
+# all_asks </permission|/question> [timeout-s] [sessionID] — print the merged JSON array of
 # open asks across EVERY directory the server has a session in. The ask queues
 # are scoped per directory (instance): a bare GET returns only the asks of the
 # server's own/default directory, so a session working in another repo (or
 # worktree) looked like "WORKING, tool running, no ask in queue" while it sat
-# parked on an external_directory prompt. Verified on 1.18.9.
+# parked on an external_directory prompt. Verified on 1.18.9. With a sessionID
+# only that session directory is queried (one small GET, not the full list).
 all_asks() {
   local tmo="${2:-5}" ab=""
   [ -n "${SERVE_PASSWORD:-}" ] && ab="$(printf '%s' "${SERVER_USERNAME}:${SERVE_PASSWORD}" | base64)"
-  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" 2>/dev/null \
+  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session${3:+/$3}" 2>/dev/null \
     | BASE_URL="$BASE_URL" AUTH_B64="$ab" QPATH="$1" TMO="$tmo" DIR="$DIR" node -e '
       let d="";process.stdin.on("data",c=>d+=c).on("end",async()=>{
         let s=[];try{s=JSON.parse(d)}catch(e){}
+        if(!Array.isArray(s))s=[s];
         const dirs=new Set([""]);if(process.env.DIR)dirs.add(process.env.DIR);
         for(const x of Array.isArray(s)?s:[])if(x&&x.directory)dirs.add(x.directory);
         const h=process.env.AUTH_B64?{authorization:"Basic "+process.env.AUTH_B64}:{};
@@ -798,9 +800,9 @@ all_asks() {
 # stuck in state.status "running" with no time.end).
 parked_permission() {
   local tmo="${2:-5}"
-  all_asks /permission "$tmo" \
+  all_asks /permission "$tmo" "$1" \
     | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);process.stdout.write(p.id+" "+p.permission+" "+((p.patterns||[]).join(" ")))}catch(e){process.exit(0)}})' 2>/dev/null || true
-  all_asks /question "$tmo" \
+  all_asks /question "$tmo" "$1" \
     | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);const q=(p.questions||[])[0]||{};process.stdout.write(p.id+" [question] "+((q.header||q.question||"").slice(0,80)))}catch(e){process.exit(0)}})' 2>/dev/null || true
 }
 
@@ -1052,7 +1054,7 @@ if [ "$MODE" = "follow" ]; then
     // Ask queues are per-directory: also query the directory the session lives in.
     let sessDir;
     const jask = async (u) => {
-      if (sessDir === undefined) { try { sessDir = (await jget("/session/" + sid)).directory || ""; } catch (e) { sessDir = ""; } }
+      if (sessDir === undefined) { try { sessDir = (await jget("/session/" + sid)).directory || ""; } catch (e) {} }
       const out = new Map();
       for (const q of await jget(u)) out.set(q.id, q);
       if (sessDir) for (const q of await jget(u + "?directory=" + encodeURIComponent(sessDir))) out.set(q.id, q);
@@ -1459,8 +1461,10 @@ if [ "$MODE" = "status" ]; then
           const jget=async(u)=>{const r=await fetch(base+u,{headers:hdr,signal:AbortSignal.timeout(5000)});if(!r.ok)throw new Error("http "+r.status);return r.json();};
           let perms=new Map(), questions=new Map();
           // Ask queues are per-directory: query every directory a session lives in.
-          const dirs=[...new Set([""].concat(a.map(x=>x?.directory).filter(Boolean)))];
-          const jall=async(u)=>{const m=new Map();await Promise.all(dirs.map(async d=>{try{for(const q of await jget(u+(d?"?directory="+encodeURIComponent(d):"")))m.set(q.id,q)}catch(e){}}));return [...m.values()];};
+          // Only directories of the sessions that will be shown, fetched 6 at a time.
+          const recent=[...a].sort((x,y)=>((y?.time?.updated)||0)-((x?.time?.updated)||0)).slice(0,parseInt(process.env.LIMIT,10)||50);
+          const dirs=[...new Set([""].concat(recent.map(x=>x?.directory).filter(Boolean)))];
+          const jall=async(u)=>{const m=new Map();for(let i=0;i<dirs.length;i+=6)await Promise.all(dirs.slice(i,i+6).map(async d=>{try{for(const q of await jget(u+(d?"?directory="+encodeURIComponent(d):"")))m.set(q.id,q)}catch(e){}}));return [...m.values()];};
           try{ for(const p of await jall("/permission")) if(p?.sessionID) perms.set(p.sessionID,"PERMASK ("+p.id+" "+p.permission+")"); }catch(e){}
           try{ for(const q of await jall("/question")){ if(q?.sessionID){ const h=(q.questions||[])[0]; questions.set(q.sessionID,"QUESTION ("+q.id+" "+((h?.header||h?.question||"").slice(0,40))+")"); } } }catch(e){}
           const norm=t=>t&&t<1e12?t*1000:t;
