@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { OpenCodeClient } from "./opencode-server.mjs";
+import { isLocalServerUrl, OpenCodeClient } from "./opencode-server.mjs";
 import {
   archiveTaskRecord,
   canonicalPath,
@@ -35,15 +35,22 @@ Options:
   --force                     Abort session, terminate process, and remove dirty worktree.
   --delete-branch             Delete the worker branch after removing its worktree.
   --teardown                  Full teardown of a finished task: first print the files left
-                              behind (first 80 bytes of the first 5), then remove the
-                              worktree even if dirty and delete the session's rows from the
-                              OpenCode database (session + event_sequence; event, message and
-                              part cascade). Requires: a registered task whose worker
-                              process has exited, no active turn, a reachable server whose
-                              session directory matches the worktree (else "unknown",
-                              refused), and, for the DB step, sqlite3 plus an existing
-                              database (a DB failure is reported; the worktree is still
-                              removed). --force bypasses the process/turn/server checks.
+                              behind (first 80 bytes of the first 5), then ask a reachable
+                              OpenCode server to delete the session through its native API
+                              (interrupts the turn, removes the share, deletes child
+                              sessions, emits session.deleted), then remove the worktree
+                              even if dirty, then verify the rows are gone and fall back to
+                              deleting them directly (session + event_sequence; event,
+                              message and part cascade) only when the server delete failed.
+                              The direct-SQL fallback and the post-delete verification only
+                              run while the configured server is local (a loopback address
+                              or one of this host's interface addresses); with a remote
+                              server the session is deleted through it and local SQL
+                              cleanup is disabled.
+                              Requires: a registered task whose worker process has exited,
+                              no active turn, a reachable server whose session directory
+                              matches the worktree (else "unknown", refused). --force
+                              bypasses the process/turn/server checks.
   --db <path>                 OpenCode database (default: $OPENCODE_DB or
                               ~/.local/share/opencode/opencode.db).
   --dry-run                   Report checks without changing anything.
@@ -206,6 +213,42 @@ function sqlQuote(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
+/**
+ * Ask the server to delete the session before the worktree goes away, so the
+ * native path runs: turn interrupted, share removed, child sessions deleted,
+ * session.deleted published. A 404 means it was already deleted.
+ */
+async function deleteSessionViaServer(client, record, session) {
+  if (!client) return { deleted: false, reason: "no OpenCode server URL supplied" };
+  if (!record.sessionId) return { deleted: false, reason: "no session recorded" };
+  // The server resolves sessions by ID alone (directory only picks the
+  // instance), so a stale record whose session now lives elsewhere must not be
+  // natively deleted (that would unshare and recurse into its children).
+  if (session?.exists && !session.directoryMatches) {
+    return { deleted: false, skipped: true, reason: "session directory does not match the worktree; refusing to delete by ID" };
+  }
+  await client.abortSession(record.sessionId, { directory: record.worktreePath }).catch(() => {});
+  try {
+    await client.deleteSession(record.sessionId, { directory: record.worktreePath });
+  } catch (error) {
+    if (error?.status === 404) return { deleted: true, alreadyGone: true };
+    throw error;
+  }
+  return { deleted: true };
+}
+
+/** Read-only row counts for one session, used to verify a server-side delete. */
+function countSessionRows(dbPath, sessionId) {
+  if (!fs.existsSync(dbPath)) return { available: false, reason: `database not found: ${dbPath}` };
+  const id = sqlQuote(sessionId);
+  const count = (sql) => Number(execFileSync("sqlite3", ["-cmd", ".timeout 60000", dbPath, sql], { encoding: "utf8" }).trim() || 0);
+  return {
+    available: true,
+    session: count(`SELECT count(*) FROM session WHERE id = ${id};`),
+    eventSequence: count(`SELECT count(*) FROM event_sequence WHERE aggregate_id = ${id};`),
+  };
+}
+
 /** Delete the session's rows from the OpenCode database. event rows cascade from event_sequence. */
 function deleteSessionData(dbPath, sessionId) {
   if (!fs.existsSync(dbPath)) return { deleted: false, reason: `database not found: ${dbPath}` };
@@ -238,7 +281,13 @@ async function main() {
       throw new Error(`refusing cleanup for worktree outside the managed root: ${record.worktreePath}`);
     }
 
-    const client = options.server || record.serverUrl ? new OpenCodeClient({ baseUrl: options.server || record.serverUrl }) : null;
+    const configuredServerUrl = options.server || record.serverUrl || process.env.OPENCODE_SERVER_URL || "";
+    const client = configuredServerUrl ? new OpenCodeClient({ baseUrl: configuredServerUrl }) : null;
+    // Direct SQL cleanup touches the LOCAL database, so it is only trustworthy
+    // when the server (if any) is this machine: a loopback address or one of
+    // this host's interface addresses. With a remote server the session must be
+    // deleted through that server; the local SQL delete is disabled.
+    const sqlCleanupAllowed = configuredServerUrl === "" || isLocalServerUrl(configuredServerUrl);
     const session = await inspectSession(client, record);
     const workerProcess = inspectProcess(record);
     const pidAlive = workerProcess.alive;
@@ -264,6 +313,14 @@ async function main() {
     const discard = options.force || options.teardown;
     if (options.force && client && record.sessionId) await client.abortSession(record.sessionId, { directory: record.worktreePath }).catch(() => {});
     if (options.force && workerProcess.matches) terminate(record.pid);
+
+    // The server delete must run while the worktree still exists: the session's
+    // directory is how the server resolves the session.
+    let serverDelete;
+    if (options.teardown && record.sessionId) {
+      serverDelete = await deleteSessionViaServer(client, record, session).catch((error) => ({ deleted: false, reason: error?.message || String(error) }));
+    }
+
     writeTaskRecord(layout, { ...record, state: "cleaning" });
     removeWorktree(repository, record, { force: discard, deleteBranch: options.deleteBranch });
     const logPath = archiveLog(layout, record);
@@ -272,9 +329,30 @@ async function main() {
     if (options.teardown && record.sessionId) {
       const dbPath = options.db || process.env.OPENCODE_DB || path.join(os.homedir(), ".local/share/opencode/opencode.db");
       try {
-        database = deleteSessionData(dbPath, record.sessionId);
+        if (serverDelete?.deleted) {
+          if (!sqlCleanupAllowed) {
+            database = { deleted: true, via: "server-api", verification: "skipped: server is not a local address" };
+          } else {
+            // Verification only: the server owns this deletion, and running the
+            // SQL delete here could remove rows from a different database (a
+            // second server's data dir) than the one the API just changed.
+            const remaining = countSessionRows(dbPath, record.sessionId);
+            database = remaining.available
+              ? { deleted: true, via: "server-api", session: remaining.session, eventSequence: remaining.eventSequence, ...(remaining.session || remaining.eventSequence ? { verification: "rows remain after server delete" } : {}) }
+              : { deleted: true, via: "server-api", verification: remaining.reason };
+          }
+        } else if (serverDelete?.skipped) {
+          database = { deleted: false, reason: serverDelete.reason };
+        } else if (!sqlCleanupAllowed) {
+          database = { deleted: false, reason: `server ${configuredServerUrl} is not a local address; direct SQL cleanup disabled (delete the session through the server)`, ...(serverDelete?.reason ? { serverError: serverDelete.reason } : {}) };
+        } else {
+          const sql = deleteSessionData(dbPath, record.sessionId);
+          database = { deleted: sql.deleted, via: "sql", session: sql.session, eventSequence: sql.eventSequence, ...(serverDelete?.reason ? { serverError: serverDelete.reason } : {}) };
+        }
       } catch (error) {
-        database = { deleted: false, reason: error?.message || String(error) };
+        database = serverDelete?.deleted
+          ? { deleted: true, via: "server-api", verificationError: error?.message || String(error) }
+          : { deleted: false, reason: error?.message || String(error) };
       }
     }
     result = { ...checks, state: "removed", archivedRecord: archivedPath, archivedLog: logPath, branchDeleted: options.deleteBranch, ...(database ? { database } : {}) };
@@ -284,7 +362,9 @@ async function main() {
   else console.log(`removed ${record.taskId}\nworktree: ${record.worktreePath}\nbranch: ${record.branch}\nrecord: ${result.archivedRecord}`);
   if (result.database && !options.json && !options.dryRun) {
     const db = result.database;
-    console.log(db.deleted ? `database: deleted ${db.session} session row(s), ${db.eventSequence} event_sequence row(s)` : `database: NOT cleaned (${db.reason})`);
+    if (!db.deleted) console.log(`database: NOT cleaned (${db.reason})`);
+    else if (db.via === "server-api") console.log(`database: deleted via OpenCode server (share and child sessions included)${db.verification ? ` — ${db.verification}` : ""}`);
+    else console.log(`database: deleted via sqlite fallback (${db.session} session row(s), ${db.eventSequence} event_sequence row(s))${db.serverError ? ` — server delete skipped: ${db.serverError}` : ""}`);
   }
 }
 

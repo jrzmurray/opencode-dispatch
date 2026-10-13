@@ -541,9 +541,15 @@ opencode-dispatch.sh task --teardown "…"                        # automatic, a
    and the server's session directory matches the worktree. An unreachable server counts as
    "state unknown" and refuses. `--force` bypasses these checks.
 4. A dirty worktree is fine: that is exactly what the preview reports and then discards.
-5. Database cleanup additionally needs the `sqlite3` CLI and an existing database file. If
-   either is missing, the worktree is still removed and the result reports
-   `database: NOT cleaned (<reason>)`.
+5. Session cleanup goes through the OpenCode server first: the native session delete
+   removes the session's share, deletes its child (subagent) sessions, interrupts any
+   active turn, and emits `session.deleted`. The direct SQL delete (needs the `sqlite3`
+   CLI and an existing database file) is only a fallback when the server delete fails,
+   and afterwards it verifies the rows are gone. Both the fallback and the verification
+   run only while the configured server is local (a loopback address or one of this
+   host's interface addresses) — with a remote server the session is deleted through it
+   and local SQL cleanup is disabled. A cleanup failure never blocks removing the
+   worktree; the result reports `database: NOT cleaned (<reason>)`.
 
 Automatic teardown (`--teardown` on `task`/`bulk`) further requires `--background` or `--wait`
 (the default) and a clean exit 0 from the turn. It is skipped with `--follow` or `--direct`,

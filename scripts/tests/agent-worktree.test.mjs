@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { OpenCodeClient } from "../opencode-server.mjs";
+import { isLocalServerUrl, OpenCodeClient } from "../opencode-server.mjs";
 import { buildWorkerArgs, resolveBootstrapCommand } from "../spawn-agent.mjs";
 import {
   archiveTaskRecord,
@@ -40,6 +41,20 @@ function fixtureRepository() {
   runGit(["commit", "-qm", "fixture"], repositoryRoot);
   return { repositoryRoot, allocationRoot, repository: getRepositoryInfo(repositoryRoot) };
 }
+
+test("isLocalServerUrl accepts loopback and local interface addresses only", () => {
+  assert.equal(isLocalServerUrl("http://127.0.0.1:4096"), true);
+  assert.equal(isLocalServerUrl("http://127.8.8.8:4096"), true);
+  assert.equal(isLocalServerUrl("http://localhost:4096"), true);
+  assert.equal(isLocalServerUrl("http://[::1]:4096"), true);
+  assert.equal(isLocalServerUrl("http://8.8.8.8:4096"), false);
+  assert.equal(isLocalServerUrl("https://opencode.example.com"), false);
+  assert.equal(isLocalServerUrl(""), false);
+  const local = Object.values(os.networkInterfaces())
+    .flat()
+    .find((entry) => entry && entry.family === "IPv4" && !entry.internal);
+  if (local) assert.equal(isLocalServerUrl(`http://${local.address}:4096`), true);
+});
 
 test("slugs and task IDs are safe for paths and branches", () => {
   assert.equal(sanitizeSlug("  Fix / thing! "), "Fix-thing");
@@ -294,7 +309,10 @@ test("agent-cleanup --teardown reports leftovers, removes the worktree, and dele
     assert.equal(result.leftovers.length, 7);
     assert.equal(result.leftovers[0].preview.length <= 80, true);
     assert.equal(result.leftovers[5].preview, undefined);
-    assert.deepEqual(result.database, { deleted: true, session: 1, eventSequence: 1 });
+    assert.equal(result.database.deleted, true);
+    assert.equal(result.database.via, "sql");
+    assert.equal(result.database.session, 1);
+    assert.equal(result.database.eventSequence, 1);
     assert.equal(fs.existsSync(record.worktreePath), false);
 
     const remaining = (sql) => spawnSync("sqlite3", [dbPath, sql], { encoding: "utf8" }).stdout.trim();
@@ -302,6 +320,112 @@ test("agent-cleanup --teardown reports leftovers, removes the worktree, and dele
     assert.equal(remaining("SELECT group_concat(aggregate_id) FROM event_sequence"), "ses_other");
     assert.equal(remaining("SELECT group_concat(id) FROM event"), "e2");
   } finally {
+    fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });
+    fs.rmSync(fixture.repositoryRoot, { recursive: true, force: true });
+  }
+});
+
+test("agent-cleanup --teardown deletes the session via the OpenCode server when reachable", { skip: spawnSync("sqlite3", ["-version"]).status !== 0 }, async () => {
+  const fixture = fixtureRepository();
+  const dbPath = path.join(fixture.allocationRoot, "opencode.db");
+  const calls = [];
+  let deleteDirectory = null;
+  let worktreeExistedAtDelete = null;
+  let stubWorktreePath = null;
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    calls.push(`${req.method} ${url.pathname}`);
+    res.setHeader("content-type", "application/json");
+    if (req.method === "GET" && url.pathname === "/session/ses_teardown") {
+      res.end(JSON.stringify({ id: "ses_teardown", directory: url.searchParams.get("directory") || "" }));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/session/ses_teardown/message") {
+      res.end("[]");
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/session/ses_teardown/abort") {
+      res.end("true");
+      return;
+    }
+    if (req.method === "DELETE" && url.pathname === "/session/ses_teardown") {
+      deleteDirectory = url.searchParams.get("directory");
+      worktreeExistedAtDelete = stubWorktreePath ? fs.existsSync(stubWorktreePath) : null;
+      // Simulate the server deleting the session row in its database, but NOT
+      // the event_sequence row: if the tool fell back to SQL afterwards, it
+      // would delete that row too, and the assertions below would catch it.
+      spawnSync("sqlite3", [dbPath, "DELETE FROM session WHERE id = 'ses_teardown';"]);
+      res.end("true");
+      return;
+    }
+    res.statusCode = 404;
+    res.end("{}");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const prepared = spawnSync(process.execPath, [
+      path.resolve(scriptsDir, "spawn-agent.mjs"),
+      "--from", fixture.repositoryRoot,
+      "--worktree-root", fixture.allocationRoot,
+      "--prepare-only",
+      "--label", "teardown-api",
+      "--",
+      "test task",
+    ], { encoding: "utf8" });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const record = JSON.parse(prepared.stdout);
+    record.sessionId = "ses_teardown";
+    stubWorktreePath = record.worktreePath;
+    writeTaskRecord(getAgentLayout(fixture.repository, { AGENT_WORKTREE_ROOT: fixture.allocationRoot }), record);
+
+    spawnSync("sqlite3", [dbPath, `
+      PRAGMA foreign_keys=ON;
+      CREATE TABLE session (id text PRIMARY KEY);
+      CREATE TABLE event_sequence (aggregate_id text PRIMARY KEY, seq integer NOT NULL);
+      INSERT INTO session VALUES ('ses_teardown'), ('ses_other');
+      INSERT INTO event_sequence VALUES ('ses_teardown', 1), ('ses_other', 1);`], { encoding: "utf8" });
+
+    // No --force: the stub reports a matching directory, so the normal teardown
+    // guards must pass and a dropped ?directory= would be caught here.
+    // Async spawn, not spawnSync: this test's stub server shares the event loop,
+    // and a blocking spawn would starve it so the child's requests time out.
+    const child = spawn(process.execPath, [
+      path.resolve(scriptsDir, "agent-cleanup.mjs"),
+      "--from", fixture.repositoryRoot,
+      "--worktree-root", fixture.allocationRoot,
+      "--task", record.taskId,
+      "--teardown",
+      "--server", `http://127.0.0.1:${server.address().port}`,
+      "--db", dbPath,
+      "--json",
+    ]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const code = await new Promise((resolve) => child.on("close", resolve));
+    assert.equal(code, 0, stderr);
+    const result = JSON.parse(stdout);
+    assert.equal(result.database.deleted, true);
+    assert.equal(result.database.via, "server-api");
+    assert.ok(calls.includes("DELETE /session/ses_teardown"), `expected a DELETE to the server, saw: ${calls.join(", ")}`);
+    assert.ok(calls.includes("POST /session/ses_teardown/abort"), `expected an abort, saw: ${calls.join(", ")}`);
+    assert.equal(deleteDirectory, record.worktreePath, "the DELETE must carry the worktree as its directory");
+    assert.equal(worktreeExistedAtDelete, true, "the session must be deleted before the worktree is removed");
+    assert.equal(fs.existsSync(record.worktreePath), false);
+
+    // The stub deleted the session row but not the event_sequence row. If the
+    // tool had run its SQL fallback after the server delete, that row would be
+    // gone too — its survival proves the delete was verification-only.
+    assert.equal(result.database.session, 0);
+    assert.equal(result.database.eventSequence, 1);
+    assert.equal(result.database.verification, "rows remain after server delete");
+    const remaining = (sql) => spawnSync("sqlite3", [dbPath, sql], { encoding: "utf8" }).stdout.trim();
+    assert.equal(remaining("SELECT group_concat(id) FROM session"), "ses_other");
+    assert.equal(remaining("SELECT count(*) FROM event_sequence WHERE aggregate_id = 'ses_teardown'"), "1");
+    assert.equal(remaining("SELECT count(*) FROM event_sequence WHERE aggregate_id = 'ses_other'"), "1");
+  } finally {
+    server.close();
     fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });
     fs.rmSync(fixture.repositoryRoot, { recursive: true, force: true });
   }
