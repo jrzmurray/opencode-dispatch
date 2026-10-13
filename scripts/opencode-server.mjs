@@ -4,6 +4,7 @@
  * It talks to an already-running server; it never starts one implicitly.
  */
 
+import os from "node:os";
 import path from "node:path";
 
 function normalizeBaseUrl(value) {
@@ -21,6 +22,34 @@ function basicAuthHeader(username, password) {
 function sameDirectory(left, right) {
   if (!left || !right) return false;
   return path.resolve(left) === path.resolve(right);
+}
+
+/**
+ * True when a server URL points at this machine: localhost names, loopback
+ * addresses, or one of this host's own interface addresses. Direct SQL cleanup
+ * against the local database is only trustworthy for such servers; a remote
+ * server owns a different database, and its sessions must be deleted through
+ * the API.
+ */
+export function isLocalServerUrl(value) {
+  if (!value) return false;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  // 127.0.0.0/8 is loopback by definition; the interface list only carries
+  // 127.0.0.1, and other addresses in the block are loopback too.
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host === "::1") return true;
+  for (const addresses of Object.values(os.networkInterfaces())) {
+    for (const address of addresses || []) {
+      if (address.address.toLowerCase() === host) return true;
+    }
+  }
+  return false;
 }
 
 export class OpenCodeServerError extends Error {
@@ -124,6 +153,11 @@ export class OpenCodeClient {
 
   abortSession(sessionId, { directory } = {}) {
     return this.request("POST", `/session/${encodeURIComponent(sessionId)}/abort`, { query: { directory } });
+  }
+
+  /** Native session delete: interrupts the turn, removes the share, deletes child sessions, emits session.deleted. */
+  deleteSession(sessionId, { directory } = {}) {
+    return this.request("DELETE", `/session/${encodeURIComponent(sessionId)}`, { query: { directory } });
   }
 
   async promptAsync(sessionId, { directory, text, agent, model, noReply = false } = {}) {
