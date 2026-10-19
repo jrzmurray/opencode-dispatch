@@ -628,11 +628,14 @@ function shellEnv(extra = {}) {
   const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-dispatch-shim-"));
   fs.symlinkSync(process.execPath, path.join(shimDir, "node"));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "oc-dispatch-home-"));
+  const tmp = path.join(home, "tmp");
+  fs.mkdirSync(tmp, { recursive: true });
   return {
     env: {
       ...process.env,
       PATH: `${shimDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
       HOME: home,
+      TMPDIR: tmp,
       OPENCODE_DISPATCH_SERVERS: path.join(home, "servers.json"),
       OPENCODE_SERVER_PASSWORD: "",
       OPENCODE_PASSWORD: "",
@@ -644,6 +647,14 @@ function shellEnv(extra = {}) {
       fs.rmSync(home, { recursive: true, force: true });
     },
   };
+}
+
+async function freePort() {
+  const server = http.createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
 }
 
 function runDispatch(args, env) {
@@ -745,6 +756,63 @@ test("profile and address-keyed credentials are independent of the single env pa
     shim.cleanup();
     alpha.close();
     beta.close();
+  }
+});
+
+test("serve launches the local server with the same credential the clients read", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-dispatch-serve-"));
+  const recordEnv = path.join(dir, "server-env.json");
+  const recordPid = path.join(dir, "server-pid");
+  const bin = path.join(dir, "opencode-fake.mjs");
+  fs.writeFileSync(bin, `#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+const args = process.argv.slice(2);
+const port = Number(args[args.indexOf("--port") + 1]);
+fs.writeFileSync(process.env.RECORD_ENV, JSON.stringify({
+  OPENCODE_PASSWORD: process.env.OPENCODE_PASSWORD,
+  OPENCODE_SERVER_PASSWORD: process.env.OPENCODE_SERVER_PASSWORD,
+  OPENCODE_SERVER_USERNAME: process.env.OPENCODE_SERVER_USERNAME,
+  OPENCODE_SERVER_CREDENTIALS: process.env.OPENCODE_SERVER_CREDENTIALS,
+}));
+fs.writeFileSync(process.env.RECORD_PID, String(process.pid));
+http.createServer((req, res) => {
+  if (req.url.startsWith("/session")) {
+    res.setHeader("content-type", "application/json");
+    res.end("[]");
+  } else {
+    res.statusCode = 404;
+    res.end("{}");
+  }
+}).listen(port, "127.0.0.1");
+`, { mode: 0o755 });
+  const port = await freePort();
+  const servers = path.join(dir, "servers.json");
+  fs.writeFileSync(servers, JSON.stringify({
+    alpha: { host: "127.0.0.1", port, password: "profile-pw", bin },
+  }));
+  const shim = shellEnv({
+    OPENCODE_DISPATCH_SERVERS: servers,
+    OPENCODE_PASSWORD: "stale-env-pw",
+    RECORD_ENV: recordEnv,
+    RECORD_PID: recordPid,
+  });
+  let pid = null;
+  try {
+    const result = await runDispatch(["serve", "--server", "alpha"], shim.env);
+    assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+    const recorded = JSON.parse(fs.readFileSync(recordEnv, "utf8"));
+    assert.equal(recorded.OPENCODE_SERVER_PASSWORD, "profile-pw", "server must use the profile credential");
+    assert.equal(recorded.OPENCODE_PASSWORD, "profile-pw", "both dialect names must carry the same resolved pair");
+    assert.equal(recorded.OPENCODE_SERVER_USERNAME, "opencode");
+    assert.equal(recorded.OPENCODE_SERVER_CREDENTIALS, undefined, "an ambient keyed map must not reach the server");
+    pid = Number(fs.readFileSync(recordPid, "utf8"));
+  } finally {
+    if (pid) {
+      try { process.kill(pid); } catch { /* already gone */ }
+    }
+    shim.cleanup();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

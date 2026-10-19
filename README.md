@@ -230,8 +230,10 @@ Resolution for each request is by the address actually used:
 
 The winning pair authenticates the server, and only that pair is exported to
 each launched client/helper (under the names its dialect reads), so server and
-clients always share one credential. Binding a non-loopback interface requires
-a credential for that address.
+clients always share one credential. A private `opencode serve` started by the
+dispatcher receives the same resolved pair (both dialect names), so it cannot
+start with a credential different from the clients it serves. Binding a
+non-loopback interface requires a credential for that address.
 
 ### Agent config (`opencode.json`)
 

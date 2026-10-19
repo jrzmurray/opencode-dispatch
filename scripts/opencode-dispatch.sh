@@ -986,15 +986,46 @@ start_server() {  # $1=dir (default $DIR) $2=port (default $PORT) $3=listen (def
   require_client_bin
   local logdir="${TMPDIR:-/tmp}/opencode-serve"; mkdir -p "$logdir"
   SERVE_LOG="$logdir/serve-${port}.log"
+  # The server must read the SAME resolved pair the clients receive. Set both
+  # dialect names explicitly (and drop an ambient keyed map) so a stale
+  # OPENCODE_PASSWORD in the caller's environment cannot win over the profile.
   if [ -n "$pass" ]; then
-    ( cd "$dir" 2>/dev/null && exec env OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" OPENCODE_SERVER_PASSWORD="$pass" nohup "$(client_bin)" serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
+    ( cd "$dir" 2>/dev/null && exec env -u OPENCODE_SERVER_CREDENTIALS \
+        OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" \
+        OPENCODE_SERVER_PASSWORD="$pass" \
+        OPENCODE_PASSWORD="$pass" \
+        nohup "$(client_bin)" serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
   else
-    ( cd "$dir" 2>/dev/null && exec nohup "$(client_bin)" serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
+    ( cd "$dir" 2>/dev/null && exec env -u OPENCODE_PASSWORD -u OPENCODE_SERVER_PASSWORD -u OPENCODE_SERVER_CREDENTIALS \
+        OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" \
+        nohup "$(client_bin)" serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
   fi
   disown 2>/dev/null || true
   local i
   for i in $(seq 1 50); do server_up && return 0; sleep 0.3; done
   return 1
+}
+
+# Re-resolve the credential after --restart changes the endpoint: credentials
+# are keyed by host:port, so the recorded server address may need a different
+# pair than the profile/CLI address used before read_serve_args.
+refresh_credentials() {
+  local out name listen host port dir pass model api bin user
+  out="$(SRV_NAME="$SERVER_NAME" SERVERS_FILE="$SERVERS_FILE" \
+    CLI_LISTEN="$LISTEN" CLI_HOST="$HOST" CLI_PORT="$PORT" \
+    ENV_PASSWORD="${OPENCODE_SERVER_PASSWORD:-${OPENCODE_PASSWORD:-}}" \
+    ENV_CREDENTIALS="${OPENCODE_SERVER_CREDENTIALS:-}" \
+    node "$SCRIPT_DIR/server-profiles.mjs")" || return 1
+  IFS=$'\x1f' read -r name listen host port dir pass model api bin user <<< "$out"
+  SERVE_PASSWORD="$pass"
+  SERVE_USERNAME="$user"
+  SERVER_USERNAME="${SERVE_USERNAME:-${OPENCODE_SERVER_USERNAME:-opencode}}"
+  CURL_AUTH=()
+  [ -n "$SERVE_PASSWORD" ] && CURL_AUTH=( --user "${SERVER_USERNAME}:${SERVE_PASSWORD}" )
+  # The old endpoint's classification is no longer valid after a restart.
+  RESOLVED_REPORT=""
+  RESOLVED_API=""
+  return 0
 }
 
 # After start_server: the started server must speak v1 for the v1-only modes
@@ -1476,6 +1507,8 @@ if [ "$MODE" = "serve" ]; then
     [ -z "$DIR_SET" ]  && [ -n "$RDIR" ]  && DIR="$RDIR"
     [ -z "$PORT_SET" ] && [ -n "$RPORT" ] && PORT="$RPORT"
     [ -z "$HOST_SET" ] && [ -n "$RHOST" ] && HOST="$RHOST"
+    # Credentials are address-keyed: re-resolve for the recorded endpoint.
+    refresh_credentials || { echo "error: could not resolve credentials for $HOST:$PORT" >&2; exit 2; }
     BASE_URL="http://${HOST}:${PORT}"
     if start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD"; then
       require_started_v1 || exit 2
