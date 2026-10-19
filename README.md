@@ -190,6 +190,14 @@ The single `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` value is only the
 last-resort fallback for a profile with no keyed credential — it never
 overrides an address-specific one.
 
+The bind address (`listen`) and the connection address (`host`) are separate
+on purpose. Credentials are keyed by the **connection** address: a profile that
+binds `0.0.0.0` but sets `host: "127.0.0.1"` uses the `127.0.0.1` credential;
+the same bind with `host: "192.0.2.50"` uses that address's credential.
+`0.0.0.0`/`::` are never valid connection addresses, so a wildcard bind without
+an explicit `host` is refused rather than guessed. `localhost` and `127.0.0.1`
+are treated as the same loopback credential key.
+
 `--server <name>` (or `$OPENCODE_DISPATCH_SERVER`, or `serve <name>`) selects a
 profile; per-field precedence is CLI flag > env (`OPENCODE_DISPATCH_*`) >
 definition. Default profile: `default` (127.0.0.1:4096) — the single-server

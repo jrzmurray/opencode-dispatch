@@ -48,7 +48,16 @@ function keysFor(host, port) {
   const normalized = normalizeHost(host);
   if (!normalized) return [];
   const value = String(port || "").trim();
-  return value ? [`${normalized}:${value}`, normalized] : [normalized];
+  // localhost and 127.0.0.1 are the same IPv4 loopback in practice; a
+  // credential keyed under either name should serve the other.
+  const aliases = normalized === "localhost"
+    ? ["127.0.0.1"]
+    : normalized === "127.0.0.1" ? ["localhost"] : [];
+  const hosts = [normalized, ...aliases];
+  const keys = [];
+  if (value) for (const item of hosts) keys.push(`${item}:${value}`);
+  for (const item of hosts) keys.push(item);
+  return keys;
 }
 
 /** Parse a credentials map from an object or a JSON string. */

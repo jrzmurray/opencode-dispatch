@@ -64,7 +64,10 @@ the profile's `username`/`password`, the `servers.json` `credentials` map, then
 the single `$OPENCODE_SERVER_PASSWORD` / `$OPENCODE_PASSWORD` fallback
 (v1 name; still read by v2 clients). `.env.local` supplies the same variables.
 Launched clients receive the names their dialect reads — one pair per process,
-so one server's credential never leaks into another's client.
+so one server's credential never leaks into another's client. A profile's bind
+address (`listen`) is not a credential key: credentials are keyed by the
+connection address (`host`), and a wildcard bind (`0.0.0.0`/`::`) without an
+explicit `host` is refused. `localhost` and `127.0.0.1` share their key.
 
 ## Mode support matrix
 

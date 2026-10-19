@@ -7,8 +7,9 @@ import { listProfiles, resolveProfile } from "../server-profiles.mjs";
 const { keysFor, normalizeKey, normalizeMap, resolveCredential } = credentials;
 
 test("credential keys normalize addresses without losing the port", () => {
-  assert.deepEqual(keysFor("127.0.0.1", 4096), ["127.0.0.1:4096", "127.0.0.1"]);
-  assert.deepEqual(keysFor("LOCALHOST", "4096"), ["localhost:4096", "localhost"]);
+  assert.deepEqual(keysFor("127.0.0.1", 4096), ["127.0.0.1:4096", "localhost:4096", "127.0.0.1", "localhost"]);
+  assert.deepEqual(keysFor("LOCALHOST", "4096"), ["localhost:4096", "127.0.0.1:4096", "localhost", "127.0.0.1"]);
+  assert.deepEqual(keysFor("192.0.2.50", 4096), ["192.0.2.50:4096", "192.0.2.50"]);
   assert.deepEqual(keysFor("", 4096), []);
   assert.equal(normalizeKey("http://192.0.2.50:4096"), "192.0.2.50:4096");
   assert.equal(normalizeKey("HTTPS://Example.COM"), "example.com:443");
@@ -102,4 +103,25 @@ test("profile resolution keeps endpoint precedence and skips non-profiles", () =
   assert.throws(() => resolveProfile({ defs, name: "credentials", file: "servers.json" }), /reserved key/);
   assert.throws(() => resolveProfile({ defs: { bad: { api: "v3" } }, name: "bad", file: "servers.json" }), /invalid api/);
   assert.throws(() => resolveProfile({ defs: { bad: { host: "0.0.0.0" } }, name: "bad", file: "servers.json" }), /no reachable address/);
+});
+
+test("binding 0.0.0.0 keys credentials by the connection host, not the bind address", () => {
+  const defs = {
+    loop: { listen: "0.0.0.0", host: "localhost", port: 4096 },
+    lan: { listen: "0.0.0.0", host: "192.0.2.50", port: 4096 },
+    credentials: { "127.0.0.1:4096": "loop-pw", "192.0.2.50:4096": "lan-pw" },
+  };
+  // Connecting through localhost resolves the 127.0.0.1 key.
+  const loop = resolveProfile({ defs, name: "loop", file: "servers.json", env: {} });
+  assert.equal(loop.password, "loop-pw");
+
+  // A wildcard bind does not make the local key apply to a different host.
+  const lan = resolveProfile({ defs, name: "lan", file: "servers.json", env: {} });
+  assert.equal(lan.password, "lan-pw");
+
+  // The wildcard bind itself is never a connection address.
+  assert.throws(
+    () => resolveProfile({ defs: { noHost: { listen: "0.0.0.0" } }, name: "noHost", file: "servers.json", env: {} }),
+    /no reachable address/,
+  );
 });
