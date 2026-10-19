@@ -177,18 +177,33 @@ model       default provider/model for dispatch through this profile
 
 Credentials are per address. A profile's `username`/`password` apply to that
 profile; profiles without one use the top-level `credentials` map, keyed by
-`host`, `host:port`, or a full URL:
-
-```json
-"credentials": {
-  "192.0.2.50": "remote-pw",
-  "127.0.0.1:4096": { "username": "opencode", "password": "local-pw" }
-}
-```
+`host`, `host:port`, or a full URL.
 
 The single `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` value is only the
 last-resort fallback for a profile with no keyed credential — it never
 overrides an address-specific one.
+
+Where each layer lives:
+
+| Layer | Location | Scope |
+| --- | --- | --- |
+| profiles + top-level `credentials` map | `~/.config/opencode-dispatch/servers.json` (or `$OPENCODE_DISPATCH_SERVERS`) | persistent; `install.sh` seeds it from `config/servers.json.example` and never overwrites it |
+| `OPENCODE_SERVER_CREDENTIALS` map, `OPENCODE_SERVER_USERNAME`, single password | `.env.local` next to the installed dispatch scripts (e.g. `~/.claude/scripts/.env.local`), or `$OPENCODE_DISPATCH_ENV_FILE` | persistent per install; exported variables win over the file |
+| same variables exported in a shell | the invoking shell / process tree | that invocation only, unless placed in a shell profile |
+
+The `credentials` map is a sibling of the profiles in `servers.json`, not a
+field inside a profile:
+
+```json
+{
+  "work": { "listen": "0.0.0.0", "host": "127.0.0.1", "port": 4096 },
+  "credentials": { "127.0.0.1:4096": "local-pw" }
+}
+```
+
+A profile's own `username`/`password` is also valid and takes precedence over
+the map. The single `OPENCODE_SERVER_PASSWORD` only applies to profiles whose
+address has no keyed or profile credential.
 
 The bind address (`listen`) and the connection address (`host`) are separate
 on purpose. Credentials are keyed by the **connection** address: a profile that
