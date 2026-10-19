@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { OpenCodeClient } from "./opencode-server.mjs";
+import { API_V1, API_V2, clientAuthEnv } from "./api-dialect.mjs";
 import {
   assertClean,
   branchPrefix,
@@ -149,15 +150,28 @@ function resolveExecutable(command) {
   }
 }
 
-export function buildWorkerArgs(options, { serverUrl, worktreePath, sessionId }) {
-  const args = ["run", "--attach", serverUrl, "--dir", worktreePath, "--session", sessionId];
+export function buildWorkerArgs(options, { serverUrl, worktreePath, sessionId, api = API_V1 }) {
+  // v1 attaches to a server URL with an explicit session directory; v2
+  // connects with --server and roots the session at the process cwd (the
+  // worktree), because `run` has no --dir flag anymore.
+  const args = api === API_V2
+    ? ["run", "--server", serverUrl, "--session", sessionId]
+    : ["run", "--attach", serverUrl, "--dir", worktreePath, "--session", sessionId];
   // Attached workers must opt into the configured autonomous permission mode.
-  // Keep this adjacent to --attach so every attached launch gets the guardrail,
-  // including launches made by callers other than the dispatch shell script.
+  // Keep this adjacent to the server flags so every attached launch gets the
+  // guardrail, including launches made by callers other than the dispatch
+  // shell script.
   args.push("--auto");
   if (options.agent) args.push("--agent", options.agent);
-  if (options.model) args.push("--model", options.model);
-  if (options.variant) args.push("--variant", options.variant);
+  if (options.model) {
+    if (api === API_V2) {
+      // v2 joins the variant to the model reference: provider/model#variant.
+      args.push("--model", options.variant ? `${options.model}#${options.variant}` : options.model);
+    } else {
+      args.push("--model", options.model);
+    }
+  }
+  if (options.variant && api !== API_V2) args.push("--variant", options.variant);
   args.push("--", options.promptText);
   return args;
 }
@@ -168,9 +182,12 @@ function updateRecord(layout, record, patch) {
   return record;
 }
 
-function workerEnvironment(record, serverUrl) {
+function workerEnvironment(record, serverUrl, auth = {}) {
   return {
     ...process.env,
+    // Give the launched client binary the credentials for the dialect it must
+    // speak (v1: OPENCODE_SERVER_PASSWORD; v2: OPENCODE_PASSWORD [+ fallback]).
+    ...clientAuthEnv(auth.api, { username: auth.username, password: auth.password }),
     AGENT_TASK_ID: record.taskId,
     AGENT_WORKTREE_PATH: record.worktreePath,
     AGENT_WORKTREE_BRANCH: record.branch,
@@ -219,11 +236,11 @@ export function resolveBootstrapCommand(options, sourceRoot) {
   return command;
 }
 
-function bootstrapWorker(record, options, repository, serverUrl) {
+function bootstrapWorker(record, options, repository, serverUrl, auth) {
   const command = resolveBootstrapCommand(options, repository.root);
   if (!command) return;
   const env = {
-    ...workerEnvironment(record, serverUrl),
+    ...workerEnvironment(record, serverUrl, auth),
     WORKTREE_TASK_ID: record.taskId,
     WORKTREE_SOURCE_PATH: repository.root,
     WORKTREE_ORIGIN: "spawned-agent",
@@ -238,15 +255,15 @@ function bootstrapWorker(record, options, repository, serverUrl) {
   });
 }
 
-function launchWorker(options, record, serverUrl, layout) {
+function launchWorker(options, record, serverUrl, layout, auth) {
   const executable = resolveExecutable(options.opencode);
-  const args = buildWorkerArgs(options, { serverUrl, worktreePath: record.worktreePath, sessionId: record.sessionId });
+  const args = buildWorkerArgs(options, { serverUrl, worktreePath: record.worktreePath, sessionId: record.sessionId, api: auth.api });
   const logPath = options.foreground ? null : path.join(layout.registryRoot, `${record.taskId}.log`);
   if (logPath) fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
   const logFd = logPath ? fs.openSync(logPath, "a", 0o600) : undefined;
   const child = spawn(executable, args, {
     cwd: record.worktreePath,
-    env: workerEnvironment(record, serverUrl),
+    env: workerEnvironment(record, serverUrl, auth),
     detached: !options.foreground,
     shell: false,
     stdio: options.foreground ? "inherit" : ["ignore", logFd, logFd],
@@ -349,7 +366,8 @@ async function main() {
 
   try {
     updateRecord(layout, record, { state: "bootstrapping" });
-    bootstrapWorker(record, options, repository, serverUrl);
+    const auth = { api: client.api, username: client.username, password: client.password };
+    bootstrapWorker(record, options, repository, serverUrl, auth);
     updateRecord(layout, record, { state: "bootstrapped" });
 
     await client.health();
@@ -365,12 +383,14 @@ async function main() {
         });
     if (!session?.id) throw new Error("OpenCode server did not return a session ID");
     record.sessionId = session.id;
+    record.serverApi = client.api;
     OpenCodeClient.assertDirectory(session, record.worktreePath);
-    updateRecord(layout, record, { sessionId: session.id, state: "session-created" });
+    updateRecord(layout, record, { sessionId: session.id, state: "session-created", serverApi: client.api });
 
-    const env = workerEnvironment(record, serverUrl);
+    const workerAuth = { api: client.api, username: client.username, password: client.password };
+    const env = workerEnvironment(record, serverUrl, workerAuth);
     runGuard(record, env);
-    const child = launchWorker(options, record, serverUrl, layout);
+    const child = launchWorker(options, record, serverUrl, layout, workerAuth);
     if (options.foreground) {
       const exitCode = await new Promise((resolve, reject) => {
         child.once("error", reject);

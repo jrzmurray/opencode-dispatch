@@ -194,6 +194,15 @@
 #                             config/servers.json.example). Keys starting with _ are
 #                             ignored. Per-field precedence:
 #                             CLI flag > env (OPENCODE_DISPATCH_*) > definition.
+#                             Definitions may also carry 'api' (auto|v1|v2) and
+#                             'bin' (the opencode binary paired with that
+#                             server's generation; per-profile, no global
+#                             default).
+#   --api <auto|v1|v2>        Server API dialect. auto probes /api/info (v2) and
+#                             the legacy /session list (v1). v1 = original API,
+#                             opencode 1.18.29+; v2 = revised API, opencode 2.x.
+#                             Modes not yet v2-ready refuse a v2 server with a
+#                             clear error; see COMPATIBILITY.md.
 #   --stop                    (serve) stop the running opencode server (needs
 #                             lsof; uses the recorded launch args unless
 #                             --port/--host are given).
@@ -210,6 +219,12 @@
 # password — the dispatcher refuses to start an unauthenticated server.
 
 set -euo pipefail
+
+# This script's directory and the dialect-aware API helper that lives next to
+# it. Rewired modes call `oc_api` (below) instead of raw curl so v1/v2 shape
+# differences stay in one place (scripts/oc-api.mjs + scripts/api-dialect.mjs).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OC_API="$SCRIPT_DIR/oc-api.mjs"
 
 # ---- .env.local credential loading ------------------------------------------
 # A .env.local in the skill directory can carry OPENCODE_SERVER_USERNAME /
@@ -241,8 +256,13 @@ load_env_local() {
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
     case "$key" in
-      OPENCODE_SERVER_USERNAME|OPENCODE_SERVER_PASSWORD)
-        if [ -z "${!key:-}" ]; then export "$key=$val"; fi ;;
+      OPENCODE_SERVER_USERNAME|OPENCODE_SERVER_PASSWORD|OPENCODE_PASSWORD)
+        if [ -z "${!key:-}" ]; then export "$key=$val"; fi
+        # The canonical v2 name feeds the shared password slot when no v1 name
+        # was provided, so one file serves both generations.
+        if [ "$key" = "OPENCODE_PASSWORD" ] && [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+          export OPENCODE_SERVER_PASSWORD="$val"
+        fi ;;
     esac
   done < "$f"
 }
@@ -358,6 +378,10 @@ Server selection (all server-backed modes):
   --server <name>     Named server definition (default: 'default').
                       Definitions file: $OPENCODE_DISPATCH_SERVERS (default
                       ~/.config/opencode-dispatch/servers.json).
+  --api <auto|v1|v2>  Server API dialect (default: the profile's 'api' field,
+                      else auto — probe the server). v1 is the legacy/LTS API
+                      (opencode 1.18.29+); v2 is the revised 2.x API. See
+                      COMPATIBILITY.md for the per-mode support matrix.
   --listen <addr>     (serve) bind interface for `opencode serve --hostname`
                       (127.0.0.1 | 0.0.0.0 | an interface IP). The server is
                       still REACHED at --host — never 0.0.0.0.
@@ -456,6 +480,9 @@ fi
 WORKTREE_ROOT="${AGENT_WORKTREE_ROOT:-}"
 TASK_ID=""
 PROMPT_FILE=""
+API_SETTING="${OPENCODE_DISPATCH_API:-}"
+API_SET=""
+SERVE_BIN=""
 PORT="${OPENCODE_DISPATCH_PORT:-}"
 HOST="${OPENCODE_DISPATCH_HOST:-}"
 PORT_SET=""
@@ -509,6 +536,7 @@ while [ $# -gt 0 ]; do
     --host)              HOST="${2:-}"; HOST_SET=1; shift 2 ;;
     --listen)            LISTEN="${2:-}"; LISTEN_SET=1; shift 2 ;;
     --server)            SERVER_NAME="${2:-}"; SERVER_SET=1; shift 2 ;;
+    --api)               API_SETTING="${2:-}"; API_SET=1; shift 2 ;;
     --stop)              STOP=1; shift ;;
     --restart)           RESTART=1; shift ;;
     --)                  shift; MSG_PARTS+=("$@"); break ;;
@@ -531,17 +559,25 @@ case "$SERVER_NAME" in
   ""|*[!A-Za-z0-9._-]*)
     echo "error: invalid server name: '$SERVER_NAME' (use letters, digits, . _ -)" >&2; exit 2 ;;
 esac
+# API dialect selection: CLI --api > $OPENCODE_DISPATCH_API > profile 'api'
+# field > auto (probe the server). v1 is the legacy/LTS API surface; v2 is the
+# revised API on opencode 2.x. Modes that are not v2-ready refuse to run
+# against a v2 server with a clear message instead of issuing v1 calls.
+case "${API_SETTING:-auto}" in
+  ""|auto|v1|v2) API_SETTING="${API_SETTING:-auto}" ;;
+  *) echo "error: --api / OPENCODE_DISPATCH_API must be auto|v1|v2 (got: '$API_SETTING')" >&2; exit 2 ;;
+esac
 # Fields are joined with \x1f (unit separator) — NOT tab: tab is IFS whitespace,
 # so bash `read` collapses empty middle fields (e.g. an unset 'dir' would push
 # the password into the wrong variable). \x1f is literal, so every field slot
 # survives, including empty ones.
-IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MODEL < <(
+IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MODEL DEF_API SERVE_BIN < <(
   SRV_NAME="$SERVER_NAME" SERVERS_FILE="$SERVERS_FILE" \
   CLI_LISTEN="$LISTEN" CLI_HOST="$HOST" CLI_PORT="$PORT" \
   ENV_LISTEN="${OPENCODE_DISPATCH_LISTEN:-}" \
   ENV_HOST="${OPENCODE_DISPATCH_HOST:-}" \
   ENV_PORT="${OPENCODE_DISPATCH_PORT:-}" \
-  ENV_PASSWORD="${OPENCODE_SERVER_PASSWORD:-}" \
+  ENV_PASSWORD="${OPENCODE_SERVER_PASSWORD:-${OPENCODE_PASSWORD:-}}" \
   node - <<'EOF'
     const fs = require("fs");
     const file = process.env.SERVERS_FILE;
@@ -567,6 +603,12 @@ IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MO
     const pass = process.env.ENV_PASSWORD || d.password || "";
     const dir = d.dir || "";
     const model = d.model || "";
+    const api = d.api || "";
+    const bin = d.bin || "";
+    if (api && !["auto", "v1", "v2"].includes(api)) {
+      console.error(`error: server '${name}' has invalid api '${api}' (use auto|v1|v2)`);
+      process.exit(1);
+    }
     if (!(port >= 1 && port <= 65535)) {
       console.error(`error: invalid port ${port} for server '${name}'`); process.exit(1);
     }
@@ -574,9 +616,20 @@ IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MO
       console.error(`error: server '${name}' has no reachable address (host can never be 0.0.0.0/::) — set 'host' in the definition, or bind loopback and let the host default to it`);
       process.exit(1);
     }
-    process.stdout.write([name, listen, host, port, dir, pass, model].join("\x1f") + "\n");
+    process.stdout.write([name, listen, host, port, dir, pass, model, api, bin].join("\x1f") + "\n");
 EOF
 ) || exit 2
+# Profile 'api' feeds the dialect selection only when nothing above it did.
+[ -z "$API_SET" ] && [ -n "$DEF_API" ] && API_SETTING="$DEF_API"
+API_SETTING="${API_SETTING:-auto}"
+# Profile 'bin' is the opencode client binary paired with this server's
+# generation (per-profile only; no global default — PATH `opencode` otherwise).
+if [ -n "$SERVE_BIN" ]; then
+  case "$SERVE_BIN" in
+    */*) [ -x "$SERVE_BIN" ] || { echo "error: profile bin is not executable: $SERVE_BIN" >&2; exit 4; } ;;
+    *) command -v "$SERVE_BIN" >/dev/null 2>&1 || { echo "error: profile bin not found on PATH: $SERVE_BIN" >&2; exit 4; } ;;
+  esac
+fi
 # Binding a non-loopback interface without a password would expose an
 # unauthenticated server on the network — refuse.
 case "$LISTEN" in
@@ -718,6 +771,7 @@ prompt_rebuild() {  # $1 = leading positional arg to keep ("" = none); rest = pr
   # defaulted to "default" before rebuild runs, so an unconditional re-pass
   # would clobber a $OPENCODE_DISPATCH_SERVER env selection on the re-exec.
   [ -n "$SERVER_SET" ] && args+=( --server "$SERVER_NAME" )
+  [ -n "$API_SET" ] && args+=( --api "$API_SETTING" )
   args+=( --port "$PORT" )
   args+=( --host "$HOST" )
   args+=( --prompt-file "$tmp" )
@@ -826,12 +880,91 @@ pending_ask() {
   return 0
 }
 
+# ---- dialect helpers (v1/v2) -------------------------------------------------
+# The client binary paired with this profile's server generation. Per-profile
+# `bin` (servers.json); PATH `opencode` otherwise.
+client_bin() { printf '%s' "${SERVE_BIN:-opencode}"; }
+
+# The paired binary's generation from --version: "1", "2", or "" (unknown).
+client_generation() {
+  local v
+  v="$("$(client_bin)" --version 2>/dev/null || true)"
+  case "$v" in
+    *\ 2.*|2.*) echo 2 ;;
+    *\ 1.*|1.*) echo 1 ;;
+    *) echo "" ;;
+  esac
+}
+
+# Run the dialect-aware API helper with the resolved credentials. The password
+# travels in the environment, not argv.
+oc_api() {
+  [ -f "$OC_API" ] || { echo "error: oc-api helper not found: $OC_API (reinstall opencode-dispatch)" >&2; exit 5; }
+  OPENCODE_PASSWORD="${SERVE_PASSWORD:-}" OPENCODE_SERVER_PASSWORD="${SERVE_PASSWORD:-}" \
+  OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" \
+    node "$OC_API" "$@"
+}
+
+RESOLVED_REPORT=""
+RESOLVED_API=""
+# resolve_report — classify the server once per invocation. Sets
+# RESOLVED_API ('v1'|'v2') and RESOLVED_REPORT (detect JSON). Returns 1 when
+# the server is down or unrecognizable (callers label that themselves).
+resolve_report() {
+  [ -n "$RESOLVED_REPORT" ] && return 0
+  local out
+  out="$(oc_api detect --server "$BASE_URL" --bin "$(client_bin)" --json 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  RESOLVED_API="$(printf '%s' "$out" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).api||"")}catch(e){}})')" || true
+  [ -n "$RESOLVED_API" ] || return 1
+  RESOLVED_REPORT="$out"
+  return 0
+}
+resolve_api() { resolve_report >/dev/null 2>&1 || true; printf '%s' "$RESOLVED_API"; }
+report_field() {  # $1 = dotted path into the detect JSON (e.g. pairing.severity)
+  printf '%s' "$RESOLVED_REPORT" | FIELD="$1" node -e '
+    let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+      try{const j=JSON.parse(d);const v=process.env.FIELD.split(".").reduce((o,k)=>o?.[k],j);
+        process.stdout.write(v===undefined||v===null?"":String(v))}catch(e){}});'
+}
+
 require_server() {
-  if ! server_up; then
-    echo "error: no opencode server reachable at $BASE_URL" >&2
+  if ! resolve_report; then
+    echo "error: no opencode server reachable at $BASE_URL (or the credentials were rejected)" >&2
     echo "  Start one: $(basename "$0") serve --port $PORT" >&2
     exit 5
   fi
+  if [ "$(report_field authOk)" != "true" ]; then
+    echo "error: server $BASE_URL requires authentication and the request was rejected" >&2
+    echo "  $(report_field detail)" >&2
+    exit 5
+  fi
+}
+
+# Refuse server-backed modes that still speak the v1 API against a v2 server.
+# They fail with a clear message instead of issuing calls that cannot work.
+require_v1_mode() {  # $1 = mode label
+  local api; api="$(resolve_api)"
+  if [ "$api" = "v2" ]; then
+    echo "error: '$1' is not v2-ready yet; this dispatch still speaks the v1 server API for it." >&2
+    echo "  v2-ready today: setup, sessions, status, history, follow, identify, claim, teardown." >&2
+    echo "  See COMPATIBILITY.md for the support matrix." >&2
+    exit 2
+  fi
+}
+
+# Server dialect ↔ client binary pairing (mismatch = hard error, unknown =
+# warning). Only modes that launch the client binary need this.
+check_pairing() {
+  resolve_report >/dev/null 2>&1 || return 0
+  local severity reason
+  severity="$(report_field pairing.severity)"
+  reason="$(report_field pairing.reason)"
+  case "$severity" in
+    ""|ok) return 0 ;;
+    unknown) echo "warning: pairing unverified — ${reason:-client version could not be determined}" >&2; return 0 ;;
+    *) echo "error: ${reason:-server/client generation mismatch}" >&2; exit 2 ;;
+  esac
 }
 
 SERVE_LOG=""
@@ -840,14 +973,25 @@ start_server() {  # $1=dir (default $DIR) $2=port (default $PORT) $3=listen (def
   local logdir="${TMPDIR:-/tmp}/opencode-serve"; mkdir -p "$logdir"
   SERVE_LOG="$logdir/serve-${port}.log"
   if [ -n "$pass" ]; then
-    ( cd "$dir" 2>/dev/null && exec env OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" OPENCODE_SERVER_PASSWORD="$pass" nohup opencode serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
+    ( cd "$dir" 2>/dev/null && exec env OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" OPENCODE_SERVER_PASSWORD="$pass" nohup "$(client_bin)" serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
   else
-    ( cd "$dir" 2>/dev/null && exec nohup opencode serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
+    ( cd "$dir" 2>/dev/null && exec nohup "$(client_bin)" serve --port "$port" --hostname "$listen" </dev/null >"$SERVE_LOG" 2>&1 ) &
   fi
   disown 2>/dev/null || true
   local i
   for i in $(seq 1 50); do server_up && return 0; sleep 0.3; done
   return 1
+}
+
+# After start_server: the started server must speak v1 for the v1-only modes
+# (a v2 binary serves the v2 API, which those paths cannot drive).
+require_started_v1() {
+  if resolve_report && [ "$RESOLVED_API" != "v1" ]; then
+    echo "error: $(client_bin) started a $RESOLVED_API server at $BASE_URL, but this mode still speaks the v1 API." >&2
+    echo "  Set this profile's \"bin\" to an opencode 1.18.x binary (see COMPATIBILITY.md)." >&2
+    return 1
+  fi
+  return 0
 }
 
 # The last server THIS script started for the resolved server name is recorded
@@ -932,6 +1076,8 @@ ensure_server() {  # auto-start in $DIR if none is reachable
   server_up && return 0
   echo "no opencode server ($SERVER_NAME) at $BASE_URL — starting one in ${DIR}…" >&2
   start_server "$DIR" || { echo "error: server did not start; see $SERVE_LOG" >&2; exit 6; }
+  # These paths drive the v1 API; a v2 binary would have started a v2 server.
+  require_started_v1 || exit 2
 }
 
 # --- server API helpers (used by the default server-backed run path) ---
@@ -977,23 +1123,33 @@ oc_submit_async() {  # $1=sessionId $2=path-to-message-text-file $3=agent(option
 
 # ---- setup -------------------------------------------------------------------
 if [ "$MODE" = "setup" ]; then
-  echo "opencode:  $(command -v opencode)"
-  opencode --version 2>/dev/null | sed 's/^/version:   /' || true
+  echo "opencode:  $(command -v "$(client_bin)" 2>/dev/null || echo "$(client_bin) (not on PATH)")"
+  "$(client_bin)" --version 2>/dev/null | sed 's/^/version:   /' || true
+  echo "v1 floor:  1.18.29 (v1 servers need this release or newer; v2 needs 2.x)"
   echo "config:    $HOME/.config/opencode/opencode.json"
   echo "servers:   $SERVERS_FILE"
-  # Every defined server, with its bind vs addressable split and live state.
+  # Every defined server, with its bind vs addressable split and live dialect.
   # '*' marks the one this invocation resolves (--server / OPENCODE_DISPATCH_SERVER).
-  while IFS=$'\x1f' read -r n l h p d pw m; do
+  # State column: v1|v2 = reachable API dialect, auth = rejected credentials,
+  # down = unreachable. Definitions may carry 'api' (auto|v1|v2) and 'bin'
+  # (the opencode binary paired with that server's generation).
+  while IFS=$'\x1f' read -r n l h p d pw m a b; do
     [ -n "$n" ] || continue
     mark=" "; [ "$n" = "$SERVER_NAME" ] && mark="*"
     # The marked row shows the RESOLVED values (CLI/env overrides applied).
     if [ "$n" = "$SERVER_NAME" ]; then
-      l="$LISTEN"; h="$HOST"; p="$PORT"; d="$SERVE_DIR"; pw="$SERVE_PASSWORD"; m="$DEF_MODEL"
+      l="$LISTEN"; h="$HOST"; p="$PORT"; d="$SERVE_DIR"; pw="$SERVE_PASSWORD"; m="$DEF_MODEL"; a="$DEF_API"; b="$SERVE_BIN"
     fi
     url="http://${h}:${p}"
-    auth=(); [ -n "$pw" ] && auth=( --user "${SERVER_USERNAME:-opencode}:${pw}" )
-    if curl -sf -m 2 ${auth[@]:+"${auth[@]}"} "$url/session" -o /dev/null 2>/dev/null; then st="UP"; else st="down"; fi
-    printf '%s %-16s %-14s -> %-22s %-5s %s%s\n' "$mark" "$n" "listen:$l" "$h:$p" "$st" "${m:+model: $m }" "${d:+dir: $d}"
+    st="down"
+    if [ -f "$OC_API" ]; then
+      st="$(OPENCODE_PASSWORD="$pw" OPENCODE_SERVER_PASSWORD="$pw" node "$OC_API" detect --server "$url" --json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);process.stdout.write(!j.serverUp?"down":(j.api?(j.authOk?j.api:"auth"):"?"))}catch(e){process.stdout.write("down")}})')"
+      [ -n "$st" ] || st="down"
+    else
+      auth=(); [ -n "$pw" ] && auth=( --user "${SERVER_USERNAME:-opencode}:${pw}" )
+      if curl -sf -m 2 ${auth[@]:+"${auth[@]}"} "$url/session" -o /dev/null 2>/dev/null; then st="UP"; else st="down"; fi
+    fi
+    printf '%s %-16s %-14s -> %-22s %-4s %s%s%s%s\n' "$mark" "$n" "listen:$l" "$h:$p" "$st" "${a:+api:$a }" "${b:+bin:$(basename "$b") }" "${m:+model: $m }" "${d:+dir: $d}"
   done < <(
     SERVERS_FILE="$SERVERS_FILE" node - <<'EOF'
       const fs = require("fs");
@@ -1010,15 +1166,24 @@ if [ "$MODE" = "setup" ]; then
         const host = v.host || (loopback(listen) ? listen : "");
         // The env password is the effective one for any profile without its own.
         const pw = v.password || process.env.OPENCODE_SERVER_PASSWORD || "";
-        process.stdout.write([k, listen, host, v.port || "4096", v.dir || "", pw, v.model || ""].join("\x1f") + "\n");
+        process.stdout.write([k, listen, host, v.port || "4096", v.dir || "", pw, v.model || "", v.api || "", v.bin || ""].join("\x1f") + "\n");
       }
 EOF
   )
+  # Dialect + pairing for the resolved server. Detection is honest about the
+  # server; the declared 'api' only feeds client launching.
+  if resolve_report 2>/dev/null; then
+    pinfo="$(report_field pairing.reason)"
+    echo "dialect:   ${RESOLVED_API} at $BASE_URL (declared: ${API_SETTING}; bin: $(client_bin))"
+    [ -n "$pinfo" ] && echo "pairing:   ${pinfo}"
+  else
+    echo "dialect:   unreachable at $BASE_URL (declared: ${API_SETTING}; bin: $(client_bin))"
+  fi
   echo "default model (dispatch): ${MODEL:-<opencode config default>}"
   echo "authenticated providers:"
-  opencode auth list 2>/dev/null | sed 's/^/  /' || echo "  (none — run: opencode auth login)"
+  "$(client_bin)" auth list 2>/dev/null | sed 's/^/  /' || echo "  (none — run: opencode auth login)"
   echo "models available:"
-  opencode models 2>/dev/null | sed 's/^/  - /' | head -40 || echo "  (run after auth to list)"
+  "$(client_bin)" models 2>/dev/null | sed 's/^/  - /' | head -40 || echo "  (run after auth to list)"
   exit 0
 fi
 
@@ -1032,6 +1197,14 @@ if [ "$MODE" = "follow" ]; then
   [ -n "$TASK_ID" ] && { resolve_task_context; }
   if [ -z "$SID" ]; then
     echo "error: follow needs a <sessionID> (or --task <taskID>)" >&2; exit 2
+  fi
+  # v2: the event-driven follower in oc-api (same output lines and exit codes;
+  # falls back to polling if the event stream drops). The loop below is the
+  # v1 polling path.
+  if [ "$(resolve_api)" = "v2" ]; then
+    _ftimeout=0; [ -n "$TIMEOUT_SET" ] && _ftimeout="$FOLLOW_TIMEOUT"
+    oc_api follow --server "$BASE_URL" --session "$SID" --dir "$DIR" --timeout "$_ftimeout"
+    exit $?
   fi
   if ! curl -sf -m 5 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID" -o /dev/null 2>/dev/null; then
     echo "error: session not found: $SID" >&2; exit 5
@@ -1273,6 +1446,11 @@ prune_prompt_files() {
   find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name 'opencode-msg.*' -o -name 'opencode-diff.*' \) -mtime "+${ttl}" -delete 2>/dev/null || true
 }
 if [ "$MODE" = "serve" ]; then
+  # The serve lifecycle below manages a private v1 `opencode serve`. v2's
+  # shared background service is managed by `opencode service` (or a private
+  # `opencode serve`), which this dispatcher does not own yet.
+  require_v1_mode serve
+  check_pairing
   prune_prompt_files
   if [ -n "$STOP" ] && [ -n "$RESTART" ]; then
     echo "error: --stop and --restart are mutually exclusive" >&2; exit 2
@@ -1299,6 +1477,7 @@ if [ "$MODE" = "serve" ]; then
     [ -z "$HOST_SET" ] && [ -n "$RHOST" ] && HOST="$RHOST"
     BASE_URL="http://${HOST}:${PORT}"
     if start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD"; then
+      require_started_v1 || exit 2
       write_serve_args "$DIR" "$PORT" "$HOST"
       echo "opencode server restarted at $BASE_URL (dir: $DIR)"
       [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (password from env/.env.local/profile)"
@@ -1314,6 +1493,7 @@ if [ "$MODE" = "serve" ]; then
     exit 0
   fi
   if start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD"; then
+    require_started_v1 || exit 2
     write_serve_args "$DIR" "$PORT" "$HOST"
     echo "opencode server started at $BASE_URL (dir: $DIR)"
     [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (password from env/.env.local/profile)"
@@ -1333,20 +1513,8 @@ fi
 # ---- sessions ----------------------------------------------------------------
 if [ "$MODE" = "sessions" ]; then
   require_server
-  curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" \
-    | LIMIT="$TAIL" node -e '
-      let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
-        let a; try{a=JSON.parse(d)}catch(e){console.error("bad JSON from server");process.exit(1)}
-        const norm=t=>t&&t<1e12?t*1000:t;
-        a.sort((x,y)=>(norm(y?.time?.updated)||0)-(norm(x?.time?.updated)||0));
-        const lim=parseInt(process.env.LIMIT,10)||50;
-        const shown=a.slice(0,lim);
-        for(const s of shown){
-          const u=norm(s?.time?.updated); const iso=u?new Date(u).toISOString().replace("T"," ").slice(0,19):"?";
-          console.log(`${s.id}  ${iso}  ${s.title||""}`);
-        }
-        if(a.length>shown.length) console.log(`… ${a.length-shown.length} older session(s) not shown (raise --tail).`);
-      });'
+  # Rendering (and dialect differences) live in oc-api; see COMPATIBILITY.md.
+  oc_api sessions --server "$BASE_URL" --limit "$TAIL" || exit $?
   exit 0
 fi
 
@@ -1359,61 +1527,12 @@ if [ "$MODE" = "history" ]; then
     echo "error: history needs a <sessionID> (see: $(basename "$0") sessions)" >&2
     exit 2
   fi
-  # Directory-scoped fetch first; a session rooted elsewhere (or a server that
-  # ignores the param) falls back to a bare fetch — the session id is unique
-  # server-wide, the directory is only a scoping hint.
-  HIST_RAW="$(curl -sf -m 30 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" 2>/dev/null)" \
-    || HIST_RAW="$(curl -sf -m 30 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" 2>/dev/null)" \
-    || { echo "error: session $SID not found (server unreachable or no such session)" >&2; exit 5; }
-  printf '%s' "$HIST_RAW" \
-    | TAIL="$TAIL" TAIL_SET="$TAIL_SET" TURNS="$TURNS" SINCE="$SINCE" node -e '
-      let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
-        let msgs; try{msgs=JSON.parse(d)}catch(e){console.error("bad JSON from server");process.exit(1)}
-        if(!Array.isArray(msgs)){console.error("unexpected response");process.exit(1)}
-        const norm=t=>t&&t<1e12?t*1000:t;
-        // --since -> cutoff (ms). supports s/m/h/d/w.
-        let cutoff=0; const since=(process.env.SINCE||"").trim();
-        if(since){
-          const m=since.match(/^([0-9]+)\s*([smhdw])$/i);
-          if(!m){console.error(`bad --since "${since}" (use e.g. 30s 10m 6h 1d 2w)`);process.exit(2);}
-          const n=parseInt(m[1],10); const unit={s:1e3,m:6e4,h:36e5,d:864e5,w:6048e5}[m[2].toLowerCase()];
-          cutoff=Date.now()-n*unit;
-        }
-        // 1) time filter
-        let kept=msgs.filter(msg=>{
-          const c=norm(msg?.info?.time?.created)||0;
-          return !(cutoff && c && c<cutoff);
-        });
-        // 2) --turns: keep only the last N user prompts and everything after each.
-        const turns=parseInt(process.env.TURNS,10);
-        if(turns>0){
-          const userIdx=kept.map((m,i)=>({r:m?.info?.role,i})).filter(x=>x.r==="user").map(x=>x.i);
-          if(userIdx.length>turns){ kept=kept.slice(userIdx[userIdx.length-turns]); }
-        }
-        // 3) render
-        const lines=[];
-        for(const msg of kept){
-          const info=msg?.info||{}; const created=norm(info?.time?.created)||0;
-          const role=info.role||"?";
-          const iso=created?new Date(created).toISOString().replace("T"," ").slice(0,19):"";
-          const text=(msg?.parts||[]).filter(p=>p&&p.type==="text"&&p.text).map(p=>p.text).join("\n").trim();
-          if(!text) continue;
-          lines.push(`── ${role}${iso?" @ "+iso:""} ──`);
-          for(const l of text.split("\n")) lines.push(l);
-          lines.push("");
-        }
-        // 4) line cap: --tail always applies; otherwise the default 100 UNLESS
-        //    --turns was given — then the window is shown UNBOUNDED (a fixed
-        //    cap silently ate whole turns, and any per-turn allowance (100,
-        //    turns*200) was still too small for tool-heavy turns). The caller
-        //    bounds volume explicitly with --tail when they want less.
-        const tailSet=!!process.env.TAIL_SET;
-        const cap = tailSet ? (parseInt(process.env.TAIL,10)||100)
-                            : (turns>0 ? Infinity : 100);
-        const out = lines.length>cap ? lines.slice(-cap) : lines;
-        if(lines.length>cap) console.log(`… showing last ${cap} of ${lines.length} lines (raise --tail) …`);
-        process.stdout.write(out.join("\n")+"\n");
-      });'
+  # Rendering/filtering (and dialect differences) live in oc-api.
+  _hargs=( history --server "$BASE_URL" --session "$SID" --dir "$DIR" )
+  [ -n "$TAIL_SET" ] && _hargs+=( --tail "$TAIL" )
+  [ -n "$TURNS" ] && _hargs+=( --turns "$TURNS" )
+  [ -n "$SINCE" ] && _hargs+=( --since "$SINCE" )
+  oc_api "${_hargs[@]}" || exit $?
   exit 0
 fi
 
@@ -1426,7 +1545,18 @@ if [ "$MODE" = "status" ]; then
   # --timeout (default 300s; 0 = unbounded) or Ctrl-C.
   if [ -n "$FOLLOW" ] && [ -z "${OPENCODE_STATUS_ONCE:-}" ]; then
     _once=(); for _a in "${ORIG_ARGS[@]}"; do [ "$_a" = "--follow" ] || _once+=("$_a"); done
-    _deadline=$(( $(date +%s) + FOLLOW_TIMEOUT )); _prev=""
+    _deadline=$(( $(date +%s) + FOLLOW_TIMEOUT )); _prev=""; _api="$(resolve_api)"
+    # For the v2 event gate: the session this follow watches (positional id, or
+    # resolved from --task). Missing targets simply widen the gate to "any
+    # change", which still converges via the timeout.
+    _wtsid="${MSG_PARTS[0]:-}"
+    if [ -z "$_wtsid" ] && [ -n "${TASK_ID:-}" ]; then
+      _orch="${ORCHESTRATION_ROOT:-$DIR/scripts}"
+      if [ -f "$_orch/agent-status.mjs" ]; then
+        _wtsid="$(node "$_orch/agent-status.mjs" --from "$DIR" --worktree-root "${WORKTREE_ROOT:-}" --task "$TASK_ID" --json 2>/dev/null \
+          | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const r=JSON.parse(d)[0];process.stdout.write(r?.sessionId||"")}catch(e){}})')" || _wtsid=""
+      fi
+    fi
     while :; do
       _out="$(OPENCODE_STATUS_ONCE=1 bash "$0" "${_once[@]}" 2>&1)"; _rc=$?
       # Ages tick every poll ("updated:" line; "N ago" column in the all-sessions
@@ -1438,125 +1568,38 @@ if [ "$MODE" = "status" ]; then
       if [ "$FOLLOW_TIMEOUT" != "0" ] && [ "$(date +%s)" -ge "$_deadline" ]; then
         echo "(timeout after ${FOLLOW_TIMEOUT}s — still following stopped; re-run to continue)" >&2; exit 0
       fi
-      sleep 3
+      if [ "$_api" = "v2" ]; then
+        # Event-driven gate (see oc-api watch): exit 0 = idle, 10 = changed,
+        # 3 = timeout, 7 = stream/server lost (fall back to polling).
+        _wtimeout=0
+        if [ "$FOLLOW_TIMEOUT" != "0" ]; then
+          _wtimeout=$(( _deadline - $(date +%s) ))
+          if [ "$_wtimeout" -le 0 ]; then
+            echo "(timeout after ${FOLLOW_TIMEOUT}s — still following stopped; re-run to continue)" >&2; exit 0
+          fi
+        fi
+        _wargs=( watch --server "$BASE_URL" --timeout "$_wtimeout" )
+        [ -n "$_wtsid" ] && _wargs+=( --session "$_wtsid" )
+        oc_api "${_wargs[@]}" >/dev/null 2>&1; _wrc=$?
+        case "$_wrc" in
+          0|10) continue ;;
+          3) echo "(timeout after ${FOLLOW_TIMEOUT}s — still following stopped; re-run to continue)" >&2; exit 0 ;;
+          7) sleep 3 ;;
+          *) sleep 3 ;;
+        esac
+      else
+        sleep 3
+      fi
     done
   fi
+  # Rendering (and every dialect difference) lives in oc-api; see
+  # COMPATIBILITY.md. Single sessions and the all-sessions summary share one
+  # normalized state computation there.
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
-  if [ -z "$SID" ]; then
-    # No session ID: one-line summary for every session. opencode's session JSON
-    # has NO lastMessage in 1.18.x, so "working" cannot come from the list —
-    # probe each shown session's last message (limit=1) concurrently, plus the
-    # two ask queues (/permission, /question) for parked state.
-    AUTH_B64=""
-    [ -n "${SERVE_PASSWORD:-}" ] && AUTH_B64="$(printf '%s' "${SERVER_USERNAME}:${SERVE_PASSWORD}" | base64)"
-    curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" \
-      | BASE_URL="$BASE_URL" AUTH_B64="$AUTH_B64" BN="$(basename "$0")" LIMIT="$TAIL" node -e '
-        let d=""; process.stdin.on("data",c=>d+=c).on("end",async()=>{
-          let a; try{a=JSON.parse(d)}catch(e){console.error("bad JSON from server");process.exit(1)}
-          const base=process.env.BASE_URL, auth=process.env.AUTH_B64;
-          const hdr=auth?{authorization:"Basic "+auth}:{};
-          const jget=async(u)=>{const r=await fetch(base+u,{headers:hdr,signal:AbortSignal.timeout(5000)});if(!r.ok)throw new Error("http "+r.status);return r.json();};
-          let perms=new Map(), questions=new Map();
-          // Ask queues are per-directory: query every directory a session lives in.
-          const dirs=[...new Set([""].concat(a.map(x=>x?.directory).filter(Boolean)))];
-          const jall=async(u)=>{const m=new Map();await Promise.all(dirs.map(async d=>{try{for(const q of await jget(u+(d?"?directory="+encodeURIComponent(d):"")))m.set(q.id,q)}catch(e){}}));return [...m.values()];};
-          try{ for(const p of await jall("/permission")) if(p?.sessionID) perms.set(p.sessionID,"PERMASK ("+p.id+" "+p.permission+")"); }catch(e){}
-          try{ for(const q of await jall("/question")){ if(q?.sessionID){ const h=(q.questions||[])[0]; questions.set(q.sessionID,"QUESTION ("+q.id+" "+((h?.header||h?.question||"").slice(0,40))+")"); } } }catch(e){}
-          const norm=t=>t&&t<1e12?t*1000:t;
-          const now=Date.now();
-          const fmt=ms=>{let x=Math.floor(ms/1000);const h=Math.floor(x/3600);x%=3600;const mi=Math.floor(x/60);const se=x%60;return (h?h+"h ":"")+(h||mi?mi+"m ":"")+se+"s";};
-          a.sort((x,y)=>(norm(y?.time?.updated)||0)-(norm(x?.time?.updated)||0));
-          const lim=parseInt(process.env.LIMIT,10)||50;
-          const shown=a.slice(0,lim);
-          // working = last assistant message without time.completed; parked queues win.
-          // Also capture a stuck tool part (durable signal) so a WORKING row names
-          // the tool, and flag turns frozen >30m as STALE.
-          const states=await Promise.all(shown.map(async s=>{
-            if(perms.has(s.id)) return "PERMASK";
-            if(questions.has(s.id)) return "QUESTION";
-            try{
-              const dir=encodeURIComponent(s.directory||"");
-              const msgs=await jget("/session/"+s.id+"/message?directory="+dir+"&limit=1");
-              const m=(msgs||[])[(msgs||[]).length-1];
-              const li=m?.info||{};
-              const working=li.role==="assistant" && !(li.time&&li.time.completed);
-              if(!working) return "idle";
-              const parts=(m?.parts)||[];
-              let runPart=null;
-              for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){runPart=p;break;}}
-              const dur=runPart?.state?.time?.start?fmt(Math.max(0,now-runPart.state.time.start)):"";
-              const idle=now-(norm(s?.time?.updated)||0);
-              const tool=(runPart?("("+runPart.tool+(dur?"·"+dur:"")+")"):"");
-              return (idle>30*60*1000?"STALE":"WORKING")+tool;
-            }catch(e){ return "idle"; }
-          }));
-          let nparked=0, nwork=0;
-          shown.forEach((s,i)=>{
-            const u=norm(s?.time?.updated)||0;
-            const idle=now-u;
-            const state=states[i];
-            if(state==="PERMASK"||state==="QUESTION") nparked++;
-            if(state.startsWith("WORKING")) nwork++;
-            const age=u?fmt(idle)+" ago":"?";
-            console.log(`${s.id}  ${state.padEnd(14)}  ${age.padStart(12)}  ${s.title||""}`);
-          });
-          if(nparked) console.log(`… ${nparked} session(s) parked on an ask (see: ${process.env.BN} permissions / allow)`);
-          if(nwork) console.log(`… ${nwork} session(s) working`);
-          if(a.length>shown.length) console.log(`… ${a.length-shown.length} older session(s) not shown (raise --tail).`);
-        });'
-    exit 0
-  fi
-  # Directory-scoped fetch first, bare fetch as fallback (see history mode).
-  sess="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID?$DIR_Q" 2>/dev/null)" \
-    || sess="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID" 2>/dev/null)" \
-    || { echo "error: session not found" >&2; exit 5; }
-  msgs="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" 2>/dev/null)" \
-    || msgs="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message" 2>/dev/null)" \
-    || msgs="[]"
-  parked="$(parked_permission "$SID")"
-  printf '{"session":%s,"messages":%s}' "$sess" "$msgs" | PARKED="$parked" BN="$(basename "$0")" node -e '
-    let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
-      const {session:s,messages:m}=JSON.parse(d);
-      const parked=process.env.PARKED||"";
-      const norm=t=>t&&t<1e12?t*1000:t;
-      const upd=norm(s?.time?.updated)||0; const now=Date.now();
-      const idle=Math.max(0,now-upd);
-      const fmt=ms=>{let x=Math.floor(ms/1000);const h=Math.floor(x/3600);x%=3600;const mi=Math.floor(x/60);const se=x%60;return (h?h+"h ":"")+(h||mi?mi+"m ":"")+se+"s";};
-      const last=Array.isArray(m)&&m.length?m[m.length-1]:null;
-      const li=last?.info||{};
-      const working = li.role==="assistant" && !(li.time&&li.time.completed);
-      // Durable stuck-tool signal: the newest assistant turn holds a tool part
-      // stuck in state.status "running" with no time.end. The ask queues are
-      // in-memory and die with a server restart while the session stays stuck,
-      // so this is what still names the stuck-ness after the queue is gone.
-      const parts=(last?.parts)||[];
-      let runPart=null;
-      for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.type==="tool"&&p.state?.status==="running"&&!p.state?.time?.end){runPart=p;break;}}
-      // Only the newest message error counts: an earlier abort/failure that a
-      // later turn superseded is history, not current state.
-      const lastErr = li.error;
-      console.log("session:  "+s.id);
-      console.log("title:    "+(s.title||""));
-      console.log("model:    "+(s?.model?.providerID||"?")+"/"+(s?.model?.id||"?"));
-      console.log("messages: "+(Array.isArray(m)?m.length:0)+"   cost: $"+(s.cost??0));
-      console.log("updated:  "+(upd?new Date(upd).toISOString().replace("T"," ").slice(0,19):"?")+"  ("+fmt(idle)+" ago)");
-      const stale = working && idle > 30*60*1000;
-      let state;
-      if (parked) {
-        const head=parked.startsWith("per_")?"PERMISSION PROMPT":"QUESTION ASK";
-        const act=parked.startsWith("per_")
-          ? "approve: "+process.env.BN+" allow <requestID> [--always]"
-          : "no reply path on a headless server (the agent is waiting on a human)";
-        state = "WORKING — "+head+" ("+parked+") — "+act+"   |   abort: "+process.env.BN+" abort "+s.id;
-      } else if (working && runPart) {
-        const d=runPart.state?.time?.start?fmt(Math.max(0,now-runPart.state.time.start)):"?";
-        state = "WORKING — TOOL RUNNING ("+(runPart.tool||"?")+" · "+d+", no ask in queue — likely parked on a lost prompt or a dead turn; abort if it never finishes)";
-      } else if (stale) state = "WORKING — STALE ("+fmt(idle)+" without activity; likely a dead turn — try "+process.env.BN+" abort "+s.id+")";
-      else state = working ? "WORKING (turn in progress)" : "idle";
-      console.log("state:    "+state);
-      if(lastErr) console.log("lastError: "+(lastErr.name||"?")+" "+(lastErr.data?.statusCode||"")+" "+(lastErr.data?.message||""));
-    });'
+  _sargs=( status --server "$BASE_URL" --limit "$TAIL" --tool-name "$(basename "$0")" --dir "$DIR" )
+  [ -n "$SID" ] && _sargs+=( --session "$SID" )
+  oc_api "${_sargs[@]}" || exit $?
   exit 0
 fi
 
@@ -1775,6 +1818,7 @@ await_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits
 # ---- send --------------------------------------------------------------------
 if [ "$MODE" = "send" ]; then
   require_server
+  require_v1_mode send
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
   [ -z "$SID" ] && { echo "error: send needs a <sessionID> and a message (positional or --prompt-file <path>)" >&2; exit 2; }
@@ -1856,6 +1900,7 @@ fi
 # ---- abort -------------------------------------------------------------------
 if [ "$MODE" = "abort" ]; then
   require_server
+  require_v1_mode abort
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
   [ -z "$SID" ] && { echo "error: abort needs a <sessionID>" >&2; exit 2; }
@@ -1873,6 +1918,7 @@ fi
 # `external_directory`/`bash` ask on a headless server no TUI ever answered.
 if [ "$MODE" = "permissions" ]; then
   require_server
+  require_v1_mode permissions
   all_asks /permission 10 \
     | node -e '
       let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
@@ -1902,6 +1948,7 @@ fi
 # fix). The blocked turn resumes if its session is still active.
 if [ "$MODE" = "allow" ]; then
   require_server
+  require_v1_mode allow
   RID="${MSG_PARTS[0]:-}"
   [ -z "$RID" ] && { echo "error: allow needs a <requestID> (see: $(basename "$0") permissions)" >&2; exit 2; }
   REPLY="once"; [ -n "$ALWAYS" ] && REPLY="always"
@@ -2025,6 +2072,15 @@ else
 fi
 
 if [ -n "$DIRECT" ]; then
+  # One-shot local runs execute the client binary directly; the run flags
+  # differ between generations (v1: --dir/--variant; v2: cwd + --server and
+  # provider/model#variant). v2 one-shots are not wired yet — refuse instead
+  # of passing v1 flags to a v2 binary.
+  if [ "$(client_generation)" = "2" ]; then
+    echo "error: --direct with a v2 client is not wired yet (the run flags differ between generations)." >&2
+    echo "  Use a v1 binary for --direct, or a server-backed mode (support matrix: COMPATIBILITY.md)." >&2
+    exit 2
+  fi
   # ---- OPT-IN: one-shot, non-server, blocking (returns output inline) ----
   COMMON=( run --dir "$DIR" )
   [ -n "$MODEL" ]   && COMMON+=( -m "$MODEL" )
@@ -2056,6 +2112,10 @@ if [ -n "$DIRECT" ]; then
 fi
 
 # ---- DEFAULT: server-backed, async ----
+# v1-only for now: the submit/completion path below speaks the v1 API, and the
+# client binary must be paired with the server's generation before it launches.
+require_v1_mode "$MODE"
+check_pairing
 ensure_server
 
 # assemble the prompt text into a file (safe for huge review diffs over HTTP)

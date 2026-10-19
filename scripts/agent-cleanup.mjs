@@ -100,8 +100,8 @@ async function inspectSession(client, record) {
   try {
     const session = await client.getSession(record.sessionId, { directory: record.worktreePath });
     const messages = await client.messages(record.sessionId, { directory: record.worktreePath }).catch(() => []);
-    const last = Array.isArray(messages) ? messages[messages.length - 1]?.info : null;
-    const working = last?.role === "assistant" && !last?.time?.completed;
+    const last = Array.isArray(messages) ? messages[messages.length - 1] : null;
+    const working = last?.role === "assistant" && !last?.completed;
     const directory = session?.directory || null;
     return {
       checked: true,

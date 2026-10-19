@@ -25,7 +25,7 @@ worker scripts are documented under "Agent launcher scripts" below.
 | `scripts/opencode-guard.sh` | `~/.claude/scripts/opencode-guard.sh` | PreToolUse hook (Bash matcher) that throws if `opencode-dispatch.sh` output is piped through `tail`. |
 | `commands/opencode/*.md` | `~/.claude/commands/opencode/` | Claude Code slash-command instructions. |
 | `install.sh` | not installed | Installs the surfaces above, registers the tail-guard hook in `~/.claude/settings.json` (merged, never clobbered), and copies the config samples (`config/opencode.json`, `config/servers.json.example`) into `~/.config/…` only when no file exists there yet. It never reads or writes provider credentials. |
-| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`) | `~/.claude/scripts/` (installed next to the dispatcher) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, and cleans up. |
+| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`, `api-dialect.mjs`, `oc-api.mjs`) | `~/.claude/scripts/` (installed next to the dispatcher) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, cleans up, and owns the v1/v2 API dialect layer. |
 
 The skill repository is not the worker repository. `install.sh` installs the
 launcher scripts next to `opencode-dispatch.sh`, and the dispatcher finds them
@@ -38,6 +38,10 @@ What each item is actually needed for:
 
 - **OpenCode CLI on `PATH`** — every mode; the wrapper exits 4 when it is
   missing (`brew install sst/tap/opencode`, or `npm i -g opencode-ai`).
+  Both server generations are supported: v1 (1.18.29+) and v2 (2.x). A
+  server and the client binary launched against it must be the same
+  generation; the dispatcher detects the dialect and refuses mismatches. See
+  [COMPATIBILITY.md](COMPATIBILITY.md).
 - **Node.js** — the wrapper needs Node 18+ (the `follow` mode uses built-in
   `fetch`). Two features need newer Node: `identify`'s database fallback uses
   `node:sqlite` (Node 22.5+) and the Codex skill generator uses native
@@ -59,6 +63,17 @@ What each item is actually needed for:
   `follow`, `status`, `history`, `send`, `abort`, …) run without them.
 - **A clean source worktree for edit tasks** — enforced by the external
   launcher; uncommitted source changes are not copied into a worker worktree.
+
+## OpenCode v1 and v2 support
+
+This dispatcher speaks both the original opencode server API (**v1**, opencode
+1.18.29+) and the revised **v2** API (opencode 2.x). The dialect is detected by
+probing the server; each profile may pin `api` and the client binary it uses
+(`bin`), and a server/client generation mismatch is refused before anything
+launches. Not every mode is v2-ready yet — the per-mode matrix and the rollout
+plan live in [COMPATIBILITY.md](COMPATIBILITY.md). Modes that are not ported
+refuse a v2 server with a clear error instead of issuing calls that cannot
+work. `/opencode:setup` prints each profile's live dialect and pairing.
 
 ## Installation
 
@@ -163,6 +178,18 @@ profile; per-field precedence is CLI flag > env (`OPENCODE_DISPATCH_*`) >
 definition. Default profile: `default` (127.0.0.1:4096) — the single-server
 behavior when no definitions file exists.
 
+Two optional fields tune the server generation (see
+[COMPATIBILITY.md](COMPATIBILITY.md)):
+
+```text
+api         API dialect pin: auto (default; probe the server) | v1 | v2
+bin         opencode client binary paired with THIS profile's generation
+            (per-profile; default: `opencode` on PATH)
+```
+
+`setup` shows each profile's live dialect, resolved binary, and pairing
+status.
+
 ### Credentials (`.env.local`)
 
 ```bash
@@ -170,11 +197,12 @@ cp .env.local.example .env.local    # gitignored; install.sh copies it next
 $EDITOR .env.local                  # to the installed scripts
 ```
 
-Only `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD` are read; an
-exported shell variable always wins over the file. The resolved pair
-authenticates every HTTP request and is exported to servers the dispatcher
-starts, so server and clients always share one credential. Binding a
-non-loopback interface requires a password.
+Only `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD`, and
+`OPENCODE_PASSWORD` are read; an exported shell variable always wins over the
+file (and `OPENCODE_PASSWORD` feeds the same password slot as the v1 name). The
+resolved pair authenticates every HTTP request and is exported to servers the
+dispatcher starts, so server and clients always share one credential. Binding
+a non-loopback interface requires a password.
 
 ### Agent config (`opencode.json`)
 
@@ -243,9 +271,11 @@ executed as shell, so treat it like any other repo-controlled script.
 | `OPENCODE_DISPATCH_HOST` / `OPENCODE_DISPATCH_PORT` | Dispatch server endpoint parts (override the resolved profile). |
 | `OPENCODE_DISPATCH_LISTEN` | Bind interface override for launches (same as `--listen`). |
 | `OPENCODE_DISPATCH_SERVER` | Server profile name (default `default`; same as `--server`). |
+| `OPENCODE_DISPATCH_API` | Server API dialect override (`auto` default; `v1` or `v2`; same as `--api`). |
 | `OPENCODE_DISPATCH_SERVERS` | Server definitions file (default `~/.config/opencode-dispatch/servers.json`). |
-| `OPENCODE_SERVER_PASSWORD` | Server password for HTTP requests; exported to launched servers. |
-| `OPENCODE_SERVER_USERNAME` | Server basic-auth username (default `opencode`); exported to launched servers. |
+| `OPENCODE_SERVER_PASSWORD` | Server password for HTTP requests; the v1 name (still read by v2 clients); exported to launched clients. |
+| `OPENCODE_PASSWORD` | v2 name for the same password (preferred by v2 clients). |
+| `OPENCODE_SERVER_USERNAME` | v1 basic-auth username (default `opencode`); v2 fixes the username to `opencode`. |
 | `OPENCODE_DISPATCH_ENV_FILE` | Explicit path to a `.env.local`-style credential file. |
 | `OPENCODE_SESSION_ID` / `_SLUG` / `_TITLE` / `_AGENT` / `_MODEL` / `_DIRECTORY` | The **executing** session's own identity, injected into every tool shell by the `opencode-identity` plugin (`plugins/opencode-identity.js`, installed to `~/.config/opencode/plugins/`). Parents and subagents each see their own id — the basis for `identify` / `claim`. |
 | `OPENCODE_STALENESS_FETCH_TTL` / `OPENCODE_STALENESS_NUDGE_AT` / `OPENCODE_STALENESS_HOT_PATHS` | Tuning for the `opencode-branch-staleness` plugin: seconds between real `git fetch`es (default 300), commits-behind threshold for escalated wording (default 25), and optional comma-separated paths whose changes are called out explicitly. |
@@ -643,5 +673,6 @@ npm run check   # node --check on the launcher scripts
 npm test        # node --test scripts/tests/*.test.mjs
 ```
 
-The tests use temporary Git repositories and mocked server requests. They must not
-require, inspect, or modify secret-bearing OpenCode configuration.
+The tests use temporary Git repositories and mocked server requests (covering
+both v1 and v2 response shapes). They must not require, inspect, or modify
+secret-bearing OpenCode configuration.

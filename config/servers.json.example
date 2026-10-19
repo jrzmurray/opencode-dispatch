@@ -1,7 +1,15 @@
 {
+  "_comment": "Named OpenCode server profiles. Keys starting with _ are documentation and ignored. See COMPATIBILITY.md for the v1/v2 dialect rules.",
+  "_comment-fields": {
+    "_listen_host": "listen = bind interface passed to `opencode serve --hostname`; host = addressable address the dispatcher reaches (never 0.0.0.0/::).",
+    "_api": "Optional 'api': auto (default; probe the server), v1, or v2. Only set to pin what auto cannot see (e.g. a server that is down).",
+    "_bin": "Optional 'bin': the opencode client binary paired with THIS server's generation (per-profile; default PATH `opencode`). A v2 binary cannot drive a v1 server and vice versa; see COMPATIBILITY.md.",
+    "_password": "Required when 'listen' is non-loopback. v1 clients read it via OPENCODE_SERVER_PASSWORD; v2 clients prefer OPENCODE_PASSWORD (both are exported for launched clients)."
+  },
   "default": {
     "listen": "127.0.0.1",
-    "port": 4096
+    "port": 4096,
+    "_v2-note": "On a v2 install the shared background service lives at a discovered URL (see `opencode service status`); point a profile at it with host/port, or run a private `opencode serve`."
   },
   "_example-remote": {
     "listen": "0.0.0.0",
@@ -10,5 +18,20 @@
     "dir": "~/Code/your-project",
     "password": "REPLACE_ME",
     "model": "deepseek/deepseek-v4-pro"
+  },
+  "_example-v1-legacy": {
+    "listen": "127.0.0.1",
+    "host": "127.0.0.1",
+    "port": 4096,
+    "password": "REPLACE_ME",
+    "api": "v1",
+    "bin": "/opt/opencode-v1/opencode"
+  },
+  "_example-v2": {
+    "listen": "127.0.0.1",
+    "host": "127.0.0.1",
+    "port": 4096,
+    "api": "v2",
+    "bin": "/opt/opencode-v2/opencode"
   }
 }

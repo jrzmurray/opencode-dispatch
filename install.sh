@@ -60,7 +60,7 @@ Claude install (--claude):
   scripts/opencode-set-model.sh     -> same dirs
   scripts/opencode-guard.sh         -> same dirs
   scripts/{spawn-agent,agent-status,agent-cleanup,agent-worker-guard,
-          worktree-utils,opencode-server}.mjs
+          worktree-utils,opencode-server,api-dialect,oc-api}.mjs
                                     -> same dirs (task/bulk worker launcher;
                                        the dispatcher finds it next to itself)
   commands/opencode/*.md            -> $CLAUDE/commands/opencode/ (profile)
@@ -180,7 +180,7 @@ if [ "$SCOPE" = "repo" ]; then
 fi
 
 CLAUDE="${CLAUDE_HOME:-$HOME/.claude}"
-LAUNCHER_FILES=(spawn-agent.mjs agent-status.mjs agent-cleanup.mjs agent-worker-guard.mjs worktree-utils.mjs opencode-server.mjs)
+LAUNCHER_FILES=(spawn-agent.mjs agent-status.mjs agent-cleanup.mjs agent-worker-guard.mjs worktree-utils.mjs opencode-server.mjs api-dialect.mjs oc-api.mjs)
 CONFIG="$HOME/.config/opencode/opencode.json"
 echo "repo:   $REPO"
 echo "claude: $CLAUDE"

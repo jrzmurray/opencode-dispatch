@@ -30,6 +30,17 @@ import {
 
 const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+// Tests may run inside an opencode session (the identity plugin injects
+// OPENCODE_SESSION_* into tool shells); child processes under test must not
+// inherit the test runner's own identity.
+function scrubbedEnv(extra = {}) {
+  const env = { ...process.env, ...extra };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("OPENCODE_SESSION_")) delete env[key];
+  }
+  return env;
+}
+
 function fixtureRepository() {
   const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agent-source-"));
   const allocationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agent-allocation-"));
@@ -155,12 +166,11 @@ test("spawn-agent prepare-only uses the same allocation contract", () => {
       record.worktreePath,
     ], {
       cwd: record.worktreePath,
-      env: {
-        ...process.env,
+      env: scrubbedEnv({
         AGENT_TASK_ID: record.taskId,
         AGENT_WORKTREE_PATH: record.worktreePath,
         AGENT_WORKTREE_BRANCH: record.branch,
-      },
+      }),
       encoding: "utf8",
     });
     assert.equal(guard.status, 0, guard.stderr);
@@ -200,6 +210,7 @@ test("OpenCode client sends directory routing and rejects a mismatch", async () 
   const calls = [];
   const client = new OpenCodeClient({
     baseUrl: "http://127.0.0.1:4096",
+    api: "v1",
     fetchImpl: async (url, options) => {
       calls.push({ url: String(url), options });
       return new Response(JSON.stringify({ id: "ses_test", directory: "/tmp/worker" }), { status: 200 });
@@ -336,6 +347,11 @@ test("agent-cleanup --teardown deletes the session via the OpenCode server when 
     const url = new URL(req.url, "http://127.0.0.1");
     calls.push(`${req.method} ${url.pathname}`);
     res.setHeader("content-type", "application/json");
+    if (req.method === "GET" && url.pathname === "/session") {
+      // v1 dialect signal used by the client's auto-detection probe.
+      res.end("[]");
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/session/ses_teardown") {
       res.end(JSON.stringify({ id: "ses_teardown", directory: url.searchParams.get("directory") || "" }));
       return;
