@@ -10,7 +10,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { OpenCodeClient } from "./opencode-server.mjs";
-import { API_V1, API_V2, clientAuthEnv } from "./api-dialect.mjs";
+import { API_V1, API_V2, clientAuthEnv, clientVersion, pairingStatus } from "./api-dialect.mjs";
 import {
   assertClean,
   branchPrefix,
@@ -334,6 +334,19 @@ async function main() {
   let outputRecord;
   const client = options.prepareOnly || options.dryRun ? null : new OpenCodeClient({ baseUrl: options.server });
   const serverUrl = client?.baseUrl || null;
+  let workerAuth = null;
+  if (client) {
+    // Preflight before allocating anything: reach the server, classify its
+    // dialect, and refuse a client binary from the wrong generation.
+    resolveExecutable(options.opencode);
+    await client.health();
+    const binary = clientVersion(options.opencode, { execFileImpl: execFileSync });
+    const pairing = pairingStatus({ api: client.api, generation: binary.generation, version: binary.version });
+    if (pairing.severity === "mismatch") throw new Error(pairing.reason);
+    if (pairing.severity === "unknown") console.error(`spawn-agent: warning: ${pairing.reason}`);
+    workerAuth = { api: client.api, username: client.username, password: client.password };
+  }
+  if (options.variant && !options.model) console.error("spawn-agent: warning: --variant without --model is ignored");
   // The registry lock covers ONLY shared-registry mutations (record + git
   // worktree creation, and rollback's removal). Bootstrap (minutes) and the
   // foreground worker run must NOT hold it — a foreground agent would
@@ -366,11 +379,9 @@ async function main() {
 
   try {
     updateRecord(layout, record, { state: "bootstrapping" });
-    const auth = { api: client.api, username: client.username, password: client.password };
-    bootstrapWorker(record, options, repository, serverUrl, auth);
+    bootstrapWorker(record, options, repository, serverUrl, workerAuth);
     updateRecord(layout, record, { state: "bootstrapped" });
 
-    await client.health();
     updateRecord(layout, record, { state: "creating-session" });
     const session = options.parentSession
       ? await client.forkSession(options.parentSession, { directory: record.worktreePath })
@@ -387,10 +398,10 @@ async function main() {
     OpenCodeClient.assertDirectory(session, record.worktreePath);
     updateRecord(layout, record, { sessionId: session.id, state: "session-created", serverApi: client.api });
 
-    const workerAuth = { api: client.api, username: client.username, password: client.password };
-    const env = workerEnvironment(record, serverUrl, workerAuth);
+    const workerAuthForLaunch = workerAuth || { api: client.api, username: client.username, password: client.password };
+    const env = workerEnvironment(record, serverUrl, workerAuthForLaunch);
     runGuard(record, env);
-    const child = launchWorker(options, record, serverUrl, layout, workerAuth);
+    const child = launchWorker(options, record, serverUrl, layout, workerAuthForLaunch);
     if (options.foreground) {
       const exitCode = await new Promise((resolve, reject) => {
         child.once("error", reject);

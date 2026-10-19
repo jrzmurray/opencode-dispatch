@@ -227,8 +227,9 @@ test("OpenCode client sends directory routing and rejects a mismatch", async () 
     ],
   });
   assert.equal(session.id, "ses_test");
-  assert.match(calls[0].url, /directory=%2Ftmp%2Fworker/);
-  assert.deepEqual(JSON.parse(calls[0].options.body), {
+  const createCall = calls.find((call) => call.options?.method === "POST");
+  assert.match(createCall.url, /directory=%2Ftmp%2Fworker/);
+  assert.deepEqual(JSON.parse(createCall.options.body), {
     title: "test",
     agent: "auto",
     model: { providerID: "deepseek", id: "deepseek-v4-pro", variant: "high" },
@@ -440,6 +441,182 @@ test("agent-cleanup --teardown deletes the session via the OpenCode server when 
     assert.equal(remaining("SELECT group_concat(id) FROM session"), "ses_other");
     assert.equal(remaining("SELECT count(*) FROM event_sequence WHERE aggregate_id = 'ses_teardown'"), "1");
     assert.equal(remaining("SELECT count(*) FROM event_sequence WHERE aggregate_id = 'ses_other'"), "1");
+  } finally {
+    server.close();
+    fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });
+    fs.rmSync(fixture.repositoryRoot, { recursive: true, force: true });
+  }
+});
+
+test("agent-cleanup --teardown never falls back to v1 SQL on a v2 server", { skip: spawnSync("sqlite3", ["-version"]).status !== 0 }, async () => {
+  const fixture = fixtureRepository();
+  const dbPath = path.join(fixture.allocationRoot, "opencode.db");
+  const calls = [];
+  let deleteResponse = 500;
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    calls.push(`${req.method} ${url.pathname}`);
+    res.setHeader("content-type", "application/json");
+    const directory = decodeURIComponent(req.headers["x-opencode-directory"] || "");
+    if (url.pathname === "/api/info") return res.end(JSON.stringify({ version: "2.0.32", pid: 5 }));
+    if (req.method === "GET" && url.pathname === "/api/session/ses_teardown") {
+      return res.end(JSON.stringify({ data: { id: "ses_teardown", location: { directory } } }));
+    }
+    if (req.method === "GET" && url.pathname === "/api/session/ses_teardown/message") {
+      return res.end(JSON.stringify({ data: [], cursor: { previous: null, next: null } }));
+    }
+    if (url.pathname === "/api/session" || url.pathname === "/api/permission/request" || url.pathname === "/api/form") {
+      return res.end(JSON.stringify({ data: [] }));
+    }
+    if (req.method === "POST" && url.pathname === "/api/session/ses_teardown/interrupt") {
+      return res.end("{}");
+    }
+    if (req.method === "DELETE" && url.pathname === "/api/session/ses_teardown") {
+      res.statusCode = deleteResponse;
+      return res.end(JSON.stringify({ error: "delete failed" }));
+    }
+    res.statusCode = 404;
+    res.end("{}");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const prepared = spawnSync(process.execPath, [
+      path.resolve(scriptsDir, "spawn-agent.mjs"),
+      "--from", fixture.repositoryRoot,
+      "--worktree-root", fixture.allocationRoot,
+      "--prepare-only",
+      "--label", "teardown-v2",
+      "--",
+      "test task",
+    ], { encoding: "utf8" });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const record = JSON.parse(prepared.stdout);
+    record.sessionId = "ses_teardown";
+    record.serverApi = "v2";
+    writeTaskRecord(getAgentLayout(fixture.repository, { AGENT_WORKTREE_ROOT: fixture.allocationRoot }), record);
+
+    // The v1 tables are populated to prove the fallback never touches them on
+    // a v2 server (a bogus "success" would delete these rows).
+    spawnSync("sqlite3", [dbPath, `
+      PRAGMA foreign_keys=ON;
+      CREATE TABLE session (id text PRIMARY KEY);
+      CREATE TABLE event_sequence (aggregate_id text PRIMARY KEY, seq integer NOT NULL);
+      INSERT INTO session VALUES ('ses_teardown'), ('ses_other');
+      INSERT INTO event_sequence VALUES ('ses_teardown', 1), ('ses_other', 1);`], { encoding: "utf8" });
+
+    const child = spawn(process.execPath, [
+      path.resolve(scriptsDir, "agent-cleanup.mjs"),
+      "--from", fixture.repositoryRoot,
+      "--worktree-root", fixture.allocationRoot,
+      "--task", record.taskId,
+      "--teardown",
+      "--server", `http://127.0.0.1:${server.address().port}`,
+      "--db", dbPath,
+      "--json",
+    ]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const code = await new Promise((resolve) => child.on("close", resolve));
+    assert.equal(code, 0, stderr);
+    const result = JSON.parse(stdout);
+    assert.ok(calls.includes("DELETE /api/session/ses_teardown"), `expected a DELETE, saw: ${calls.join(", ")}`);
+    assert.equal(result.database.deleted, false);
+    assert.equal(result.database.via, undefined);
+    assert.match(result.database.reason, /v2 server; direct SQL cleanup is v1-only/);
+    assert.equal(fs.existsSync(record.worktreePath), false);
+
+    const remaining = (sql) => spawnSync("sqlite3", [dbPath, sql], { encoding: "utf8" }).stdout.trim();
+    assert.equal(remaining("SELECT count(*) FROM session WHERE id = 'ses_teardown'"), "1", "the v1 SQL fallback must not run on v2");
+    assert.equal(remaining("SELECT count(*) FROM event_sequence WHERE aggregate_id = 'ses_teardown'"), "1");
+  } finally {
+    server.close();
+    fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });
+    fs.rmSync(fixture.repositoryRoot, { recursive: true, force: true });
+  }
+});
+
+test("agent-cleanup --teardown verifies a v2 server delete against the v2 tables", { skip: spawnSync("sqlite3", ["-version"]).status !== 0 }, async () => {
+  const fixture = fixtureRepository();
+  const dbPath = path.join(fixture.allocationRoot, "opencode.db");
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    calls.push(`${req.method} ${url.pathname}`);
+    res.setHeader("content-type", "application/json");
+    const directory = decodeURIComponent(req.headers["x-opencode-directory"] || "");
+    if (url.pathname === "/api/info") return res.end(JSON.stringify({ version: "2.0.32", pid: 7 }));
+    if (req.method === "GET" && url.pathname === "/api/session/ses_teardown") {
+      return res.end(JSON.stringify({ data: { id: "ses_teardown", location: { directory } } }));
+    }
+    if (req.method === "GET" && url.pathname === "/api/session/ses_teardown/message") {
+      return res.end(JSON.stringify({ data: [], cursor: { previous: null, next: null } }));
+    }
+    if (url.pathname === "/api/session" || url.pathname === "/api/permission/request" || url.pathname === "/api/form") {
+      return res.end(JSON.stringify({ data: [] }));
+    }
+    if (req.method === "POST" && url.pathname === "/api/session/ses_teardown/interrupt") {
+      return res.end("{}");
+    }
+    if (req.method === "DELETE" && url.pathname === "/api/session/ses_teardown") {
+      spawnSync("sqlite3", [dbPath, "PRAGMA foreign_keys=ON; DELETE FROM session_v2 WHERE id = 'ses_teardown';"]);
+      return res.end("{}");
+    }
+    res.statusCode = 404;
+    res.end("{}");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const prepared = spawnSync(process.execPath, [
+      path.resolve(scriptsDir, "spawn-agent.mjs"),
+      "--from", fixture.repositoryRoot,
+      "--worktree-root", fixture.allocationRoot,
+      "--prepare-only",
+      "--label", "teardown-v2-ok",
+      "--",
+      "test task",
+    ], { encoding: "utf8" });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const record = JSON.parse(prepared.stdout);
+    record.sessionId = "ses_teardown";
+    record.serverApi = "v2";
+    writeTaskRecord(getAgentLayout(fixture.repository, { AGENT_WORKTREE_ROOT: fixture.allocationRoot }), record);
+
+    spawnSync("sqlite3", [dbPath, `
+      PRAGMA foreign_keys=ON;
+      CREATE TABLE session_v2 (id text PRIMARY KEY);
+      CREATE TABLE session_message (id text PRIMARY KEY, session_id text REFERENCES session_v2(id) ON DELETE CASCADE);
+      INSERT INTO session_v2 VALUES ('ses_teardown'), ('ses_other');
+      INSERT INTO session_message VALUES ('m1', 'ses_teardown'), ('m2', 'ses_teardown'), ('m3', 'ses_other');`], { encoding: "utf8" });
+
+    const child = spawn(process.execPath, [
+      path.resolve(scriptsDir, "agent-cleanup.mjs"),
+      "--from", fixture.repositoryRoot,
+      "--worktree-root", fixture.allocationRoot,
+      "--task", record.taskId,
+      "--teardown",
+      "--server", `http://127.0.0.1:${server.address().port}`,
+      "--db", dbPath,
+      "--json",
+    ]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const code = await new Promise((resolve) => child.on("close", resolve));
+    assert.equal(code, 0, stderr);
+    const result = JSON.parse(stdout);
+    assert.equal(result.database.deleted, true);
+    assert.equal(result.database.via, "server-api");
+    assert.equal(result.database.session, 0);
+    assert.equal(result.database.sessionMessages, 0);
+    assert.equal(result.database.verification, undefined);
+    assert.equal(fs.existsSync(record.worktreePath), false);
+
+    const remaining = (sql) => spawnSync("sqlite3", [dbPath, sql], { encoding: "utf8" }).stdout.trim();
+    assert.equal(remaining("SELECT group_concat(id) FROM session_v2"), "ses_other");
+    assert.equal(remaining("SELECT group_concat(id) FROM session_message"), "m3");
   } finally {
     server.close();
     fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });

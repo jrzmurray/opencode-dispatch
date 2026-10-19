@@ -11,6 +11,8 @@
  * Commands:
  *   detect    Classify the server (v1|v2|down), auth status, and — with
  *             --bin — client pairing. Exit 7 when the server is unreachable.
+ *   version   Print a client binary's version and generation (for the shell's
+ *             `--direct` gate); exit 2 when the version cannot be parsed.
  *   sessions  List sessions, newest first (dispatcher `sessions` format).
  *   status    Render liveness for one session or a one-line summary of all
  *             sessions (dispatcher `status` format).
@@ -27,7 +29,8 @@
  * Common flags:
  *   --server <url>        Server URL (default $OPENCODE_SERVER_URL or
  *                         127.0.0.1:4096)
- *   --api <auto|v1|v2>    Dialect; auto probes (default auto)
+ *   --api <auto|v1|v2>    Dialect; auto probes (default auto). A pin is only
+ *                         a fallback when the server cannot be classified.
  *   --password <pw>       Basic-auth password (default $OPENCODE_PASSWORD or
  *                         $OPENCODE_SERVER_PASSWORD)
  *   --username <u>        Basic-auth username (default opencode)
@@ -46,11 +49,11 @@ import { OpenCodeClient, OpenCodeServerError, normalizeAsk } from "./opencode-se
 
 const EXIT = { OK: 0, USAGE: 2, TIMEOUT: 3, NOT_FOUND: 5, UNREACHABLE: 7, CHANGE: 10 };
 
-const COMMANDS = new Set(["detect", "sessions", "status", "history", "follow", "watch", "ask"]);
+const COMMANDS = new Set(["detect", "version", "sessions", "status", "history", "follow", "watch", "ask"]);
 
 function usage(message) {
   if (message) console.error(`oc-api: ${message}`);
-  console.error("usage: node scripts/oc-api.mjs <detect|sessions|status|history|follow|watch|ask> [flags]");
+  console.error("usage: node scripts/oc-api.mjs <detect|version|sessions|status|history|follow|watch|ask> [flags]");
   console.error("       run with --help for the command reference");
   process.exit(EXIT.USAGE);
 }
@@ -208,9 +211,15 @@ function askLabel(ask) {
   return `(${ask.id} ${ask.title})`;
 }
 
-/** Working/finished state of a normalized message (mirrors the v1 heuristics). */
+/**
+ * Working/finished state of a normalized message (mirrors the v1 heuristics).
+ * A trailing user message means the turn was submitted but the assistant row
+ * has not landed yet — it is pending, not idle. An idle marker is terminal.
+ */
 function messageWorking(message) {
-  return Boolean(message && message.role === "assistant" && !message.completed);
+  if (!message) return false;
+  if (message.role === "user") return true;
+  return message.role === "assistant" && !message.completed;
 }
 
 function stuckTool(message) {
@@ -253,6 +262,22 @@ async function commandDetect(options) {
     if (pairing) console.log(`pairing: ${pairing.ok ? "ok" : pairing.severity} — ${pairing.reason || ""}`);
   }
   process.exit(probe.serverUp && probe.api ? EXIT.OK : EXIT.UNREACHABLE);
+}
+
+// ---------------------------------------------------------------------------
+// version
+// ---------------------------------------------------------------------------
+
+async function commandVersion(options) {
+  const info = clientVersion(options.bin || "opencode", { execFileImpl: execFileSync });
+  if (options.json) {
+    console.log(JSON.stringify(info));
+  } else if (info.generation) {
+    console.log(`${info.version} (v${info.generation})`);
+  } else {
+    console.log(`unknown${info.error ? ` (${info.error})` : ""}`);
+  }
+  process.exit(info.generation ? EXIT.OK : EXIT.USAGE);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +441,7 @@ function parseSince(value) {
 }
 
 /** Fetch enough of the newest messages to cover the requested window (v2 pages). */
-async function fetchHistoryMessages(client, options, directory) {
+async function fetchHistoryMessages(client, options, directory, cutoff = 0) {
   const api = await client.resolveApi();
   if (api !== API_V2) {
     const messages = await client.messages(options.session, { directory }).catch(fail);
@@ -434,7 +459,10 @@ async function fetchHistoryMessages(client, options, directory) {
     collected.push(...result.messages);
     userCount += result.messages.filter((message) => message.role === "user").length;
     cursor = result.cursor?.next || null;
-    if (!cursor || userCount >= neededTurns || collected.length >= 2000) break;
+    // --since needs the whole requested window, not just N turns: keep paging
+    // until a fetched message predates the cutoff (or the cursor runs out).
+    const reachedCutoff = cutoff > 0 && result.messages.some((message) => message.created && message.created < cutoff);
+    if (!cursor || reachedCutoff || (cutoff <= 0 && userCount >= neededTurns) || collected.length >= 2000) break;
   }
   return collected.sort((left, right) => (left.created || 0) - (right.created || 0));
 }
@@ -449,7 +477,7 @@ async function commandHistory(options) {
     console.error("oc-api: session not found (server unreachable or no such session)");
     process.exit(EXIT.NOT_FOUND);
   }
-  const messages = await fetchHistoryMessages(client, options, session?.directory || options.dir || undefined);
+  const messages = await fetchHistoryMessages(client, options, session?.directory || options.dir || undefined, parseSince(options.since));
   const cutoff = parseSince(options.since);
   let kept = messages.filter((message) => !(cutoff && message.created && message.created < cutoff));
   const turns = parseInt(options.turns, 10);
@@ -495,25 +523,80 @@ async function commandFollow(options) {
   const deadline = timeout > 0 ? Date.now() + timeout * 1000 : 0;
   console.log(`following ${options.session} (read-only; Ctrl-C to detach)`);
 
-  const printed = new Map(); // messageId -> count of parts already printed
+  // messageId -> Map(partIndex -> { chars, noted }). v2 mutates a streaming
+  // text part in place, so part count is not enough: track the emitted
+  // character count and write only the delta.
+  const printed = new Map();
   const noticed = new Set();
   let first = true;
+  let atLineStart = true;
+  // The text part that owns the currently open output line, if any.
+  let openPart = null;
+
+  const write = (text) => {
+    if (!text) return;
+    process.stdout.write(text);
+    atLineStart = text.endsWith("\n");
+  };
+  const endLine = () => {
+    if (!atLineStart) {
+      process.stdout.write("\n");
+      atLineStart = true;
+    }
+  };
+  const note = (line) => {
+    endLine();
+    console.log(line);
+    openPart = null;
+  };
+  const closeIfOpen = (message) => {
+    if (openPart && openPart.messageId === message.id) {
+      endLine();
+      openPart = null;
+    }
+  };
 
   const printNew = (messages) => {
     for (const message of messages) {
-      const seen = printed.get(message.id) || 0;
-      const parts = message.parts || [];
-      for (let index = seen; index < parts.length; index += 1) {
-        const part = parts[index];
-        if (part.kind === "text" && part.text) {
-          process.stdout.write(`${part.text.replace(/\n+$/, "")}\n`);
-        } else if (part.kind === "reasoning" && part.text && !first) {
-          console.log(`· ${part.text.split("\n")[0].slice(0, 120)}`);
-        } else if (part.kind === "tool" && part.status === "running") {
-          console.log(`(tool: ${part.name} running)`);
-        }
+      if (message.role === "idle") continue;
+      let seen = printed.get(message.id);
+      if (!seen) {
+        seen = new Map();
+        printed.set(message.id, seen);
       }
-      printed.set(message.id, parts.length);
+      const parts = message.parts || [];
+      for (let index = 0; index < parts.length; index += 1) {
+        const part = parts[index];
+        const state = seen.get(index) || { chars: 0, noted: false };
+        if (part.kind === "text") {
+          const text = part.text || "";
+          if (text.length > state.chars) {
+            // A different text part starts its own line (matches the old
+            // per-part output), including a part that arrived empty and grew.
+            if (!openPart || openPart.messageId !== message.id || openPart.index !== index) {
+              endLine();
+              openPart = { messageId: message.id, index };
+            }
+            write(text.slice(state.chars));
+            state.chars = text.length;
+          }
+        } else if (part.kind === "reasoning") {
+          if (!state.noted) {
+            if (!first && part.text) note(`· ${part.text.split("\n")[0].slice(0, 120)}`);
+            // Mark historical reasoning even when suppressed, or the next
+            // frame treats it as new and splits the stream.
+            state.noted = true;
+          }
+        } else if (part.kind === "tool" && part.status === "running" && !state.noted) {
+          note(`(tool: ${part.name} running)`);
+          state.noted = true;
+        }
+        seen.set(index, state);
+      }
+      // Close the line on completion even when this frame added no text. The
+      // per-message owner check keeps an earlier (already-printed) message from
+      // closing a newer message's still-open stream.
+      if (message.completed || message.role === "user") closeIfOpen(message);
     }
     first = false;
   };
@@ -543,16 +626,28 @@ async function commandFollow(options) {
   // Initial frame: print the transcript as it stands, then subscribe.
   const isDone = (messages) => {
     const last = messages[messages.length - 1];
-    return Boolean(last && last.role === "assistant" && last.completed);
+    if (!last) return false;
+    if (last.role === "idle") return true;
+    return last.role === "assistant" && Boolean(last.completed);
+  };
+  const finish = (messages) => {
+    endLine();
+    const last = messages[messages.length - 1];
+    const unsettled = last?.role === "idle" && (last.error || (last.outcome && last.outcome !== "succeeded"));
+    if (unsettled) {
+      const label = last.error || last.outcome === "failed" ? "failed" : last.outcome;
+      const detail = last.error ? `: ${last.error.type || "error"} ${last.error.message || ""}`.trimEnd() : "";
+      console.log(`(${label} — ${options.session} turn ${label}${detail})`);
+    } else {
+      console.log(`(done — ${options.session} completed)`);
+    }
+    process.exit(EXIT.OK);
   };
   try {
     const messages = await fetchWindow();
     printNew(messages);
     await reportAsks();
-    if (isDone(messages)) {
-      console.log(`(done — ${options.session} completed)`);
-      process.exit(EXIT.OK);
-    }
+    if (isDone(messages)) finish(messages);
   } catch {
     console.error(`oc-api: could not read session ${options.session}`);
     process.exit(EXIT.UNREACHABLE);
@@ -600,10 +695,7 @@ async function commandFollow(options) {
       const messages = await fetchWindow();
       printNew(messages);
       await reportAsks();
-      if (isDone(messages)) {
-        console.log(`(done — ${options.session} completed)`);
-        process.exit(EXIT.OK);
-      }
+      if (isDone(messages)) finish(messages);
     } catch {
       // transient fetch failure; keep waiting
     }
@@ -722,6 +814,7 @@ async function main() {
   if (options.help || !COMMANDS.has(options.command)) usage(options.command ? undefined : "a command is required");
   switch (options.command) {
     case "detect": return commandDetect(options);
+    case "version": return commandVersion(options);
     case "sessions": return commandSessions(options);
     case "status": return commandStatus(options);
     case "history": return commandHistory(options);

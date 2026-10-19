@@ -73,7 +73,8 @@ probing the server; each profile may pin `api` and the client binary it uses
 launches. Not every mode is v2-ready yet — the per-mode matrix and the rollout
 plan live in [COMPATIBILITY.md](COMPATIBILITY.md). Modes that are not ported
 refuse a v2 server with a clear error instead of issuing calls that cannot
-work. `/opencode:setup` prints each profile's live dialect and pairing.
+work. `/opencode:setup` prints each profile's live dialect and the resolved
+profile's pairing.
 
 ## Installation
 
@@ -187,8 +188,8 @@ bin         opencode client binary paired with THIS profile's generation
             (per-profile; default: `opencode` on PATH)
 ```
 
-`setup` shows each profile's live dialect, resolved binary, and pairing
-status.
+`setup` shows each profile's live dialect and the resolved profile's binary
+pairing status.
 
 ### Credentials (`.env.local`)
 
@@ -197,12 +198,13 @@ cp .env.local.example .env.local    # gitignored; install.sh copies it next
 $EDITOR .env.local                  # to the installed scripts
 ```
 
-Only `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD`, and
+Only `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD`, and the v2 alias
 `OPENCODE_PASSWORD` are read; an exported shell variable always wins over the
-file (and `OPENCODE_PASSWORD` feeds the same password slot as the v1 name). The
-resolved pair authenticates every HTTP request and is exported to servers the
-dispatcher starts, so server and clients always share one credential. Binding
-a non-loopback interface requires a password.
+file, and the v1/v2 password names share one slot (neither file value overrides
+an exported variable under the other name). The resolved pair authenticates
+every HTTP request, and the per-dialect credential names are exported to
+launched clients and child helpers, so server and clients always share one
+credential. Binding a non-loopback interface requires a password.
 
 ### Agent config (`opencode.json`)
 

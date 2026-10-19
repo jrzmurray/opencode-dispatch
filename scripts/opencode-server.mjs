@@ -165,8 +165,10 @@ function normalizePart(part, api) {
 
 /**
  * Normalize a raw message list (v1 {info, parts} items or v2 content[]
- * messages) into flat user/assistant records. Non-conversation v2 messages
- * (idle, synthetic, system, compaction, ...) are dropped.
+ * messages) into flat records. v2 `idle` records are terminal markers: they
+ * carry the turn outcome (and any provider error) when no assistant reply was
+ * written, so they are kept as { role: "idle", outcome, error }. Other
+ * non-conversation v2 messages (synthetic, system, compaction, ...) are dropped.
  */
 export function normalizeMessages(rawItems, api) {
   if (!Array.isArray(rawItems)) return [];
@@ -174,6 +176,20 @@ export function normalizeMessages(rawItems, api) {
   for (const item of rawItems) {
     if (!item || typeof item !== "object") continue;
     if (api === API_V2) {
+      if (item.type === "idle") {
+        out.push({
+          id: item.id,
+          role: "idle",
+          created: normTime(item.time?.created),
+          completed: normTime(item.time?.created),
+          error: normalizeError(item.error, api),
+          outcome: item.outcome || null,
+          text: "",
+          parts: [],
+          raw: item,
+        });
+        continue;
+      }
       if (item.type !== "user" && item.type !== "assistant") continue;
       if (item.type === "user") {
         const text = item.text || "";
@@ -286,7 +302,9 @@ export class OpenCodeClient {
     this.fetchImpl = fetchImpl;
     this.timeoutMs = timeoutMs;
     this.apiSetting = api;
-    this._resolvedApi = api === "auto" ? null : api;
+    // Never pre-seed the resolved dialect from the pin: resolveApi() always
+    // probes a reachable server first and only falls back to the pin.
+    this._resolvedApi = null;
     this._probe = null;
   }
 
@@ -294,47 +312,55 @@ export class OpenCodeClient {
     return this._resolvedApi;
   }
 
-  get capabilities() {
-    const api = this._resolvedApi;
-    return {
-      wait: api === API_V2,
-      events: api === API_V2,
-      forms: api === API_V2,
-      steerQueue: api === API_V2 || api === API_V1,
-      detected: Boolean(api),
-    };
-  }
-
-  /** Resolve the dialect ('auto' probes the server). Throws when unknown. */
+  /**
+   * Resolve the dialect. A reachable server always wins: the configured `api`
+   * setting (CLI/env/profile pin) is only a fallback when the server cannot be
+   * classified (typically because it is down and the caller is about to launch
+   * it). Credential rejection is an error, never a pinned dialect.
+   */
   async resolveApi({ force = false } = {}) {
     if (this._resolvedApi && !force) return this._resolvedApi;
-    if (this.apiSetting !== "auto" && !force) {
-      this._resolvedApi = this.apiSetting;
-      return this._resolvedApi;
-    }
-    const probe = await probeServer({
+    const probeOptions = {
       baseUrl: this.baseUrl,
       username: this.username,
       password: this.password,
       fetchImpl: this.fetchImpl,
       timeoutMs: Math.min(this.timeoutMs, 5_000),
-    });
-    this._probe = probe;
-    if (!probe.api) {
-      throw new OpenCodeServerError(`could not classify OpenCode server at ${this.baseUrl}: ${probe.detail}`, {
-        status: 0,
-        url: this.baseUrl,
-      });
+    };
+    let probe = await probeServer(probeOptions);
+    // v2 fixes the basic-auth username to `opencode`. If a profile carries a
+    // custom v1 username, retry with the v2 default before reporting a
+    // failure — but only accept a v2 answer: a v1 server that accepts the
+    // default username does not make the configured custom username valid.
+    if (probe.authRequired && this.username !== DEFAULT_USERNAME) {
+      const retry = await probeServer({ ...probeOptions, username: DEFAULT_USERNAME });
+      if (retry.api === API_V2 && retry.authOk) probe = retry;
     }
-    if (!probe.authOk) {
+    this._probe = probe;
+    if (probe.api) {
+      if (!probe.authOk) {
+        throw new OpenCodeServerError(`OpenCode server at ${this.baseUrl} rejected the credentials: ${probe.detail}`, {
+          status: 401,
+          url: this.baseUrl,
+        });
+      }
+      this._resolvedApi = probe.api;
+      return this._resolvedApi;
+    }
+    if (probe.authRequired) {
       throw new OpenCodeServerError(`OpenCode server at ${this.baseUrl} rejected the credentials: ${probe.detail}`, {
         status: 401,
         url: this.baseUrl,
       });
     }
-    this._resolvedApi = probe.api;
-    this._probe = probe;
-    return this._resolvedApi;
+    if (this.apiSetting !== "auto") {
+      this._resolvedApi = this.apiSetting;
+      return this._resolvedApi;
+    }
+    throw new OpenCodeServerError(`could not classify OpenCode server at ${this.baseUrl}: ${probe.detail}`, {
+      status: 0,
+      url: this.baseUrl,
+    });
   }
 
   /** Probe result when auto resolution ran; null otherwise. */
@@ -353,7 +379,9 @@ export class OpenCodeClient {
       if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
     }
     const headers = { accept: "application/json", ...extraHeaders };
-    const auth = basicAuthHeader(this.username, this.password);
+    // v2 fixes basic auth to username `opencode`; a profile's custom username
+    // only applies to v1 servers.
+    const auth = basicAuthHeader(this._resolvedApi === API_V2 ? DEFAULT_USERNAME : this.username, this.password);
     if (auth) headers.authorization = auth;
     if (body !== undefined) headers["content-type"] = "application/json";
 
@@ -431,7 +459,17 @@ export class OpenCodeClient {
         headers: this.locationHeaders(directory),
         body: { before: messageId || null },
       });
-      return normalizeSession(response?.data, api);
+      const forked = normalizeSession(response?.data, api);
+      // The fork inherits the parent's location (the header only scopes the
+      // request), so move it onto the requested worktree explicitly.
+      if (forked?.id && directory && !sameDirectory(forked.directory, directory)) {
+        const moved = await this.request("POST", `/api/session/${encodeURIComponent(forked.id)}/move`, {
+          headers: this.locationHeaders(directory),
+          body: { directory },
+        });
+        return normalizeSession(moved?.data || moved || { ...forked, location: { directory } }, api);
+      }
+      return forked;
     }
     const response = await this.request("POST", `/session/${encodeURIComponent(parentId)}/fork`, {
       query: { directory },
@@ -643,7 +681,7 @@ export class OpenCodeClient {
     if (api !== API_V2) throw new OpenCodeServerError("the event stream is a v2 capability", { status: 0 });
     const url = new URL(`${this.baseUrl}/api/event`);
     const headers = { accept: "text/event-stream" };
-    const auth = basicAuthHeader(this.username, this.password);
+    const auth = basicAuthHeader(this._resolvedApi === API_V2 ? DEFAULT_USERNAME : this.username, this.password);
     if (auth) headers.authorization = auth;
     let response;
     try {

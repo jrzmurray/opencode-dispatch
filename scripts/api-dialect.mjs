@@ -29,12 +29,6 @@ export const V1_MIN_VERSION = [1, 18, 29];
 
 export const DEFAULT_USERNAME = "opencode";
 
-/** Canonical password env var per dialect. v2 also reads the v1 name. */
-export const PASSWORD_ENV = {
-  [API_V1]: "OPENCODE_SERVER_PASSWORD",
-  [API_V2]: "OPENCODE_PASSWORD",
-};
-
 /**
  * Parse a version string into [major, minor, patch]. Accepts plain versions
  * ("1.18.29", "2.0.32-beta.1") and full --version output ("opencode v2.0.32").
@@ -96,12 +90,17 @@ function tryJson(text) {
 /**
  * Classify an OpenCode endpoint without assuming a dialect.
  *
- * v2 signals: GET /api/info → 200 JSON ({version,pid}); a 401 there is also
- * v2, because v1 has no /api/info route at all. v1 signals: GET /session →
- * 200 JSON array. On v2 the same /session route serves the web UI (HTML).
+ * v2 signals: GET /api/info → 200 JSON ({version,pid}); the v2 web UI served at
+ * /session is HTML. v1 signals: GET /session → 200 JSON array.
  *
- * Returns { api, serverUp, authOk, version, detail }. api is null when the
- * server is down or unrecognized.
+ * A 401/403 on /api/info is NOT a dialect signal: both generations guard every
+ * route with basic auth before routing, so an authenticated v1 server also
+ * answers 401 there. When the info probe is rejected, the legacy /session probe
+ * decides: JSON ⇒ v1 with credentials accepted, HTML ⇒ v2 with credentials
+ * rejected, rejected as well ⇒ auth required and dialect unknown.
+ *
+ * Returns { api, serverUp, authOk, authRequired, version, detail }. api is null
+ * when the server is down, unrecognized, or authentication hides the dialect.
  */
 export async function probeServer({
   baseUrl,
@@ -112,34 +111,24 @@ export async function probeServer({
 } = {}) {
   if (typeof fetchImpl !== "function") throw new Error("fetch is unavailable");
   const base = String(baseUrl || "").replace(/\/+$/, "");
-  if (!base) return { api: null, serverUp: false, authOk: false, version: null, detail: "no server URL" };
+  if (!base) return { api: null, serverUp: false, authOk: false, authRequired: false, version: null, detail: "no server URL" };
   const headers = {};
   const auth = basicAuthHeader(username, password);
   if (auth) headers.authorization = auth;
 
   // v2 first: the v2 API is authoritative about itself.
   const info = await probeGet(fetchImpl, base, "/api/info", { headers, timeoutMs });
-  if (!info.error) {
-    if (info.status === 200) {
-      const parsed = tryJson(info.text);
-      if (parsed && typeof parsed === "object" && ("version" in parsed || "pid" in parsed)) {
-        return {
-          api: API_V2,
-          serverUp: true,
-          authOk: true,
-          version: typeof parsed.version === "string" ? parsed.version : null,
-          detail: "v2 /api/info",
-        };
-      }
-    }
-    if (info.status === 401 || info.status === 403) {
-      // v1 has no /api/info (404), so an auth challenge here is a v2 signal.
+  const infoAuthRequired = !info.error && (info.status === 401 || info.status === 403);
+  if (!info.error && info.status === 200) {
+    const parsed = tryJson(info.text);
+    if (parsed && typeof parsed === "object" && ("version" in parsed || "pid" in parsed)) {
       return {
         api: API_V2,
         serverUp: true,
-        authOk: false,
-        version: null,
-        detail: `v2 api requires authentication (HTTP ${info.status} on /api/info)`,
+        authOk: true,
+        authRequired: false,
+        version: typeof parsed.version === "string" ? parsed.version : null,
+        detail: "v2 /api/info",
       };
     }
   }
@@ -150,41 +139,63 @@ export async function probeServer({
     if (legacy.status === 200) {
       const parsed = tryJson(legacy.text);
       if (Array.isArray(parsed)) {
-        return { api: API_V1, serverUp: true, authOk: true, version: null, detail: "v1 session list" };
+        // The credentials reached the v1 router even if /api/info 401'd
+        // (v1 answers that unknown route behind its auth middleware).
+        return { api: API_V1, serverUp: true, authOk: true, authRequired: false, version: null, detail: "v1 session list" };
       }
       if (parsed === undefined && /^\s*</.test(legacy.text)) {
         // The v2 web UI is served at /session; a parseable JSON result would
-        // have been the v1 API.
+        // have been the v1 API. A public SPA with a protected API is still v2.
         return {
           api: API_V2,
           serverUp: true,
-          authOk: false,
+          authOk: !infoAuthRequired,
+          authRequired: infoAuthRequired,
           version: null,
-          detail: "v2 web ui (the legacy /session route no longer serves the api)",
+          detail: infoAuthRequired
+            ? `v2 web ui (the api requires authentication; HTTP ${info.status} on /api/info)`
+            : "v2 web ui (the legacy /session route no longer serves the api)",
         };
       }
     }
     if (legacy.status === 401 || legacy.status === 403) {
       return {
-        api: API_V1,
+        api: null,
         serverUp: true,
         authOk: false,
+        authRequired: true,
         version: null,
-        detail: `v1 api requires authentication (HTTP ${legacy.status} on /session)`,
+        detail: `authentication required; dialect unknown (HTTP ${legacy.status} on /session)`,
       };
     }
     return {
       api: null,
       serverUp: true,
       authOk: false,
+      authRequired: infoAuthRequired,
       version: null,
-      detail: `unrecognized server response (HTTP ${legacy.status} on /session)`,
+      detail: infoAuthRequired
+        ? `authentication required; dialect unknown (HTTP ${info.status} on /api/info)`
+        : `unrecognized server response (HTTP ${legacy.status} on /session)`,
+    };
+  }
+  if (infoAuthRequired) {
+    // /api/info answered even though the legacy probe could not: the server is
+    // up, but authentication hides which generation it is.
+    return {
+      api: null,
+      serverUp: true,
+      authOk: false,
+      authRequired: true,
+      version: null,
+      detail: `authentication required; dialect unknown (HTTP ${info.status} on /api/info)`,
     };
   }
   return {
     api: null,
     serverUp: false,
     authOk: false,
+    authRequired: false,
     version: null,
     detail: `server unreachable (${info.error || legacy.error})`,
   };

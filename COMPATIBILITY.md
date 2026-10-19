@@ -22,14 +22,19 @@ binary, and refuses mismatches with an actionable error.
 
 `auto` probes the server:
 
-- `GET /api/info` → `200` JSON ⇒ **v2** (a `401` there is also v2: v1 has no
-  `/api/info` route),
+- `GET /api/info` → `200` JSON ⇒ **v2**,
 - `GET /session` → `200` JSON array ⇒ **v1** (on v2 that URL serves the web
-  UI as HTML),
+  UI as HTML; HTML is therefore a v2 signal),
+- both routes rejected with `401`/`403` ⇒ authentication required and the
+  dialect is unknown; a `401` on `/api/info` alone is **not** a v2 signal
+  (v1 also guards unknown routes with basic auth),
 - neither ⇒ the mode reports the server as unreachable.
 
 Detection is honest — a pinned `api` never overrides what the server actually
-is; it only feeds client launching when the server is down.
+is. The pin is only a fallback for client operations when the server cannot be
+classified (typically because it is down and about to be launched). A
+credential rejection is always reported as an auth error, never masked by the
+pin.
 
 ## Client pairing (`bin`)
 
@@ -41,12 +46,14 @@ else `opencode` on `PATH`). The pairing rule:
 - unknown versions produce a warning, mismatches a hard error before launch.
 
 Read-only HTTP modes (`setup`, `sessions`, `status`, `history`, `follow`,
-`identify`, `claim`, `teardown`) never launch the client binary, so a missing
+`identify`, `claim`, `teardown`) do not require a paired binary, so a missing
 or mismatched `bin` does not block them — but the pairing is still shown in
-`setup` and checked wherever a client is launched.
+`setup` and checked wherever a client is launched (including by `spawn-agent`,
+which takes the profile's binary as `--opencode`). `setup` additionally queries
+the binary for its version/auth/models when one is available.
 
-`setup` prints each profile's live dialect (`v1`/`v2`/`auth`/`down`), the
-resolved binary, and the pairing result.
+`setup` prints each profile's live dialect, and the resolved profile's binary
+pairing.
 
 ## Authentication
 
@@ -59,11 +66,11 @@ username override). The password comes from the profile, `$OPENCODE_PASSWORD`,
 
 | Mode / area | v1 | v2 | Notes |
 | --- | --- | --- | --- |
-| `setup` | ✓ | ✓ | Shows live dialect, `bin`, pairing |
+| `setup` | ✓ | ✓ | Shows each profile's live dialect and the resolved profile's `bin` pairing |
 | `sessions` | ✓ | ✓ | Normalized via `oc-api` |
 | `status` (and `--follow`) | ✓ | ✓ | v2 `--follow` rides the event stream (`watch`), falling back to polling if the stream drops |
-| `history` | ✓ | ✓ | v2 pages the message API backwards |
-| `follow` | ✓ | ✓ | v2 is event-driven (same output and exit codes); v1 keeps the polling loop |
+| `history` | ✓ | ✓ | v2 pages the message API backwards; `--since` pages back to the cutoff |
+| `follow` | ✓ | ✓ | v2 is event-driven (same output and exit codes); v1 keeps the polling loop. A failed v2 turn is reported from its `idle` record instead of waiting for an assistant reply that will never arrive |
 | `identify` / `claim` / `release` | ✓ | partial | Identity env comes from the `opencode-identity` plugin, which is still v1-shaped (see below) |
 | `teardown` | ✓ | ✓ | Server delete works on v1 and v2; the direct-SQL fallback is v1-only (v2 sessions live in `session_v2`) |
 | `permissions` / `allow` | ✓ | — | Not v2-ready yet; refuses with a clear error |

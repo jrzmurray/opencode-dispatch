@@ -227,8 +227,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OC_API="$SCRIPT_DIR/oc-api.mjs"
 
 # ---- .env.local credential loading ------------------------------------------
-# A .env.local in the skill directory can carry OPENCODE_SERVER_USERNAME /
-# OPENCODE_SERVER_PASSWORD (nothing else is read from it). Looked up in order:
+# A .env.local in the skill directory can carry OPENCODE_SERVER_USERNAME,
+# OPENCODE_SERVER_PASSWORD, or the v2 alias OPENCODE_PASSWORD (nothing else is
+# read from it). Looked up in order:
 # $OPENCODE_DISPATCH_ENV_FILE, then walking up from this script's directory
 # (stopping at $HOME). Values apply ONLY when the variable is not already set
 # in the real environment (dotenv semantics), so an exported shell var always
@@ -256,12 +257,13 @@ load_env_local() {
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
     case "$key" in
-      OPENCODE_SERVER_USERNAME|OPENCODE_SERVER_PASSWORD|OPENCODE_PASSWORD)
-        if [ -z "${!key:-}" ]; then export "$key=$val"; fi
-        # The canonical v2 name feeds the shared password slot when no v1 name
-        # was provided, so one file serves both generations.
-        if [ "$key" = "OPENCODE_PASSWORD" ] && [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
-          export OPENCODE_SERVER_PASSWORD="$val"
+      OPENCODE_SERVER_USERNAME)
+        if [ -z "${OPENCODE_SERVER_USERNAME:-}" ]; then export OPENCODE_SERVER_USERNAME="$val"; fi ;;
+      OPENCODE_SERVER_PASSWORD|OPENCODE_PASSWORD)
+        # The two names are one credential slot: neither file value may
+        # override an exported variable under the other name.
+        if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ] && [ -z "${OPENCODE_PASSWORD:-}" ]; then
+          export OPENCODE_PASSWORD="$val" OPENCODE_SERVER_PASSWORD="$val"
         fi ;;
     esac
   done < "$f"
@@ -431,12 +433,6 @@ for _a in "$@"; do
   esac
 done
 
-if ! command -v opencode >/dev/null 2>&1; then
-  echo "error: opencode is not installed or not on PATH." >&2
-  echo "  Install: brew install sst/tap/opencode   (or: npm i -g opencode-ai)" >&2
-  exit 4
-fi
-
 MODEL="${OPENCODE_DISPATCH_MODEL:-}"
 AGENT=""
 VARIANT=""
@@ -482,6 +478,8 @@ TASK_ID=""
 PROMPT_FILE=""
 API_SETTING="${OPENCODE_DISPATCH_API:-}"
 API_SET=""
+API_ENV_SET=""
+[ -n "$API_SETTING" ] && API_ENV_SET=1
 SERVE_BIN=""
 PORT="${OPENCODE_DISPATCH_PORT:-}"
 HOST="${OPENCODE_DISPATCH_HOST:-}"
@@ -619,17 +617,14 @@ IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MO
     process.stdout.write([name, listen, host, port, dir, pass, model, api, bin].join("\x1f") + "\n");
 EOF
 ) || exit 2
-# Profile 'api' feeds the dialect selection only when nothing above it did.
-[ -z "$API_SET" ] && [ -n "$DEF_API" ] && API_SETTING="$DEF_API"
+# Profile 'api' feeds the dialect selection only when neither the CLI flag nor
+# the environment set one (CLI > env > profile > auto).
+[ -z "$API_SET" ] && [ -z "$API_ENV_SET" ] && [ -n "$DEF_API" ] && API_SETTING="$DEF_API"
 API_SETTING="${API_SETTING:-auto}"
 # Profile 'bin' is the opencode client binary paired with this server's
 # generation (per-profile only; no global default — PATH `opencode` otherwise).
-if [ -n "$SERVE_BIN" ]; then
-  case "$SERVE_BIN" in
-    */*) [ -x "$SERVE_BIN" ] || { echo "error: profile bin is not executable: $SERVE_BIN" >&2; exit 4; } ;;
-    *) command -v "$SERVE_BIN" >/dev/null 2>&1 || { echo "error: profile bin not found on PATH: $SERVE_BIN" >&2; exit 4; } ;;
-  esac
-fi
+# It is validated where it is actually launched (require_client_bin), so
+# read-only HTTP modes are not blocked by a missing binary.
 # Binding a non-loopback interface without a password would expose an
 # unauthenticated server on the network — refuse.
 case "$LISTEN" in
@@ -885,15 +880,27 @@ pending_ask() {
 # `bin` (servers.json); PATH `opencode` otherwise.
 client_bin() { printf '%s' "${SERVE_BIN:-opencode}"; }
 
-# The paired binary's generation from --version: "1", "2", or "" (unknown).
-client_generation() {
-  local v
-  v="$("$(client_bin)" --version 2>/dev/null || true)"
-  case "$v" in
-    *\ 2.*|2.*) echo 2 ;;
-    *\ 1.*|1.*) echo 1 ;;
-    *) echo "" ;;
+# Fail (exit 4) only where the client actually launches. Read-only HTTP modes
+# must work with a profile that has no binary (or no `opencode` on PATH).
+require_client_bin() {
+  local bin
+  bin="$(client_bin)"
+  case "$bin" in
+    */*) [ -x "$bin" ] || { echo "error: opencode client binary is not executable: $bin" >&2; exit 4; } ;;
+    *) command -v "$bin" >/dev/null 2>&1 || {
+         echo "error: opencode client binary not found on PATH: $bin" >&2
+         echo "  Install: brew install sst/tap/opencode (or: npm i -g opencode-ai), or set this profile's \"bin\"." >&2
+         exit 4
+       } ;;
   esac
+}
+
+# The paired binary's generation from --version: "1", "2", or "" (unknown).
+# Version parsing lives in oc-api (it handles "opencode v2.0.32", plain
+# "2.0.32", prereleases, ...); the shell never guesses from the output shape.
+client_generation() {
+  oc_api version --bin "$(client_bin)" --json 2>/dev/null \
+    | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);process.stdout.write(j.generation?String(j.generation):"")}catch(e){}});' 2>/dev/null || true
 }
 
 # Run the dialect-aware API helper with the resolved credentials. The password
@@ -902,35 +909,56 @@ oc_api() {
   [ -f "$OC_API" ] || { echo "error: oc-api helper not found: $OC_API (reinstall opencode-dispatch)" >&2; exit 5; }
   OPENCODE_PASSWORD="${SERVE_PASSWORD:-}" OPENCODE_SERVER_PASSWORD="${SERVE_PASSWORD:-}" \
   OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" \
-    node "$OC_API" "$@"
+    node "$OC_API" "$@" --api "$API_SETTING"
+}
+
+# json_field <json> <dotted-path> — print one value from a detect JSON blob.
+json_field() {
+  printf '%s' "$1" | FIELD="$2" node -e '
+    let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+      try{const j=JSON.parse(d);const v=process.env.FIELD.split(".").reduce((o,k)=>o?.[k],j);
+        process.stdout.write(v===undefined||v===null?"":String(v))}catch(e){}});'
 }
 
 RESOLVED_REPORT=""
 RESOLVED_API=""
 # resolve_report — classify the server once per invocation. Sets
 # RESOLVED_API ('v1'|'v2') and RESOLVED_REPORT (detect JSON). Returns 1 when
-# the server is down or unrecognizable (callers label that themselves).
+# the server is down, unrecognized, or authentication hides the dialect.
+# Detection never launches the client binary; pairing is checked separately
+# only in modes that actually launch it.
 resolve_report() {
-  [ -n "$RESOLVED_REPORT" ] && return 0
+  [ -n "$RESOLVED_REPORT" ] && [ -n "$RESOLVED_API" ] && return 0
+  RESOLVED_REPORT=""
   local out
-  out="$(oc_api detect --server "$BASE_URL" --bin "$(client_bin)" --json 2>/dev/null)" || return 1
+  # Capture stdout before testing the status: detect exits nonzero both when
+  # the server is down and when auth hides an otherwise reachable dialect, and
+  # the JSON detail is needed in both cases.
+  if ! out="$(oc_api detect --server "$BASE_URL" --json 2>/dev/null)"; then
+    RESOLVED_REPORT="$out"
+    return 1
+  fi
   [ -n "$out" ] || return 1
-  RESOLVED_API="$(printf '%s' "$out" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).api||"")}catch(e){}})')" || true
-  [ -n "$RESOLVED_API" ] || return 1
+  local api
+  api="$(json_field "$out" api)"
+  # Keep the JSON for error detail, but only cache a SUCCESS: a later call (for
+  # example after `serve` starts the server) must be able to re-probe.
   RESOLVED_REPORT="$out"
+  [ -n "$api" ] || return 1
+  RESOLVED_API="$api"
   return 0
 }
 resolve_api() { resolve_report >/dev/null 2>&1 || true; printf '%s' "$RESOLVED_API"; }
-report_field() {  # $1 = dotted path into the detect JSON (e.g. pairing.severity)
-  printf '%s' "$RESOLVED_REPORT" | FIELD="$1" node -e '
-    let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
-      try{const j=JSON.parse(d);const v=process.env.FIELD.split(".").reduce((o,k)=>o?.[k],j);
-        process.stdout.write(v===undefined||v===null?"":String(v))}catch(e){}});'
+report_field() {  # $1 = dotted path into the detect JSON (e.g. authOk)
+  json_field "$RESOLVED_REPORT" "$1"
 }
 
 require_server() {
   if ! resolve_report; then
     echo "error: no opencode server reachable at $BASE_URL (or the credentials were rejected)" >&2
+    if [ -n "$RESOLVED_REPORT" ] && [ "$(report_field serverUp)" = "true" ]; then
+      echo "  $(report_field detail)" >&2
+    fi
     echo "  Start one: $(basename "$0") serve --port $PORT" >&2
     exit 5
   fi
@@ -953,13 +981,28 @@ require_v1_mode() {  # $1 = mode label
   fi
 }
 
+# Pairing line for setup (never fails the invocation).
+pairing_report() {
+  local out severity reason api
+  out="$(oc_api detect --server "$BASE_URL" --bin "$(client_bin)" --json 2>/dev/null || true)"
+  [ -n "$out" ] || return 0
+  # A skip/no-dialect result (down, auth-required) has no meaningful pairing.
+  api="$(json_field "$out" api)"
+  [ -n "$api" ] || return 0
+  severity="$(json_field "$out" pairing.severity)"
+  reason="$(json_field "$out" pairing.reason)"
+  [ -n "$severity" ] && printf '%s — %s\n' "$severity" "$reason"
+  return 0
+}
+
 # Server dialect ↔ client binary pairing (mismatch = hard error, unknown =
 # warning). Only modes that launch the client binary need this.
 check_pairing() {
   resolve_report >/dev/null 2>&1 || return 0
-  local severity reason
-  severity="$(report_field pairing.severity)"
-  reason="$(report_field pairing.reason)"
+  local out severity reason
+  out="$(oc_api detect --server "$BASE_URL" --bin "$(client_bin)" --json 2>/dev/null)" || return 0
+  severity="$(json_field "$out" pairing.severity)"
+  reason="$(json_field "$out" pairing.reason)"
   case "$severity" in
     ""|ok) return 0 ;;
     unknown) echo "warning: pairing unverified — ${reason:-client version could not be determined}" >&2; return 0 ;;
@@ -970,6 +1013,7 @@ check_pairing() {
 SERVE_LOG=""
 start_server() {  # $1=dir (default $DIR) $2=port (default $PORT) $3=listen (default $LISTEN) $4=password
   local dir="${1:-$DIR}" port="${2:-$PORT}" listen="${3:-$LISTEN}" pass="${4:-$SERVE_PASSWORD}"
+  require_client_bin
   local logdir="${TMPDIR:-/tmp}/opencode-serve"; mkdir -p "$logdir"
   SERVE_LOG="$logdir/serve-${port}.log"
   if [ -n "$pass" ]; then
@@ -1143,7 +1187,7 @@ if [ "$MODE" = "setup" ]; then
     url="http://${h}:${p}"
     st="down"
     if [ -f "$OC_API" ]; then
-      st="$(OPENCODE_PASSWORD="$pw" OPENCODE_SERVER_PASSWORD="$pw" node "$OC_API" detect --server "$url" --json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);process.stdout.write(!j.serverUp?"down":(j.api?(j.authOk?j.api:"auth"):"?"))}catch(e){process.stdout.write("down")}})')"
+      st="$(OPENCODE_PASSWORD="$pw" OPENCODE_SERVER_PASSWORD="$pw" node "$OC_API" detect --server "$url" --json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);process.stdout.write(!j.serverUp?"down":(j.authRequired&&!j.authOk?"auth":(j.api?(j.authOk?j.api:"auth"):"?")))}catch(e){process.stdout.write("down")}})')" || true
       [ -n "$st" ] || st="down"
     else
       auth=(); [ -n "$pw" ] && auth=( --user "${SERVER_USERNAME:-opencode}:${pw}" )
@@ -1164,8 +1208,9 @@ if [ "$MODE" = "setup" ]; then
         if (k.startsWith("_")) continue;  // documentation keys
         const listen = v.listen || "127.0.0.1";
         const host = v.host || (loopback(listen) ? listen : "");
-        // The env password is the effective one for any profile without its own.
-        const pw = v.password || process.env.OPENCODE_SERVER_PASSWORD || "";
+        // The env password is the effective one for any profile without its own
+        // (either generation name).
+        const pw = v.password || process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD || "";
         process.stdout.write([k, listen, host, v.port || "4096", v.dir || "", pw, v.model || "", v.api || "", v.bin || ""].join("\x1f") + "\n");
       }
 EOF
@@ -1173,12 +1218,14 @@ EOF
   # Dialect + pairing for the resolved server. Detection is honest about the
   # server; the declared 'api' only feeds client launching.
   if resolve_report 2>/dev/null; then
-    pinfo="$(report_field pairing.reason)"
     echo "dialect:   ${RESOLVED_API} at $BASE_URL (declared: ${API_SETTING}; bin: $(client_bin))"
-    [ -n "$pinfo" ] && echo "pairing:   ${pinfo}"
+  elif [ "$(report_field serverUp)" = "true" ] && [ "$(report_field authRequired)" = "true" ]; then
+    echo "dialect:   auth required (dialect unknown) at $BASE_URL (declared: ${API_SETTING}; bin: $(client_bin))"
   else
     echo "dialect:   unreachable at $BASE_URL (declared: ${API_SETTING}; bin: $(client_bin))"
   fi
+  _pairing="$(pairing_report 2>/dev/null || true)"
+  [ -n "$_pairing" ] && echo "pairing:   ${_pairing}"
   echo "default model (dispatch): ${MODEL:-<opencode config default>}"
   echo "authenticated providers:"
   "$(client_bin)" auth list 2>/dev/null | sed 's/^/  /' || echo "  (none — run: opencode auth login)"
@@ -1884,7 +1931,9 @@ run_teardown() {  # $1=taskID [extra agent-cleanup args...]
   [ -f "$orch/agent-cleanup.mjs" ] || { echo "error: cleanup helper not found: $orch/agent-cleanup.mjs" >&2; return 5; }
   local cargs=( --task "$task" --from "$DIR" --teardown )
   [ -n "$WORKTREE_ROOT" ] && cargs+=( --worktree-root "$WORKTREE_ROOT" )
-  node "$orch/agent-cleanup.mjs" "${cargs[@]}" "$@"
+  OPENCODE_PASSWORD="${SERVE_PASSWORD:-}" OPENCODE_SERVER_PASSWORD="${SERVE_PASSWORD:-}" \
+  OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" \
+    node "$orch/agent-cleanup.mjs" "${cargs[@]}" "$@"
 }
 
 if [ "$MODE" = "teardown" ]; then
@@ -2076,6 +2125,7 @@ if [ -n "$DIRECT" ]; then
   # differ between generations (v1: --dir/--variant; v2: cwd + --server and
   # provider/model#variant). v2 one-shots are not wired yet — refuse instead
   # of passing v1 flags to a v2 binary.
+  require_client_bin
   if [ "$(client_generation)" = "2" ]; then
     echo "error: --direct with a v2 client is not wired yet (the run flags differ between generations)." >&2
     echo "  Use a v1 binary for --direct, or a server-backed mode (support matrix: COMPATIBILITY.md)." >&2
@@ -2093,7 +2143,7 @@ if [ -n "$DIRECT" ]; then
         # --auto kept for review: its config EXPLICITLY denies edit/webfetch, so
         # --auto cannot unlock them (auto only approves what is not denied);
         # bash is explicitly allowed (git reads). Verified on opencode 1.18.9.
-        exec opencode "${COMMON[@]}" --agent "$AGENT_USE" --auto "$prompt" -f "$diff"
+        exec "$(client_bin)" "${COMMON[@]}" --agent "$AGENT_USE" --auto "$prompt" -f "$diff"
         ;;
       plan|ask)
         # NO --auto for plan/ask: the plan agent's bash is already allowed by
@@ -2102,7 +2152,7 @@ if [ -n "$DIRECT" ]; then
         # and doom_loop asks that are plan's remaining read-only guards. Verified
         # on opencode 1.18.9 (agent list + live bash probe). --auto IS kept for
         # review below, whose edit/webfetch are explicitly denied.
-        exec opencode "${COMMON[@]}" --agent "$AGENT_USE" "$MSG"
+        exec "$(client_bin)" "${COMMON[@]}" --agent "$AGENT_USE" "$MSG"
         ;;
     task|bulk)
       echo "error: --direct is not supported for edit-capable task/bulk workers; use the isolated server-backed path" >&2
@@ -2160,11 +2210,12 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
     echo "  Set OPENCODE_ORCHESTRATION_ROOT or pass --orchestration-root <path>." >&2
     exit 5
   fi
-  spawn_args=("$spawn" --from "$DIR" --server "$BASE_URL" --agent "${AGENT_USE:-auto}" --prompt-file "$msgfile" --allow-edit --allow-bash)
+  spawn_args=("$spawn" --from "$DIR" --server "$BASE_URL" --opencode "$(client_bin)" --agent "${AGENT_USE:-auto}" --prompt-file "$msgfile" --allow-edit --allow-bash)
   [ -n "$MODEL" ] && spawn_args+=(--model "$MODEL")
   [ -n "$VARIANT" ] && spawn_args+=(--variant "$VARIANT")
   [ -n "$WORKTREE_ROOT" ] && spawn_args+=(--worktree-root "$WORKTREE_ROOT")
-  worker_json="$(node "${spawn_args[@]}")" || { echo "error: isolated worker launch failed" >&2; exit 5; }
+  worker_json="$(OPENCODE_PASSWORD="${SERVE_PASSWORD:-}" OPENCODE_SERVER_PASSWORD="${SERVE_PASSWORD:-}" \
+    OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" node "${spawn_args[@]}")" || { echo "error: isolated worker launch failed" >&2; exit 5; }
   IFS=$'\t' read -r SID DIR TASK_ID WORKER_BRANCH < <(printf '%s' "$worker_json" | node -e '
     const r=JSON.parse(require("fs").readFileSync(0,"utf8"));
     process.stdout.write(`${r.sessionId || ""}\t${r.worktreePath || ""}\t${r.taskId || ""}\t${r.branch || ""}\n`);') || {
