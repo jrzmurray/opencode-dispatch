@@ -58,9 +58,13 @@ pairing.
 ## Authentication
 
 Basic auth with username **`opencode`** in both generations (v2 has no
-username override). The password comes from the profile, `$OPENCODE_PASSWORD`,
-`$OPENCODE_SERVER_PASSWORD` (v1 name; still read by v2 clients), or
-`.env.local`. Launched clients receive the names their dialect reads.
+username override). Credentials are keyed by the address actually used, in
+this order: `OPENCODE_SERVER_CREDENTIALS` (a JSON map keyed by host/host:port),
+the profile's `username`/`password`, the `servers.json` `credentials` map, then
+the single `$OPENCODE_SERVER_PASSWORD` / `$OPENCODE_PASSWORD` fallback
+(v1 name; still read by v2 clients). `.env.local` supplies the same variables.
+Launched clients receive the names their dialect reads — one pair per process,
+so one server's credential never leaks into another's client.
 
 ## Mode support matrix
 

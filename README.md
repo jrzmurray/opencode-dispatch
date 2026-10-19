@@ -170,9 +170,25 @@ host        addressable host the dispatcher reaches the server at
             a password)
 port        server port (default 4096)
 dir         server working directory
-password    basic-auth password (username defaults to `opencode`)
+username    optional basic-auth username for this profile (default `opencode`)
+password    optional basic-auth password for this profile
 model       default provider/model for dispatch through this profile
 ```
+
+Credentials are per address. A profile's `username`/`password` apply to that
+profile; profiles without one use the top-level `credentials` map, keyed by
+`host`, `host:port`, or a full URL:
+
+```json
+"credentials": {
+  "192.0.2.50": "remote-pw",
+  "127.0.0.1:4096": { "username": "opencode", "password": "local-pw" }
+}
+```
+
+The single `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` value is only the
+last-resort fallback for a profile with no keyed credential — it never
+overrides an address-specific one.
 
 `--server <name>` (or `$OPENCODE_DISPATCH_SERVER`, or `serve <name>`) selects a
 profile; per-field precedence is CLI flag > env (`OPENCODE_DISPATCH_*`) >
@@ -198,13 +214,24 @@ cp .env.local.example .env.local    # gitignored; install.sh copies it next
 $EDITOR .env.local                  # to the installed scripts
 ```
 
-Only `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD`, and the v2 alias
-`OPENCODE_PASSWORD` are read; an exported shell variable always wins over the
-file, and the v1/v2 password names share one slot (neither file value overrides
-an exported variable under the other name). The resolved pair authenticates
-every HTTP request, and the per-dialect credential names are exported to
-launched clients and child helpers, so server and clients always share one
-credential. Binding a non-loopback interface requires a password.
+`.env.local` accepts `OPENCODE_SERVER_USERNAME`, the password names
+`OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` (one slot), and
+`OPENCODE_SERVER_CREDENTIALS` — a JSON object keyed by `host`, `host:port`, or
+a full URL. An exported shell variable always wins over the file, and the
+v1/v2 password names share one slot (neither file value overrides an exported
+variable under the other name).
+
+Resolution for each request is by the address actually used:
+
+1. `OPENCODE_SERVER_CREDENTIALS` (environment or `.env.local`),
+2. the selected profile's `username`/`password`,
+3. the `credentials` map in `servers.json`,
+4. the single `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` fallback.
+
+The winning pair authenticates the server, and only that pair is exported to
+each launched client/helper (under the names its dialect reads), so server and
+clients always share one credential. Binding a non-loopback interface requires
+a credential for that address.
 
 ### Agent config (`opencode.json`)
 
@@ -275,9 +302,10 @@ executed as shell, so treat it like any other repo-controlled script.
 | `OPENCODE_DISPATCH_SERVER` | Server profile name (default `default`; same as `--server`). |
 | `OPENCODE_DISPATCH_API` | Server API dialect override (`auto` default; `v1` or `v2`; same as `--api`). |
 | `OPENCODE_DISPATCH_SERVERS` | Server definitions file (default `~/.config/opencode-dispatch/servers.json`). |
-| `OPENCODE_SERVER_PASSWORD` | Server password for HTTP requests; the v1 name (still read by v2 clients); exported to launched clients. |
-| `OPENCODE_PASSWORD` | v2 name for the same password (preferred by v2 clients). |
-| `OPENCODE_SERVER_USERNAME` | v1 basic-auth username (default `opencode`); v2 fixes the username to `opencode`. |
+| `OPENCODE_SERVER_PASSWORD` | Fallback password for profiles with no address-keyed credential; the v1 name (still read by v2 clients); exported to launched clients. |
+| `OPENCODE_PASSWORD` | v2 name for the same fallback password slot (preferred by v2 clients). |
+| `OPENCODE_SERVER_CREDENTIALS` | JSON object of credentials keyed by `host`, `host:port`, or URL; overrides `servers.json` and profile fields. |
+| `OPENCODE_SERVER_USERNAME` | Fallback v1 basic-auth username (default `opencode`); v2 fixes the username to `opencode`. |
 | `OPENCODE_DISPATCH_ENV_FILE` | Explicit path to a `.env.local`-style credential file. |
 | `OPENCODE_SESSION_ID` / `_SLUG` / `_TITLE` / `_AGENT` / `_MODEL` / `_DIRECTORY` | The **executing** session's own identity, injected into every tool shell by the `opencode-identity` plugin (`plugins/opencode-identity.js`, installed to `~/.config/opencode/plugins/`). Parents and subagents each see their own id — the basis for `identify` / `claim`. |
 | `OPENCODE_STALENESS_FETCH_TTL` / `OPENCODE_STALENESS_NUDGE_AT` / `OPENCODE_STALENESS_HOT_PATHS` | Tuning for the `opencode-branch-staleness` plugin: seconds between real `git fetch`es (default 300), commits-behind threshold for escalated wording (default 25), and optional comma-separated paths whose changes are called out explicitly. |

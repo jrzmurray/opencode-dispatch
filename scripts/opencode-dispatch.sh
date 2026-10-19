@@ -211,12 +211,14 @@
 #                             any flags passed on this command line.
 #   --                        Everything after this is the literal message
 #
-# Server auth: the resolved profile's 'password' (or $OPENCODE_SERVER_PASSWORD,
-# or a .env.local in the skill dir) is used as the basic-auth password with
-# username $OPENCODE_SERVER_USERNAME (default 'opencode') for every request,
-# and both are exported to the launched `opencode serve` — server and clients
-# always share one credential pair. Binding a non-loopback interface REQUIRES a
-# password — the dispatcher refuses to start an unauthenticated server.
+# Server auth: credentials are keyed by the address actually used — the
+# profile's username/password, the servers.json "credentials" map, or
+# OPENCODE_SERVER_CREDENTIALS (JSON keyed by host/host:port); the single
+# $OPENCODE_SERVER_PASSWORD / $OPENCODE_PASSWORD (or a .env.local in the skill
+# dir) is only the fallback. The resolved pair authenticates every request to
+# that server and is exported to the clients launched for it, so server and
+# clients always share one credential. Binding a non-loopback interface
+# REQUIRES a credential — the dispatcher refuses an unauthenticated server.
 
 set -euo pipefail
 
@@ -228,8 +230,9 @@ OC_API="$SCRIPT_DIR/oc-api.mjs"
 
 # ---- .env.local credential loading ------------------------------------------
 # A .env.local in the skill directory can carry OPENCODE_SERVER_USERNAME,
-# OPENCODE_SERVER_PASSWORD, or the v2 alias OPENCODE_PASSWORD (nothing else is
-# read from it). Looked up in order:
+# OPENCODE_SERVER_PASSWORD, the v2 alias OPENCODE_PASSWORD, or a keyed
+# OPENCODE_SERVER_CREDENTIALS JSON map (nothing else is read from it). Looked
+# up in order:
 # $OPENCODE_DISPATCH_ENV_FILE, then walking up from this script's directory
 # (stopping at $HOME). Values apply ONLY when the variable is not already set
 # in the real environment (dotenv semantics), so an exported shell var always
@@ -259,6 +262,8 @@ load_env_local() {
     case "$key" in
       OPENCODE_SERVER_USERNAME)
         if [ -z "${OPENCODE_SERVER_USERNAME:-}" ]; then export OPENCODE_SERVER_USERNAME="$val"; fi ;;
+      OPENCODE_SERVER_CREDENTIALS)
+        if [ -z "${OPENCODE_SERVER_CREDENTIALS:-}" ]; then export OPENCODE_SERVER_CREDENTIALS="$val"; fi ;;
       OPENCODE_SERVER_PASSWORD|OPENCODE_PASSWORD)
         # The two names are one credential slot: neither file value may
         # override an exported variable under the other name.
@@ -406,9 +411,11 @@ Notes:
   - Server definitions: per-server bind interface ('listen') vs addressable
     host ('host'); binding a non-loopback interface requires a password.
   - --await was removed (use --background); --no-await was removed (use --wait).
-  - Server auth: OPENCODE_SERVER_USERNAME (default 'opencode') +
-    OPENCODE_SERVER_PASSWORD (or the profile's password field) must match
-    'opencode serve'. A .env.local in the skill dir can supply both.
+  - Server auth: credentials are keyed by address — the profile's
+    username/password, the servers.json "credentials" map, or
+    OPENCODE_SERVER_CREDENTIALS. The single OPENCODE_SERVER_PASSWORD (or the
+    v2 name OPENCODE_PASSWORD) is only the fallback. A .env.local in the skill
+    dir can supply any of them.
   - Never pipe this script's output through tail (a PreToolUse hook blocks it).
 EOF
 }
@@ -569,53 +576,15 @@ esac
 # so bash `read` collapses empty middle fields (e.g. an unset 'dir' would push
 # the password into the wrong variable). \x1f is literal, so every field slot
 # survives, including empty ones.
-IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MODEL DEF_API SERVE_BIN < <(
+IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MODEL DEF_API SERVE_BIN SERVE_USERNAME < <(
   SRV_NAME="$SERVER_NAME" SERVERS_FILE="$SERVERS_FILE" \
   CLI_LISTEN="$LISTEN" CLI_HOST="$HOST" CLI_PORT="$PORT" \
   ENV_LISTEN="${OPENCODE_DISPATCH_LISTEN:-}" \
   ENV_HOST="${OPENCODE_DISPATCH_HOST:-}" \
   ENV_PORT="${OPENCODE_DISPATCH_PORT:-}" \
   ENV_PASSWORD="${OPENCODE_SERVER_PASSWORD:-${OPENCODE_PASSWORD:-}}" \
-  node - <<'EOF'
-    const fs = require("fs");
-    const file = process.env.SERVERS_FILE;
-    let defs = {};
-    if (fs.existsSync(file)) {
-      try { defs = JSON.parse(fs.readFileSync(file, "utf8")); }
-      catch (e) { console.error(`error: ${file} is not valid JSON: ${e.message}`); process.exit(1); }
-    }
-    const name = process.env.SRV_NAME || "default";
-    const d = defs[name] || {};
-    if (name !== "default" && !(name in defs)) {
-      console.error(`error: no server definition '${name}' in ${file}`);
-      process.exit(1);
-    }
-    const loopback = (a) => a === "localhost" || a === "::1" || /^127\./.test(a);
-    const listen = process.env.CLI_LISTEN || process.env.ENV_LISTEN || d.listen || "127.0.0.1";
-    // Addressable host defaults to the listen address when that is concrete
-    // (loopback or an interface IP); a wildcard bind (0.0.0.0/::) has no
-    // addressable form and REQUIRES an explicit host.
-    let host = process.env.CLI_HOST || process.env.ENV_HOST
-      || d.host || (loopback(listen) ? listen : "");
-    const port = parseInt(process.env.CLI_PORT || process.env.ENV_PORT || d.port || "4096", 10);
-    const pass = process.env.ENV_PASSWORD || d.password || "";
-    const dir = d.dir || "";
-    const model = d.model || "";
-    const api = d.api || "";
-    const bin = d.bin || "";
-    if (api && !["auto", "v1", "v2"].includes(api)) {
-      console.error(`error: server '${name}' has invalid api '${api}' (use auto|v1|v2)`);
-      process.exit(1);
-    }
-    if (!(port >= 1 && port <= 65535)) {
-      console.error(`error: invalid port ${port} for server '${name}'`); process.exit(1);
-    }
-    if (host === "" || host === "0.0.0.0" || host === "::") {
-      console.error(`error: server '${name}' has no reachable address (host can never be 0.0.0.0/::) — set 'host' in the definition, or bind loopback and let the host default to it`);
-      process.exit(1);
-    }
-    process.stdout.write([name, listen, host, port, dir, pass, model, api, bin].join("\x1f") + "\n");
-EOF
+  ENV_CREDENTIALS="${OPENCODE_SERVER_CREDENTIALS:-}" \
+  node "$SCRIPT_DIR/server-profiles.mjs"
 ) || exit 2
 # Profile 'api' feeds the dialect selection only when neither the CLI flag nor
 # the environment set one (CLI > env > profile > auto).
@@ -631,7 +600,7 @@ case "$LISTEN" in
   127.*|localhost|::1) ;;
   *)
     if [ -z "$SERVE_PASSWORD" ]; then
-      echo "error: server '$SERVER_NAME' binds non-loopback interface '$LISTEN' — set 'password' in the definition (or OPENCODE_SERVER_PASSWORD), or it would be reachable without auth" >&2
+      echo "error: server '$SERVER_NAME' binds non-loopback interface '$LISTEN' — set a credential for ${HOST}:${PORT} in servers.json (\"credentials\" or the profile) or OPENCODE_SERVER_CREDENTIALS, or it would be reachable without auth" >&2
       exit 2
     fi ;;
 esac
@@ -645,8 +614,9 @@ BASE_URL="http://${HOST}:${PORT}"
 # opencode serve's basic auth pairs a username (OPENCODE_SERVER_USERNAME,
 # default 'opencode' — the server validates it, verified on 1.18.9) with the
 # password. Both the launched server and every client use the SAME resolved
-# pair, so a .env.local / env change never desyncs them.
-SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
+# pair, so a .env.local / env change never desyncs them. Profiles (or the
+# address-keyed credentials map) may override the username.
+SERVER_USERNAME="${SERVE_USERNAME:-${OPENCODE_SERVER_USERNAME:-opencode}}"
 CURL_AUTH=()
 [ -n "${SERVE_PASSWORD:-}" ] && CURL_AUTH=( --user "${SERVER_USERNAME}:${SERVE_PASSWORD}" )
 
@@ -1177,43 +1147,27 @@ if [ "$MODE" = "setup" ]; then
   # State column: v1|v2 = reachable API dialect, auth = rejected credentials,
   # down = unreachable. Definitions may carry 'api' (auto|v1|v2) and 'bin'
   # (the opencode binary paired with that server's generation).
-  while IFS=$'\x1f' read -r n l h p d pw m a b; do
+  while IFS=$'\x1f' read -r n l h p d pw m a b u; do
     [ -n "$n" ] || continue
     mark=" "; [ "$n" = "$SERVER_NAME" ] && mark="*"
     # The marked row shows the RESOLVED values (CLI/env overrides applied).
     if [ "$n" = "$SERVER_NAME" ]; then
-      l="$LISTEN"; h="$HOST"; p="$PORT"; d="$SERVE_DIR"; pw="$SERVE_PASSWORD"; m="$DEF_MODEL"; a="$DEF_API"; b="$SERVE_BIN"
+      l="$LISTEN"; h="$HOST"; p="$PORT"; d="$SERVE_DIR"; pw="$SERVE_PASSWORD"; m="$DEF_MODEL"; a="$DEF_API"; b="$SERVE_BIN"; u="$SERVE_USERNAME"
     fi
     url="http://${h}:${p}"
     st="down"
     if [ -f "$OC_API" ]; then
-      st="$(OPENCODE_PASSWORD="$pw" OPENCODE_SERVER_PASSWORD="$pw" node "$OC_API" detect --server "$url" --json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);process.stdout.write(!j.serverUp?"down":(j.authRequired&&!j.authOk?"auth":(j.api?(j.authOk?j.api:"auth"):"?")))}catch(e){process.stdout.write("down")}})')" || true
+      st="$(OPENCODE_SERVER_USERNAME="${u:-opencode}" OPENCODE_PASSWORD="$pw" OPENCODE_SERVER_PASSWORD="$pw" node "$OC_API" detect --server "$url" --json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);process.stdout.write(!j.serverUp?"down":(j.authRequired&&!j.authOk?"auth":(j.api?(j.authOk?j.api:"auth"):"?")))}catch(e){process.stdout.write("down")}})')" || true
       [ -n "$st" ] || st="down"
     else
-      auth=(); [ -n "$pw" ] && auth=( --user "${SERVER_USERNAME:-opencode}:${pw}" )
+      auth=(); [ -n "$pw" ] && auth=( --user "${u:-${SERVER_USERNAME:-opencode}}:$pw" )
       if curl -sf -m 2 ${auth[@]:+"${auth[@]}"} "$url/session" -o /dev/null 2>/dev/null; then st="UP"; else st="down"; fi
     fi
     printf '%s %-16s %-14s -> %-22s %-4s %s%s%s%s\n' "$mark" "$n" "listen:$l" "$h:$p" "$st" "${a:+api:$a }" "${b:+bin:$(basename "$b") }" "${m:+model: $m }" "${d:+dir: $d}"
   done < <(
-    SERVERS_FILE="$SERVERS_FILE" node - <<'EOF'
-      const fs = require("fs");
-      const file = process.env.SERVERS_FILE;
-      let defs = {};
-      if (fs.existsSync(file)) {
-        try { defs = JSON.parse(fs.readFileSync(file, "utf8")); }
-        catch (e) { console.error(`error: ${file} is not valid JSON: ${e.message}`); process.exit(1); }
-      }
-      const loopback = (a) => a === "localhost" || a === "::1" || /^127\./.test(a);
-      for (const [k, v] of Object.entries(defs)) {
-        if (k.startsWith("_")) continue;  // documentation keys
-        const listen = v.listen || "127.0.0.1";
-        const host = v.host || (loopback(listen) ? listen : "");
-        // The env password is the effective one for any profile without its own
-        // (either generation name).
-        const pw = v.password || process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD || "";
-        process.stdout.write([k, listen, host, v.port || "4096", v.dir || "", pw, v.model || "", v.api || "", v.bin || ""].join("\x1f") + "\n");
-      }
-EOF
+    SERVERS_FILE="$SERVERS_FILE" ENV_PASSWORD="${OPENCODE_SERVER_PASSWORD:-${OPENCODE_PASSWORD:-}}" \
+    ENV_CREDENTIALS="${OPENCODE_SERVER_CREDENTIALS:-}" \
+    node "$SCRIPT_DIR/server-profiles.mjs" --list
   )
   # Dialect + pairing for the resolved server. Detection is honest about the
   # server; the declared 'api' only feeds client launching.
@@ -1527,7 +1481,7 @@ if [ "$MODE" = "serve" ]; then
       require_started_v1 || exit 2
       write_serve_args "$DIR" "$PORT" "$HOST"
       echo "opencode server restarted at $BASE_URL (dir: $DIR)"
-      [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (password from env/.env.local/profile)"
+      [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (address-keyed credential)"
       echo "log: $SERVE_LOG"
       exit 0
     fi
@@ -1543,7 +1497,7 @@ if [ "$MODE" = "serve" ]; then
     require_started_v1 || exit 2
     write_serve_args "$DIR" "$PORT" "$HOST"
     echo "opencode server started at $BASE_URL (dir: $DIR)"
-    [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (password from env/.env.local/profile)"
+    [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (address-keyed credential)"
     echo "log: $SERVE_LOG"
     exit 0
   fi

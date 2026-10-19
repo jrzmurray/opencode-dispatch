@@ -703,6 +703,51 @@ test("setup reports auth-required unknown dialects instead of unreachable", asyn
   }
 });
 
+test("profile and address-keyed credentials are independent of the single env password", async () => {
+  const authServer = (password) => {
+    const expected = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
+    return http.createServer((req, res) => {
+      if (req.headers.authorization !== expected) {
+        res.statusCode = 401;
+        return res.end("{}");
+      }
+      const url = new URL(req.url, "http://127.0.0.1");
+      res.setHeader("content-type", "application/json");
+      if (url.pathname === "/api/info") return res.end(JSON.stringify({ version: "2.0.32", pid: 1 }));
+      if (url.pathname === "/api/session") return res.end(JSON.stringify({ data: [] }));
+      if (url.pathname === "/api/permission/request" || url.pathname === "/api/form") return res.end(JSON.stringify({ data: [] }));
+      res.statusCode = 404;
+      res.end("{}");
+    });
+  };
+  const alpha = authServer("alpha-pw");
+  const beta = authServer("beta-pw");
+  await new Promise((resolve) => alpha.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => beta.listen(0, "127.0.0.1", resolve));
+
+  const shim = shellEnv({
+    // The single value must NOT override either address-scoped credential.
+    OPENCODE_SERVER_PASSWORD: "global-pw",
+  });
+  fs.writeFileSync(shim.env.OPENCODE_DISPATCH_SERVERS, JSON.stringify({
+    alpha: { host: "127.0.0.1", port: alpha.address().port, password: "alpha-pw" },
+    beta: { host: "127.0.0.1", port: beta.address().port },
+    credentials: {
+      [`127.0.0.1:${beta.address().port}`]: { password: "beta-pw" },
+    },
+  }));
+  try {
+    const alphaRun = await runDispatch(["sessions", "--server", "alpha"], shim.env);
+    assert.equal(alphaRun.code, 0, alphaRun.stderr);
+    const betaRun = await runDispatch(["sessions", "--server", "beta"], shim.env);
+    assert.equal(betaRun.code, 0, betaRun.stderr);
+  } finally {
+    shim.cleanup();
+    alpha.close();
+    beta.close();
+  }
+});
+
 test("--direct refuses the profile's v2 binary (version output parsing)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-dispatch-bin-"));
   const bin = path.join(dir, "opencode-v2");
