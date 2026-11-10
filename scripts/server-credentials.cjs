@@ -7,8 +7,9 @@
  * client's own single-server contract; the dispatcher is the layer that talks
  * to several servers, so credentials are keyed by the address actually used.
  *
- * Lookup order (first match wins):
- *   1. OPENCODE_SERVER_CREDENTIALS (JSON object in the environment/.env.local)
+ * Lookup order (each field uses the first defined value):
+ *   1. OPENCODE_SERVER_CREDENTIALS (object in the environment/.env.local;
+ *      JSON or JavaScript-style {host:port:{password:pw}} syntax)
  *   2. the selected profile's own username/password fields
  *   3. servers.json top-level "credentials", keyed by host or host:port
  *   4. the single OPENCODE_SERVER_PASSWORD / OPENCODE_PASSWORD fallback
@@ -60,19 +61,204 @@ function keysFor(host, port) {
   return keys;
 }
 
-/** Parse a credentials map from an object or a JSON string. */
+// ---------------------------------------------------------------------------
+// Credential map parsing
+// ---------------------------------------------------------------------------
+//
+// The documented format is JSON, but the environment value is frequently
+// written as a JavaScript-style object:
+//
+//   {127.0.0.1:4096:{password:secret}}
+//
+// That is not JSON (unquoted keys and values). Accept both forms in one shared
+// parser so every caller (dispatcher, profile resolver, prune script, tests)
+// behaves the same. Bare values are taken literally; quote a value that
+// contains a comma, brace, or trailing whitespace.
+
+function stripQuoted(text) {
+  const value = text.trim();
+  if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+    if (value.startsWith('"')) {
+      try {
+        return JSON.parse(value);
+      } catch {
+        // Fall through to the permissive unquote below.
+      }
+    }
+    return value.slice(1, -1).replace(/\\(['"\\])/g, "$1");
+  }
+  return value;
+}
+
+/** Split at a delimiter only at the current object/array level, ignoring quotes. */
+function splitTopLevel(text, delimiter = ",") {
+  const parts = [];
+  let depth = 0;
+  let quote = "";
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quote) {
+      if (char === "\\") index += 1;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'") quote = char;
+    else if (char === "{" || char === "[") depth += 1;
+    else if (char === "}" || char === "]") depth -= 1;
+    else if (char === delimiter && depth === 0) {
+      parts.push(text.slice(start, index));
+      start = index + 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/** Top-level colon positions, ignoring colons inside quotes or nested braces. */
+function topLevelColons(text) {
+  const positions = [];
+  let depth = 0;
+  let quote = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quote) {
+      if (char === "\\") index += 1;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'") quote = char;
+    else if (char === "{" || char === "[") depth += 1;
+    else if (char === "}" || char === "]") depth -= 1;
+    else if (char === ":" && depth === 0) positions.push(index);
+  }
+  return positions;
+}
+
+function isUrlKey(text) {
+  try {
+    const url = new URL(text);
+    return Boolean(url.protocol && url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A key is a host, host:port, bracketed IPv6 address, or URL. Testing the key
+ * prefix lets us keep the colon in 127.0.0.1:4096 while finding the colon that
+ * starts its value.
+ */
+function isCredentialKey(text) {
+  const value = text.trim();
+  if (!value) return false;
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return stripQuoted(value).length > 0;
+  }
+  return (
+    isUrlKey(value) ||
+    /^\[[0-9A-Fa-f:.]+\](?::\d+)?$/.test(value) ||
+    /^[A-Za-z0-9._-]+(?::\d+)?$/.test(value)
+  );
+}
+
+/** Locate the entry's key/value colon, allowing a colon inside the key. */
+function findEntrySeparator(entry) {
+  const positions = topLevelColons(entry);
+  let best = -1;
+  for (const position of positions) {
+    if (isCredentialKey(entry.slice(0, position))) best = position;
+  }
+  if (best >= 0) return best;
+  if (positions.length > 0) return positions[positions.length - 1];
+  throw new Error(`expected "key: value" in {${entry.trim()}}`);
+}
+
+/** Find the matching close brace for a value that starts with "{". */
+function matchingBrace(text) {
+  let depth = 0;
+  let quote = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quote) {
+      if (char === "\\") index += 1;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'") quote = char;
+    else if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function parseRelaxedValue(text, label) {
+  const value = text.trim();
+  if (!value) return "";
+  if (value.startsWith("{")) {
+    const end = matchingBrace(value);
+    if (end < 0) throw new Error(`unclosed object in ${label}`);
+    if (value.slice(end + 1).trim()) throw new Error(`unexpected text after object in ${label}`);
+    return parseRelaxedObject(value, label);
+  }
+  if (value.startsWith("[")) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      throw new Error(`arrays in ${label} must use JSON syntax`);
+    }
+  }
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return stripQuoted(value);
+  }
+  return value;
+}
+
+/** Parse a JavaScript-style object literal with unquoted keys/values. */
+function parseRelaxedObject(text, label = "credentials") {
+  const source = text.trim();
+  if (!source.startsWith("{")) throw new Error(`expected an object starting with "{" in ${label}`);
+  const end = matchingBrace(source);
+  if (end < 0) throw new Error(`unclosed object in ${label}`);
+  if (source.slice(end + 1).trim()) throw new Error(`unexpected text after object in ${label}`);
+  const body = source.slice(1, end);
+  const out = {};
+  for (const rawEntry of splitTopLevel(body)) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    const separator = findEntrySeparator(entry);
+    const key = stripQuoted(entry.slice(0, separator));
+    if (!key) throw new Error(`empty key in ${label}`);
+    out[key] = parseRelaxedValue(entry.slice(separator + 1), label);
+  }
+  return out;
+}
+
+/** Parse a credentials map from an object, JSON, or JavaScript-style object. */
 function normalizeMap(value, label = "credentials") {
   if (value === undefined || value === null || value === "") return {};
   let parsed = value;
   if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return {};
     try {
-      parsed = JSON.parse(value);
-    } catch (error) {
-      throw new Error(`${label} must be a JSON object keyed by host or host:port: ${error.message}`);
+      parsed = JSON.parse(text);
+    } catch (jsonError) {
+      try {
+        parsed = parseRelaxedObject(text, label);
+      } catch (relaxedError) {
+        throw new Error(
+          `${label} must be an object keyed by host or host:port: ${jsonError.message} (relaxed parse: ${relaxedError.message}); ` +
+            'example: {127.0.0.1:4096:{password:"secret"}}',
+        );
+      }
     }
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${label} must be a JSON object keyed by host or host:port`);
+    throw new Error(`${label} must be an object keyed by host or host:port`);
   }
   const out = {};
   for (const [key, entry] of Object.entries(parsed)) {
@@ -113,19 +299,48 @@ function resolveCredential({
   const fileMap = normalizeMap(serverCredentials, 'servers.json "credentials"');
 
   const fromEnv = lookup(envMap, host, port);
-  if (fromEnv) {
-    return { username: fromEnv.credential.username, password: fromEnv.credential.password, source: `env:${fromEnv.key}` };
-  }
-  if (profile.username !== undefined || profile.password !== undefined) {
-    return { username: profile.username, password: profile.password, source: "profile" };
-  }
   const fromFile = lookup(fileMap, host, port);
-  if (fromFile) {
-    return { username: fromFile.credential.username, password: fromFile.credential.password, source: `credentials:${fromFile.key}` };
-  }
-  const password = env.OPENCODE_SERVER_PASSWORD || env.OPENCODE_PASSWORD;
-  if (password) return { username: undefined, password, source: "env" };
-  return { username: undefined, password: "", source: "none" };
+  const globalPassword = env.OPENCODE_SERVER_PASSWORD || env.OPENCODE_PASSWORD;
+  const layers = [
+    fromEnv && { credential: fromEnv.credential, source: `env:${fromEnv.key}` },
+    (profile.username !== undefined || profile.password !== undefined)
+      && { credential: profile, source: "profile" },
+    fromFile && { credential: fromFile.credential, source: `credentials:${fromFile.key}` },
+    globalPassword && { credential: { password: globalPassword }, source: "env" },
+  ].filter(Boolean);
+
+  const username = layers.find(({ credential }) => credential.username !== undefined)?.credential.username;
+  const password = layers.find(({ credential }) => credential.password !== undefined)?.credential.password ?? "";
+  const source = layers[0]?.source || "none";
+  return { username, password, source };
 }
 
-module.exports = { normalizeHost, normalizeKey, keysFor, normalizeMap, resolveCredential };
+/**
+ * Resolve the credential for a server URL using the process environment (or a
+ * supplied env). This is the one entry point Node clients should use so the
+ * address-keyed map, its relaxed syntax, and the single-password fallback all
+ * behave identically.
+ */
+function resolveEnvCredential({ baseUrl, env = process.env } = {}) {
+  const fallback = {
+    username: undefined,
+    password: env.OPENCODE_PASSWORD || env.OPENCODE_SERVER_PASSWORD || "",
+    source: env.OPENCODE_PASSWORD || env.OPENCODE_SERVER_PASSWORD ? "env" : "none",
+  };
+  let url;
+  try {
+    url = new URL(String(baseUrl || ""));
+  } catch {
+    return fallback;
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  return resolveCredential({
+    host,
+    port,
+    envCredentials: env.OPENCODE_SERVER_CREDENTIALS ?? env.ENV_CREDENTIALS ?? "",
+    env,
+  });
+}
+
+module.exports = { normalizeHost, normalizeKey, keysFor, normalizeMap, parseRelaxedObject, resolveCredential, resolveEnvCredential };

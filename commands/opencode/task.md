@@ -1,6 +1,6 @@
 ---
 description: Delegate an isolated agentic build task via opencode (awaits completion; remote summary)
-argument-hint: '[--server <name>] [--model provider/model] [--effort low|medium|high|xhigh|max] [--timeout <N>] [--wait|--background] [--follow] [--orchestration-root <path>] <task>'
+argument-hint: '[--server <name>] [--dir <path>] [--model provider/model] [--effort low|medium|high|xhigh|max] [--timeout <N>] [--wait|--background] [--follow] [--orchestration-root <path>] [--bootstrap-cmd <cmd>] <task>'
 allowed-tools: Bash(bash:*), Bash(opencode:*), Bash(git:*), Read
 ---
 
@@ -39,5 +39,12 @@ bash "$HOME/.claude/scripts/opencode-dispatch.sh" task --background $ARGUMENTS
   task ID, session ID, branch, and path. The persistent server is shared safely.
 - The default already runs the job in the background with wake-on-complete;
   there is no fire-and-forget mode — every dispatch waits for its turn.
+- **Target repo:** `--dir <path>` selects the repo to edit; use it when the
+  session's cwd is not the project. The repo's
+  `<repo>/.opencode-dispatch.json` `{"bootstrap":"..."}` runs in the new
+  worktree before the session starts. It sees tracked files only (the worktree
+  is created from the base commit), so commit any script it references or pass
+  `--bootstrap-cmd` with an absolute path. The started output prints the
+  resolved command, or `(none)` when no hook was found.
 - **Never pipe this command's output through `tail`** — the installed PreToolUse
   hook blocks it, and tail can clip the distilled summary the script prints.

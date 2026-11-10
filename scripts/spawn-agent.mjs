@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { OpenCodeClient } from "./opencode-server.mjs";
+import { resolveAgentModel } from "./agent-config.mjs";
 import { API_V1, API_V2, clientAuthEnv, clientVersion, pairingStatus } from "./api-dialect.mjs";
 import {
   branchPrefix,
@@ -236,9 +237,16 @@ export function resolveBootstrapCommand(options, sourceRoot) {
   return command;
 }
 
-function bootstrapWorker(record, options, repository, serverUrl, auth) {
-  const command = resolveBootstrapCommand(options, repository.root);
-  if (!command) return;
+export function bootstrapWorker(record, options, repository, serverUrl, auth) {
+  // The config normally lives in the source checkout. For a linked worktree,
+  // an untracked config may exist only in the primary repository root, so fall
+  // back there before deciding there is no hook.
+  let command = resolveBootstrapCommand(options, repository.root);
+  if (!command && repository.primaryRoot && repository.primaryRoot !== repository.root) {
+    command = resolveBootstrapCommand(options, repository.primaryRoot);
+  }
+  record.bootstrapCommand = command || "";
+  if (!command) return null;
   const env = {
     ...workerEnvironment(record, serverUrl, auth),
     WORKTREE_TASK_ID: record.taskId,
@@ -247,12 +255,27 @@ function bootstrapWorker(record, options, repository, serverUrl, auth) {
     WORKTREE_BOOTSTRAP_CHILD: "0",
     WORKTREE_SESSION_START: "0",
   };
-  execFileSync("/bin/sh", ["-c", command], {
-    cwd: record.worktreePath,
-    env,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  process.stderr.write(`spawn-agent: bootstrap: ${command}\n`);
+  try {
+    execFileSync("/bin/sh", ["-c", command], {
+      cwd: record.worktreePath,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const output = [String(error?.stderr || "").trim(), String(error?.stdout || "").trim()]
+      .filter(Boolean)
+      .join("\n");
+    const detail = output || error?.message || String(error);
+    throw new Error(
+      `bootstrap failed in ${record.worktreePath}: ${command}\n${detail}\n` +
+      "The hook runs in the child worktree, which contains tracked files only. " +
+      "Commit any script it references, or pass --bootstrap-cmd with an absolute path.",
+    );
+  }
+  process.stderr.write("spawn-agent: bootstrap: ok\n");
+  return command;
 }
 
 function launchWorker(options, record, serverUrl, layout, auth) {
@@ -309,6 +332,20 @@ async function main() {
   options.promptText = promptFrom(options);
   if (!options.dryRun && !options.prepareOnly && !options.promptText) throw new Error("a task prompt is required");
   if (!options.dryRun && !options.prepareOnly && !options.server) throw new Error("--server or OPENCODE_SERVER_URL is required");
+  // A v2 session keeps no model unless one is sent. When the caller did not
+  // pass --model, use the selected agent's effective model from opencode.json
+  // (the dispatcher normally resolves this already; this covers direct use).
+  if (!options.model && options.agent) {
+    const resolved = resolveAgentModel({
+      directory: options.from,
+      agent: options.agent,
+      bin: options.opencode,
+    });
+    if (resolved) {
+      options.model = `${resolved.providerID}/${resolved.model}`;
+      if (!options.variant && resolved.variant) options.variant = resolved.variant;
+    }
+  }
   const selectedModel = parseModel(options.model);
   const sessionModel = selectedModel
     ? { ...selectedModel, ...(options.variant ? { variant: options.variant } : {}) }

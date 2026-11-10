@@ -8,7 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { isLocalServerUrl, OpenCodeClient } from "../opencode-server.mjs";
-import { buildWorkerArgs, resolveBootstrapCommand } from "../spawn-agent.mjs";
+import { bootstrapWorker, buildWorkerArgs, resolveBootstrapCommand } from "../spawn-agent.mjs";
 import {
   archiveTaskRecord,
   branchExists,
@@ -132,6 +132,96 @@ test("the async registry lock stays held across awaited work", async () => {
     });
     await Promise.all([first, second]);
     assert.deepEqual(events, ["first-start", "first-end", "second"]);
+  } finally {
+    fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });
+    fs.rmSync(fixture.repositoryRoot, { recursive: true, force: true });
+  }
+});
+
+test("registry locks left by a dead process are reclaimed", async () => {
+  const fixture = fixtureRepository();
+  const layout = getAgentLayout(fixture.repository, { AGENT_WORKTREE_ROOT: fixture.allocationRoot });
+  const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+  assert.ok(deadPid > 0);
+  const plantStaleLock = () => {
+    fs.mkdirSync(layout.lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(layout.lockPath, "owner.json"), JSON.stringify({ pid: deadPid, startedAt: new Date().toISOString() }));
+  };
+  try {
+    plantStaleLock();
+    let syncRan = false;
+    withAgentLock(layout, () => {
+      syncRan = true;
+    });
+    assert.equal(syncRan, true);
+    assert.equal(fs.existsSync(layout.lockPath), false);
+
+    plantStaleLock();
+    let asyncRan = false;
+    await withAgentLockAsync(layout, async () => {
+      asyncRan = true;
+    });
+    assert.equal(asyncRan, true);
+    assert.equal(fs.existsSync(layout.lockPath), false);
+  } finally {
+    fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });
+    fs.rmSync(fixture.repositoryRoot, { recursive: true, force: true });
+  }
+});
+
+test("concurrent processes serialize stale registry-lock recovery", async () => {
+  const fixture = fixtureRepository();
+  const layout = getAgentLayout(fixture.repository, { AGENT_WORKTREE_ROOT: fixture.allocationRoot });
+  const activePath = path.join(fixture.allocationRoot, "active-callback");
+  const modulePath = path.resolve(scriptsDir, "worktree-utils.mjs");
+  const childScript = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+    const { withAgentLockAsync } = await import(pathToFileURL(process.argv[1]).href);
+    const lockPath = process.argv[2];
+    const activePath = process.argv[3];
+    await withAgentLockAsync({ root: path.dirname(lockPath), lockPath }, async () => {
+      let fd;
+      try {
+        fd = fs.openSync(activePath, "wx");
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        fs.writeFileSync(activePath + ".overlap", String(process.pid) + "\\n", { flag: "a" });
+        return;
+      }
+      fs.writeSync(fd, String(process.pid));
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      fs.closeSync(fd);
+      fs.unlinkSync(activePath);
+    });
+  `;
+  const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+  fs.mkdirSync(layout.lockPath, { mode: 0o700 });
+  fs.writeFileSync(path.join(layout.lockPath, "owner.json"), JSON.stringify({ pid: deadPid }));
+
+  const runChild = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "--input-type=module",
+      "-e",
+      childScript,
+      modulePath,
+      layout.lockPath,
+      activePath,
+    ], { env: scrubbedEnv(), stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stderr }));
+  });
+
+  try {
+    const results = await Promise.all(Array.from({ length: 4 }, runChild));
+    assert.deepEqual(results.map(({ code }) => code), [0, 0, 0, 0], results.map(({ stderr }) => stderr).join("\n"));
+    assert.equal(fs.existsSync(`${activePath}.overlap`), false, "callbacks must not overlap after stale-lock recovery");
+    assert.equal(fs.existsSync(layout.lockPath), false);
+    assert.equal(fs.existsSync(`${layout.lockPath}.reclaim`), false);
   } finally {
     fs.rmSync(fixture.allocationRoot, { recursive: true, force: true });
     fs.rmSync(fixture.repositoryRoot, { recursive: true, force: true });
@@ -268,6 +358,67 @@ test("bootstrap command resolves from --bootstrap-cmd, then repo config, then no
     assert.throws(() => resolveBootstrapCommand({ bootstrap: true, bootstrapCmd: "" }, root), /must be a string/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bootstrapWorker runs the repo hook in the child worktree and records it", () => {
+  const source = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bootstrap-source-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bootstrap-child-"));
+  fs.writeFileSync(path.join(source, ".opencode-dispatch.json"), JSON.stringify({ bootstrap: "printf ran > marker.txt" }));
+  const record = {
+    taskId: "bootstrap-test",
+    worktreePath: worktree,
+    branch: "ai/agent/bootstrap-test",
+    recordPath: path.join(source, "record.json"),
+    sessionId: null,
+  };
+  try {
+    const command = bootstrapWorker(
+      record,
+      { bootstrap: true, bootstrapCmd: "" },
+      { root: source, primaryRoot: source },
+      "http://127.0.0.1:1",
+      { api: "v2", username: "opencode", password: "pw" },
+    );
+    assert.equal(command, "printf ran > marker.txt");
+    assert.equal(fs.readFileSync(path.join(worktree, "marker.txt"), "utf8"), "ran");
+    assert.equal(record.bootstrapCommand, command);
+  } finally {
+    fs.rmSync(source, { recursive: true, force: true });
+    fs.rmSync(worktree, { recursive: true, force: true });
+  }
+});
+
+test("bootstrapWorker falls back to the primary root and surfaces command failures", () => {
+  const source = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bootstrap-source-"));
+  const primary = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bootstrap-primary-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bootstrap-child-"));
+  const record = {
+    taskId: "bootstrap-test",
+    worktreePath: worktree,
+    branch: "ai/agent/bootstrap-test",
+    recordPath: path.join(source, "record.json"),
+    sessionId: null,
+  };
+  const options = { bootstrap: true, bootstrapCmd: "" };
+  const auth = { api: "v2", username: "opencode", password: "pw" };
+  try {
+    fs.writeFileSync(path.join(primary, ".opencode-dispatch.json"), JSON.stringify({ bootstrap: "printf primary > primary.txt" }));
+    const command = bootstrapWorker(record, options, { root: source, primaryRoot: primary }, "http://127.0.0.1:1", auth);
+    assert.equal(command, "printf primary > primary.txt");
+    assert.equal(fs.readFileSync(path.join(worktree, "primary.txt"), "utf8"), "primary");
+
+    fs.writeFileSync(path.join(primary, ".opencode-dispatch.json"), JSON.stringify({ bootstrap: "node missing-bootstrap.mjs" }));
+    assert.throws(
+      () => bootstrapWorker(record, options, { root: source, primaryRoot: primary }, "http://127.0.0.1:1", auth),
+      (error) => /bootstrap failed/.test(error.message)
+        && /missing-bootstrap\.mjs/.test(error.message)
+        && /Cannot find module|MODULE_NOT_FOUND/.test(error.message),
+    );
+  } finally {
+    fs.rmSync(source, { recursive: true, force: true });
+    fs.rmSync(primary, { recursive: true, force: true });
+    fs.rmSync(worktree, { recursive: true, force: true });
   }
 });
 

@@ -25,7 +25,10 @@
 import os from "node:os";
 import path from "node:path";
 
+import credentials from "./server-credentials.cjs";
 import { API_V1, API_V2, DEFAULT_USERNAME, probeServer } from "./api-dialect.mjs";
+
+const { resolveEnvCredential } = credentials;
 
 function normalizeBaseUrl(value) {
   const url = new URL(value || "http://127.0.0.1:4096");
@@ -289,16 +292,20 @@ export class OpenCodeClient {
    */
   constructor({
     baseUrl,
-    username = process.env.OPENCODE_SERVER_USERNAME || DEFAULT_USERNAME,
-    password = process.env.OPENCODE_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD,
+    username,
+    password,
     fetchImpl = globalThis.fetch,
     timeoutMs = 15_000,
     api = "auto",
   } = {}) {
     if (typeof fetchImpl !== "function") throw new Error("Node fetch is unavailable");
     this.baseUrl = normalizeBaseUrl(baseUrl || process.env.OPENCODE_SERVER_URL);
-    this.username = username;
-    this.password = password;
+    // Resolve the address-keyed map only when the caller did not supply a
+    // password; an explicit pair always wins (and must not be rejected because
+    // an unrelated env map is malformed).
+    const environment = password === undefined ? resolveEnvCredential({ baseUrl: this.baseUrl }) : {};
+    this.username = username ?? environment.username ?? process.env.OPENCODE_SERVER_USERNAME ?? DEFAULT_USERNAME;
+    this.password = password ?? environment.password;
     this.fetchImpl = fetchImpl;
     this.timeoutMs = timeoutMs;
     this.apiSetting = api;
@@ -562,11 +569,21 @@ export class OpenCodeClient {
    * v1: POST /session/:id/prompt_async. v2: set agent/model on the session
    * first (they are session state), then POST /api/session/:id/prompt.
    * `model` may be { providerID, id|modelID, variant }.
+   *
+   * `delivery` ("steer" | "queue") is a v2-only admission mode: the prompt is
+   * injected into / queued behind the running turn, and no agent/model is
+   * applied (the running turn keeps its configuration).
    */
-  async promptAsync(sessionId, { directory, text, agent, model, noReply = false } = {}) {
+  async promptAsync(sessionId, { directory, text, agent, model, noReply = false, delivery } = {}) {
     const api = await this.resolveApi();
-    const body = { parts: [{ type: "text", text }], ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(noReply ? { noReply: true } : {}) };
     if (api === API_V2) {
+      if (delivery) {
+        const response = await this.request("POST", `/api/session/${encodeURIComponent(sessionId)}/prompt`, {
+          headers: this.locationHeaders(directory),
+          body: { text, delivery },
+        });
+        return response?.data;
+      }
       if (agent) await this.setSessionAgent(sessionId, agent, { directory });
       if (model) {
         const ref = { providerID: model.providerID, id: model.id || model.modelID, ...(model.variant ? { variant: model.variant } : {}) };
@@ -578,10 +595,11 @@ export class OpenCodeClient {
       });
       return response?.data;
     }
+    if (delivery) throw new OpenCodeServerError("steer/queue delivery is a v2 capability", { status: 0 });
     return this.request("POST", `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
       query: { directory },
       body: {
-        parts: body.parts,
+        parts: [{ type: "text", text }],
         ...(agent ? { agent } : {}),
         ...(model ? { model: { providerID: model.providerID, modelID: model.id || model.modelID } } : {}),
         ...(model?.variant ? { variant: model.variant } : {}),

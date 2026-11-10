@@ -6,7 +6,7 @@
     "_bin": "Optional 'bin': the opencode client binary paired with THIS server's generation (per-profile; default PATH `opencode`). A v2 binary cannot drive a v1 server and vice versa; see COMPATIBILITY.md.",
     "_username_password": "Optional per-profile 'username'/'password'. When omitted, the top-level address-keyed 'credentials' map is consulted, then the single OPENCODE_SERVER_PASSWORD/OPENCODE_PASSWORD fallback.",
     "_credentials": "Address-keyed credentials: keys are 'host', 'host:port', or a full URL; values are a password string or {username, password}. More specific (host:port) beats host. OPENCODE_SERVER_CREDENTIALS (a JSON object in the environment/.env.local) overrides this map. Precedence: env map > profile fields > this map > single env password.",
-    "_password_note": "Required when 'listen' is non-loopback. v1 clients read it via OPENCODE_SERVER_PASSWORD; v2 clients prefer OPENCODE_PASSWORD (both are exported for launched clients)."
+    "_password_note": "Required when 'listen' is non-loopback, and for any v2 'opencode serve' (v2 always enables basic auth and invents a random password when none is supplied). v1 clients read it via OPENCODE_SERVER_PASSWORD; v2 clients prefer OPENCODE_PASSWORD (both are exported for launched clients)."
   },
   "credentials": {
     "192.0.2.50": { "password": "REPLACE_ME" },

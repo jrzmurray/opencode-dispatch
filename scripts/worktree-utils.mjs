@@ -289,6 +289,51 @@ export function sleepSync(milliseconds) {
   }
 }
 
+function lockOwnerPid(lockPath) {
+  try {
+    const owner = JSON.parse(fs.readFileSync(path.join(lockPath, "owner.json"), "utf8"));
+    const pid = Number(owner?.pid);
+    return Number.isInteger(pid) && pid > 0 ? pid : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Remove a registry lock whose recorded owner is gone. A short-lived sibling
+ * lock serializes stale-lock removal so two waiters cannot both remove the
+ * lock or remove a replacement lock. A lock without owner.json is left alone
+ * because its owner may be writing it. Returns true when acquisition should
+ * retry immediately.
+ */
+function clearStaleAgentLock(lockPath) {
+  const reclaimPath = `${lockPath}.reclaim`;
+  try {
+    fs.mkdirSync(reclaimPath, { mode: 0o700 });
+  } catch (error) {
+    // The lock disappeared before we could claim its recovery step.
+    if (error?.code === "ENOENT") return true;
+    if (error?.code === "EEXIST") return false;
+    throw error;
+  }
+
+  try {
+    fs.writeFileSync(path.join(reclaimPath, "owner.json"), `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`, {
+      mode: 0o600,
+    });
+    const ownerPid = lockOwnerPid(lockPath);
+    if (!ownerPid || processIsAlive(ownerPid)) return false;
+
+    // Keep the reclaim lock until the stale registry lock is gone. Normal
+    // acquisitions may proceed after rmSync, but no second reclaimer can
+    // inspect and remove a newly created lock until this guard is released.
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  } finally {
+    fs.rmSync(reclaimPath, { recursive: true, force: true });
+  }
+}
+
 export function withAgentLock(layout, callback) {
   fs.mkdirSync(layout.root, { recursive: true, mode: 0o700 });
   const lockPath = layout.lockPath;
@@ -313,8 +358,9 @@ export function withAgentLock(layout, callback) {
         // lock, so removing it here would clobber another process's mutex.
         throw error;
       }
+      if (clearStaleAgentLock(lockPath)) continue;
       if (Date.now() - started >= LOCK_WAIT_MS) {
-        throw new Error(`agent worktree registry is locked: ${lockPath}; inspect or remove that exact stale lock if no owner is running`);
+        throw new Error(`agent worktree registry is locked: ${lockPath}; inspect or remove that exact stale lock (and ${lockPath}.reclaim if recovery was interrupted) if no owner is running`);
       }
       sleepSync(LOCK_POLL_MS);
     }
@@ -349,8 +395,9 @@ export async function withAgentLockAsync(layout, callback) {
         // lock, so removing it here would clobber another process's mutex.
         throw error;
       }
+      if (clearStaleAgentLock(lockPath)) continue;
       if (Date.now() - started >= LOCK_WAIT_MS) {
-        throw new Error(`agent worktree registry is locked: ${lockPath}; inspect or remove that exact stale lock if no owner is running`);
+        throw new Error(`agent worktree registry is locked: ${lockPath}; inspect or remove that exact stale lock (and ${lockPath}.reclaim if recovery was interrupted) if no owner is running`);
       }
       await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
     }

@@ -33,6 +33,42 @@ test("the keyed layers are address-scoped and the single env value is only a fal
     { username: "env-user", password: "env-pw", source: "env:192.0.2.50:4096" },
   );
 
+  // Credential layers win per field, so a partial higher-priority entry does
+  // not hide the other half of a pair supplied by a lower layer.
+  assert.deepEqual(
+    resolveCredential({
+      host: "203.0.113.9",
+      port: 4096,
+      profile: { username: "profile-user", password: "profile-pw" },
+      serverCredentials: {},
+      envCredentials: JSON.stringify({ "203.0.113.9:4096": { username: "env-user" } }),
+      env,
+    }),
+    { username: "env-user", password: "profile-pw", source: "env:203.0.113.9:4096" },
+  );
+  assert.deepEqual(
+    resolveCredential({
+      host: "192.0.2.50",
+      port: 4096,
+      profile: { username: "profile-user" },
+      serverCredentials: fileMap,
+      envCredentials: "",
+      env,
+    }),
+    { username: "profile-user", password: "file-port-pw", source: "profile" },
+  );
+  assert.deepEqual(
+    resolveCredential({
+      host: "203.0.113.9",
+      port: 4096,
+      profile: { username: "profile-user" },
+      serverCredentials: {},
+      envCredentials: JSON.stringify({ "203.0.113.9:4096": { username: "env-user" } }),
+      env,
+    }),
+    { username: "env-user", password: "global-pw", source: "env:203.0.113.9:4096" },
+  );
+
   // The profile owns its own credential.
   assert.deepEqual(
     resolveCredential({ host: "203.0.113.9", port: 4096, profile: project, serverCredentials: fileMap, envCredentials: "", env }),
@@ -64,10 +100,29 @@ test("the keyed layers are address-scoped and the single env value is only a fal
   );
 });
 
-test("a malformed keyed map is rejected instead of silently ignored", () => {
-  assert.throws(() => normalizeMap("{not json}", "OPENCODE_SERVER_CREDENTIALS"), /must be a JSON object/);
-  assert.throws(() => normalizeMap(["a"], "servers.json credentials"), /must be a JSON object/);
+test("the keyed map accepts JSON and the JavaScript-style object form", () => {
   assert.deepEqual(normalizeMap('{"127.0.0.1": "pw"}'), { "127.0.0.1": { password: "pw" } });
+  assert.deepEqual(normalizeMap("{127.0.0.1:4096:{password:<password>}}"), {
+    "127.0.0.1:4096": { password: "<password>" },
+  });
+  assert.deepEqual(normalizeMap("{127.0.0.1:4096:plain-pw}"), {
+    "127.0.0.1:4096": { password: "plain-pw" },
+  });
+  assert.deepEqual(normalizeMap("{127.0.0.1:4096:{username:me,password:p@ss:word}}"), {
+    "127.0.0.1:4096": { username: "me", password: "p@ss:word" },
+  });
+  assert.deepEqual(normalizeMap("{[::1]:4096:{password:pw}}"), {
+    "::1:4096": { password: "pw" },
+  });
+  assert.deepEqual(normalizeMap('{https://example.com:4096:{password:"a,b}"}}'), {
+    "example.com:4096": { password: "a,b}" },
+  });
+});
+
+test("a malformed keyed map is rejected instead of silently ignored", () => {
+  assert.throws(() => normalizeMap("{not json}", "OPENCODE_SERVER_CREDENTIALS"), /must be an object keyed by host/);
+  assert.throws(() => normalizeMap(["a"], "servers.json credentials"), /must be an object keyed by host/);
+  assert.throws(() => normalizeMap("{127.0.0.1:4096:{password:unterminated}", "OPENCODE_SERVER_CREDENTIALS"), /unclosed object/);
 });
 
 test("profile resolution keeps endpoint precedence and skips non-profiles", () => {

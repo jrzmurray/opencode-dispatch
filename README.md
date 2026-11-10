@@ -25,7 +25,7 @@ worker scripts are documented under "Agent launcher scripts" below.
 | `scripts/opencode-guard.sh` | `~/.claude/scripts/opencode-guard.sh` | PreToolUse hook (Bash matcher) that throws if `opencode-dispatch.sh` output is piped through `tail`. |
 | `commands/opencode/*.md` | `~/.claude/commands/opencode/` | Claude Code slash-command instructions. |
 | `install.sh` | not installed | Installs the surfaces above, registers the tail-guard hook in `~/.claude/settings.json` (merged, never clobbered), and copies the config samples (`config/opencode.json`, `config/servers.json.example`) into `~/.config/…` only when no file exists there yet. It never reads or writes provider credentials. |
-| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`, `api-dialect.mjs`, `oc-api.mjs`) | `~/.claude/scripts/` (installed next to the dispatcher) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, cleans up, and owns the v1/v2 API dialect layer. |
+| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`, `api-dialect.mjs`, `oc-api.mjs`, `agent-config.mjs`, `server-profiles.mjs`, `server-credentials.cjs`, `prune-named-sessions.mjs`) | `~/.claude/scripts/` (installed next to the dispatcher) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, cleans up, prunes old named sessions, resolves profiles/credentials, and owns the v1/v2 API dialect layer. |
 
 The skill repository is not the worker repository. `install.sh` installs the
 launcher scripts next to `opencode-dispatch.sh`, and the dispatcher finds them
@@ -52,8 +52,8 @@ What each item is actually needed for:
   `--codex` needs Codex with plugin support. The read-only Claude modes need
   only OpenCode + Node.
 - **An authenticated OpenCode provider** — run `opencode auth login` once per
-  provider. opencode stores credentials itself; never set API keys in
-  environment variables or config files.
+  provider. The dispatcher uses OpenCode's own credential store; the separate
+  Go usage script can also read `OPENCODE_GO_API_KEYS` as described below.
 - **The launcher scripts (`scripts/*.mjs`, in this repo)** — only the
   edit-capable `task` and `bulk` modes need them: `spawn-agent.mjs`,
   `worktree-utils.mjs`, `opencode-server.mjs`, `agent-worker-guard.mjs`,
@@ -231,6 +231,22 @@ bin         opencode client binary paired with THIS profile's generation
 `setup` shows each profile's live dialect and the resolved profile's binary
 pairing status.
 
+### Agent model resolution
+
+A per-agent `model` in `opencode.json` is honored on both generations. Run
+modes resolve the selected agent's effective model through the client binary's
+normalized `opencode debug config` output and send it explicitly when the
+session is created/submitted (v2 otherwise leaves the session model empty and
+falls back to the server default). Precedence:
+
+1. `--model` / `OPENCODE_DISPATCH_MODEL` (explicit)
+2. the selected agent's `model` from `opencode.json`
+3. the profile's `model` default
+
+`--effort` / `--variant` override the agent's configured variant. If the binary
+does not support `debug config` (older v1) or the config cannot be read, the
+dispatcher leaves the model unset and relies on the server's own resolution.
+
 ### Credentials (`.env.local`)
 
 ```bash
@@ -240,10 +256,23 @@ $EDITOR .env.local                  # to the installed scripts
 
 `.env.local` accepts `OPENCODE_SERVER_USERNAME`, the password names
 `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` (one slot), and
-`OPENCODE_SERVER_CREDENTIALS` — a JSON object keyed by `host`, `host:port`, or
-a full URL. An exported shell variable always wins over the file, and the
-v1/v2 password names share one slot (neither file value overrides an exported
+`OPENCODE_SERVER_CREDENTIALS` — an object keyed by `host`, `host:port`, or a
+full URL. An exported shell variable always wins over the file, and the v1/v2
+password names share one slot (neither file value overrides an exported
 variable under the other name).
+
+`OPENCODE_SERVER_CREDENTIALS` accepts JSON and the JavaScript-style form used
+by older instructions (unquoted keys and values):
+
+```bash
+OPENCODE_SERVER_CREDENTIALS='{127.0.0.1:4096:{password:"secret"}}'
+OPENCODE_SERVER_CREDENTIALS='{127.0.0.1:4096:{username:me,password:secret}}'
+OPENCODE_SERVER_CREDENTIALS='{127.0.0.1:4096:secret}'
+```
+
+Both forms are parsed by one shared parser, so the dispatcher, profile
+resolver, prune script, and tests accept the same syntax. Quote a password that
+contains a comma, closing brace, or trailing whitespace.
 
 Resolution for each request is by the address actually used:
 
@@ -269,6 +298,22 @@ commands rely on. The installer copies it to `~/.config/opencode/opencode.json`
 only when no config exists there yet; it never modifies it beyond that
 copy-if-absent step. Manage it by hand or with `/opencode:model`; restart the
 server for changes to take effect.
+
+### OpenCode Go usage
+
+Run `node scripts/opencode-go-usage.mjs` to print the rolling, weekly, and
+monthly Go usage percentages. It gathers `OPENCODE_GO_API_KEYS` and
+`OPENCODE_API_KEY` from the shell, `.env.local`, or `.env` (shell values win;
+`.env.local` wins over `.env`), Go provider keys from
+`~/.config/opencode/opencode.json` or `opencode.jsonc`, and Go credentials from
+OpenCode's legacy auth file or SQLite credential store. Duplicate keys are
+checked once, and the script never prints key values.
+
+The module can also be imported without running the CLI. It exports
+`getOpenCodeGoUsage(apiKey)`, `getOpenCodeGoUsages(apiKeys)`, and
+`getConfiguredOpenCodeGoUsages()`. Each returns numeric `rolling`, `weekly`,
+and `monthly` percentages; the configured variant also includes credential
+source labels but never returns key values.
 
 ### Orchestration scripts
 
@@ -314,8 +359,18 @@ it (cwd = the child worktree). The command is chosen by, in order:
 `AGENT_*` (task id, worktree path, branch, record) plus `WORKTREE_TASK_ID`,
 `WORKTREE_SOURCE_PATH`, `WORKTREE_ORIGIN=spawned-agent`,
 `WORKTREE_BOOTSTRAP_CHILD=0`, and `WORKTREE_SESSION_START=0`. A non-zero exit
-rolls the task back. The config file is read from the source checkout and
-executed as shell, so treat it like any other repo-controlled script.
+rolls the task back. The config file is read from the source checkout
+(falling back to the primary repository root for a linked worktree) and executed
+as shell, so treat it like any other repo-controlled script.
+
+The hook runs **in the child worktree**, which contains tracked files only. A
+command that references an untracked script (for example
+`node scripts/agent/bootstrap-worktree.mjs`) fails there even if the script
+exists in your source checkout: commit it, or pass `--bootstrap-cmd` with an
+absolute path. `/opencode:task` forwards `--bootstrap-cmd` and prints the
+resolved hook (or `(none)`) in its started block, and `spawn-agent` reports
+`bootstrap: <cmd>` / `bootstrap: ok` / a failure with the command's stderr on
+stderr.
 
 ### Environment variables
 
@@ -330,13 +385,16 @@ executed as shell, so treat it like any other repo-controlled script.
 | `OPENCODE_DISPATCH_SERVERS` | Server definitions file (default `~/.config/opencode-dispatch/servers.json`). |
 | `OPENCODE_SERVER_PASSWORD` | Fallback password for profiles with no address-keyed credential; the v1 name (still read by v2 clients); exported to launched clients. |
 | `OPENCODE_PASSWORD` | v2 name for the same fallback password slot (preferred by v2 clients). |
-| `OPENCODE_SERVER_CREDENTIALS` | JSON object of credentials keyed by `host`, `host:port`, or URL; overrides `servers.json` and profile fields. |
+| `OPENCODE_SERVER_CREDENTIALS` | Credential object keyed by `host`, `host:port`, or URL; accepts JSON and the JavaScript-style `{host:port:{password:pw}}` form. Overrides `servers.json` and profile fields. |
 | `OPENCODE_SERVER_USERNAME` | Fallback v1 basic-auth username (default `opencode`); v2 fixes the username to `opencode`. |
 | `OPENCODE_DISPATCH_ENV_FILE` | Explicit path to a `.env.local`-style credential file. |
+| `OPENCODE_GO_API_KEYS` | Optional comma/space-separated list (or JSON array) of Go API keys for `scripts/opencode-go-usage.mjs`; exact duplicates are checked once. |
+| `OPENCODE_API_KEY` | Optional single Go API key for `scripts/opencode-go-usage.mjs`; `.env.local` overrides `.env`, while an exported shell value wins over both. |
 | `OPENCODE_SESSION_ID` / `_SLUG` / `_TITLE` / `_AGENT` / `_MODEL` / `_DIRECTORY` | The **executing** session's own identity, injected into every tool shell by the `opencode-identity` plugin (`plugins/opencode-identity.js`, installed to `~/.config/opencode/plugins/`). Parents and subagents each see their own id — the basis for `identify` / `claim`. |
 | `OPENCODE_STALENESS_FETCH_TTL` / `OPENCODE_STALENESS_NUDGE_AT` / `OPENCODE_STALENESS_HOT_PATHS` | Tuning for the `opencode-branch-staleness` plugin: seconds between real `git fetch`es (default 300), commits-behind threshold for escalated wording (default 25), and optional comma-separated paths whose changes are called out explicitly. |
 | `OPENCODE_DISPATCH_MODEL` | Default `provider/model` for dispatch. |
 | `AGENT_WORKTREE_ROOT` | Generic allocation root. |
+| `AGENT_REGISTRY_ROOT` | Override the worker registry directory (used by the launcher and the session pruner). |
 | `AGENT_BRANCH_PREFIX` | Generic worker branch prefix. |
 | `AGENT_LOCK_TIMEOUT_MS` | Allocation lock wait timeout. |
 | `OPENCODE_DISPATCH_STALL_SECS` | Default `--background` inactivity threshold; `0` disables it. |
@@ -644,6 +702,41 @@ to run manually is printed instead.
 
 Branch commits are kept unless `--delete-branch` is given to `agent-cleanup.mjs`.
 Uncommitted work is **not** recoverable after teardown; have the worker commit first.
+
+### Pruning old named sessions
+
+OpenCode auto-names sessions with a suffix such as `agent — brave-canyon` or
+`review PR #42 — calm-wizard`. To remove those older than 24 hours:
+
+```bash
+node scripts/prune-named-sessions.mjs                    # report only
+node scripts/prune-named-sessions.mjs --apply            # delete
+node scripts/prune-named-sessions.mjs --hours 48 --apply
+```
+
+Every match with an opencode-dispatch worker record is removed with
+`teardown --task <id>` (worktree and session) and its JSON result is checked for
+`database.deleted`; a teardown that reports the rows were not cleaned counts as
+a failure. Sessions without a worker record (reviews, TUI sessions, subagents)
+are removed with `teardown --session <id>`, which uses the native server delete
+and its child-session cascade. The script is a dry run unless `--apply` is
+passed; `--force` forwards teardown's force checks, and `--managed-only` leaves
+unmanaged sessions alone.
+
+Because the native delete cascades to child sessions, the script skips a
+matching parent when any descendant is outside the selection (fresh, a
+different title, the current session, or unmanaged under `--managed-only`).
+`--cascade` explicitly allows that broader deletion. Custom registry layouts are
+found through `AGENT_REGISTRY_ROOT` or `--registry-root`; if a worker's source
+checkout is gone, the session is deleted without worktree cleanup and the result
+is marked as a fallback. The suffix must match the session's `slug` when the
+server supplies one, avoiding false positives such as `Fix bug — Windows-11`.
+
+Server credentials come from the same environment as the dispatcher:
+`OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD`, and
+`OPENCODE_SERVER_CREDENTIALS`. The script also loads those four keys from
+`$OPENCODE_DISPATCH_ENV_FILE`, a `.env.local` next to the dispatcher or script,
+or `~/.claude/scripts/.env.local`; exported variables always win.
 
 ## Safety rules
 

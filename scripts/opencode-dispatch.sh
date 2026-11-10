@@ -43,7 +43,7 @@
 #             24h-backstop completion loop as the run modes (stall guard,
 #             parked-permission heartbeat, distilled reply, exit codes 3/7/8).
 #             --steer injects into the running turn; --queue appends after the
-#             current turn (both synchronous, no reply loop).
+#             current turn (both v2-only, synchronous, no reply loop).
 #   abort     Interrupt the in-progress turn of a session. <sessionID> required.
 #   permissions  List pending permission requests on the server (request id,
 #                permission, patterns, session, tool). A WORKING-but-frozen
@@ -157,6 +157,9 @@
 #                             worktree lifecycle helpers (task/bulk). Default:
 #                             this script's own dir (install.sh puts them
 #                             there), else <--dir>/scripts.
+#   --bootstrap-cmd <cmd>     (task/bulk) override the repo bootstrap hook for
+#                             this task (default: "bootstrap" in
+#                             <repo>/.opencode-dispatch.json).
 #   --task <id>               Resolve a worker task record for lifecycle commands.
 #   --teardown                (task/bulk with --background/--wait) when the turn completes
 #                             successfully, automatically run the teardown described under
@@ -177,8 +180,8 @@
 #                             loop (24h backstop, stall guard, exit codes 3/7/8)
 #   --background              (send) same completion loop as --wait (equivalent
 #                             code path; caller-side launch convention only)
-#   --steer                   (send) inject into the in-progress turn
-#   --queue                   (send) append after the current turn
+#   --steer                   (send, v2) inject into the in-progress turn
+#   --queue                   (send, v2) append after the current turn
 #   --port <N>                Server port (profile field, or $OPENCODE_DISPATCH_PORT, or 4096)
 #   --host <addr>             Server ADDRESSABLE host — how the dispatcher reaches the
 #                             server (profile field, or $OPENCODE_DISPATCH_HOST, or the
@@ -287,8 +290,9 @@ Modes:
   ask         Read-only question answering (agent 'plan').
   task        Agentic build task in a freshly allocated worktree (agent 'auto').
   bulk        Same as task, for background/batch work.
-  serve       Start/confirm the persistent server; also --stop / --restart.
-  sessions    List sessions from the server (id, updated, title).
+  serve       Start/confirm the private server (v1 or v2); also --stop / --restart.
+  sessions    List sessions from the server (id, updated, title); --json emits
+              the raw normalized list.
   status      Liveness of a session (or a one-line summary of all sessions);
               --follow keeps polling until the session is idle.
   history     Print a session transcript (bound with --tail/--turns/--since).
@@ -298,10 +302,14 @@ Modes:
               80 bytes of the first 5), delete the worktree, and delete the session's
               rows from the OpenCode database (session + event_sequence).
               Usage: teardown --task <taskID> [--force]
-              Requires: a task/bulk worker record; worker process exited; no active
-              turn; server reachable with a session directory matching the worktree
-              (unreachable = unknown = refused); sqlite3 + the DB file for the DB step
-              (else the worktree is still removed and the DB is reported not cleaned).
+                     teardown --session <sessionID> [--dir <path>]
+              --session deletes one session through the native server API without
+              requiring a worker record (used for sessions that have no worktree).
+              Requires (--task): a task/bulk worker record; worker process exited; no
+              active turn; server reachable with a session directory matching the
+              worktree (unreachable = unknown = refused); sqlite3 + the DB file for the
+              DB step (else the worktree is still removed and the DB is reported not
+              cleaned).
               --force aborts the session and kills the matching process first.
   permissions List pending permission requests on the server.
   allow       Approve a pending permission request (--always remembers it).
@@ -337,7 +345,7 @@ Run-mode flags (review|plan|ask|task|bulk):
                       positional prompt text
                       is also accepted (space-joined); the two are mutually
                       exclusive.
-  --json              With --direct: raw JSON events.
+  --json              With --direct: raw JSON events. With sessions: a JSON array.
 
 Send flags (send):
   --background/--wait Select the completion loop (24h backstop, stall guard,
@@ -366,6 +374,8 @@ Task/bulk-only flags:
   --orchestration-root <p>  Directory with spawn-agent.mjs + worktree helpers
                       (default: next to this script, where install.sh puts them).
   --worktree-root <p>  Override the worktree allocation root.
+  --bootstrap-cmd <cmd>  Override the repo bootstrap hook for this task
+                      (default: "bootstrap" from <repo>/.opencode-dispatch.json).
   --teardown          With --background/--wait: after a clean completion, list
                       leftover files (80 bytes of the first 5), remove the
                       worktree, and delete the session's DB rows. Or run it
@@ -398,8 +408,8 @@ Session/control flags:
   --tail <N>          (history/sessions) keep only the last N lines/entries.
   --turns <N>         (history) keep only the last N prompts + their responses.
   --since <range>     (history) only messages newer than now-range (1d/6h/10m/30s).
-  --steer             (send) inject into the in-progress turn.
-  --queue             (send) append after the current turn.
+  --steer             (send, v2) inject into the in-progress turn.
+  --queue             (send, v2) append after the current turn.
   --always            (allow) also remember the pattern for the session.
   --port <N>          Server port (profile field, or $OPENCODE_DISPATCH_PORT, or 4096).
   --host <addr>       Server ADDRESSABLE host — how the dispatcher reaches the
@@ -441,9 +451,15 @@ for _a in "$@"; do
 done
 
 MODEL="${OPENCODE_DISPATCH_MODEL:-}"
+# An explicit model (CLI/env) always wins. The profile's "model" is only a
+# default: a per-agent model from opencode.json is more specific and is
+# resolved below when no explicit model was given.
+MODEL_EXPLICIT=""
+[ -n "$MODEL" ] && MODEL_EXPLICIT=1
 AGENT=""
 VARIANT=""
 EFFORT=""
+BOOTSTRAP_CMD=""
 BASE=""
 REPO=""
 PR=""
@@ -502,11 +518,12 @@ STOP=""
 RESTART=""
 TEARDOWN=""
 TEARDOWN_FORCE=""
+TEARDOWN_SESSION=""
 MSG_PARTS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --model)             MODEL="${2:-}"; shift 2 ;;
+    --model)             MODEL="${2:-}"; MODEL_EXPLICIT=1; shift 2 ;;
     --agent)             AGENT="${2:-}"; shift 2 ;;
     --effort)            EFFORT="${2:-}"; shift 2 ;;
     --variant)           VARIANT="${2:-}"; shift 2 ;;
@@ -534,8 +551,10 @@ while [ $# -gt 0 ]; do
     --require-dir)       REQUIRE_DIR=1; shift ;;
     --orchestration-root) ORCHESTRATION_ROOT="${2:-}"; shift 2 ;;
     --worktree-root)     WORKTREE_ROOT="${2:-}"; shift 2 ;;
+    --bootstrap-cmd)     BOOTSTRAP_CMD="${2:-}"; shift 2 ;;
     --task)              TASK_ID="${2:-}"; shift 2 ;;
     --teardown)          TEARDOWN=1; shift ;;
+    --session)           TEARDOWN_SESSION="${2:-}"; shift 2 ;;
     --force)             TEARDOWN_FORCE=1; shift ;;
     --port)              PORT="${2:-}"; PORT_SET=1; shift 2 ;;
     --host)              HOST="${2:-}"; HOST_SET=1; shift 2 ;;
@@ -566,8 +585,8 @@ case "$SERVER_NAME" in
 esac
 # API dialect selection: CLI --api > $OPENCODE_DISPATCH_API > profile 'api'
 # field > auto (probe the server). v1 is the legacy/LTS API surface; v2 is the
-# revised API on opencode 2.x. Modes that are not v2-ready refuse to run
-# against a v2 server with a clear message instead of issuing v1 calls.
+# revised API on opencode 2.x. The adapter (oc-api/opencode-server) owns the
+# wire differences; all server-backed modes speak both.
 case "${API_SETTING:-auto}" in
   ""|auto|v1|v2) API_SETTING="${API_SETTING:-auto}" ;;
   *) echo "error: --api / OPENCODE_DISPATCH_API must be auto|v1|v2 (got: '$API_SETTING')" >&2; exit 2 ;;
@@ -776,7 +795,13 @@ esac
 # the caller set --timeout (0 = unbounded). --follow keeps its 300s default.
 if [ -n "$AWAIT" ] && [ -z "$TIMEOUT_SET" ]; then FOLLOW_TIMEOUT="86400"; fi
 
-server_up() { curl -sf -m 3 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" -o /dev/null 2>/dev/null; }
+# Dialect-aware reachability: v1 answers /session, v2 answers /api/info (its
+# /session URL is the web UI). Any authenticated response counts as up.
+server_up() {
+  local out
+  out="$(oc_api detect --server "$BASE_URL" --json 2>/dev/null)" || true
+  [ "$(json_field "$out" serverUp)" = "true" ]
+}
 
 # all_asks </permission|/question> [timeout-s] — print the merged JSON array of
 # open asks across EVERY directory the server has a session in. The ask queues
@@ -939,18 +964,6 @@ require_server() {
   fi
 }
 
-# Refuse server-backed modes that still speak the v1 API against a v2 server.
-# They fail with a clear message instead of issuing calls that cannot work.
-require_v1_mode() {  # $1 = mode label
-  local api; api="$(resolve_api)"
-  if [ "$api" = "v2" ]; then
-    echo "error: '$1' is not v2-ready yet; this dispatch still speaks the v1 server API for it." >&2
-    echo "  v2-ready today: setup, sessions, status, history, follow, identify, claim, teardown." >&2
-    echo "  See COMPATIBILITY.md for the support matrix." >&2
-    exit 2
-  fi
-}
-
 # Pairing line for setup (never fails the invocation).
 pairing_report() {
   local out severity reason api
@@ -980,10 +993,34 @@ check_pairing() {
   esac
 }
 
+# v2's `opencode serve` ALWAYS enables basic auth and invents a random password
+# when none is supplied. That password is printed to the log, not shared with
+# the dispatcher's HTTP clients, so starting without one produces a server every
+# later call gets 401 from. Refuse before launching instead.
+v2_serve_password_error() {
+  echo "error: profile '$SERVER_NAME' is v2 (or its binary is), and 'opencode serve' v2 always requires basic auth." >&2
+  echo "  With no password, v2 generates a random one that this dispatcher cannot know." >&2
+  echo "  Set a password for the profile: servers.json \"password\", OPENCODE_SERVER_CREDENTIALS, or OPENCODE_SERVER_PASSWORD." >&2
+}
+
 SERVE_LOG=""
 start_server() {  # $1=dir (default $DIR) $2=port (default $PORT) $3=listen (default $LISTEN) $4=password
   local dir="${1:-$DIR}" port="${2:-$PORT}" listen="${3:-$LISTEN}" pass="${4:-$SERVE_PASSWORD}"
   require_client_bin
+  SERVE_LOG=""
+  # The profile's pin is checked first so a v2 profile with no binary (or one
+  # whose version cannot be parsed) still fails closed. Otherwise ask the
+  # binary; only v2 needs this preflight (v1 can serve loopback without auth).
+  if [ -z "$pass" ]; then
+    if [ "$API_SETTING" = "v2" ]; then
+      v2_serve_password_error
+      return 2
+    fi
+    if [ "$(client_generation)" = "2" ]; then
+      v2_serve_password_error
+      return 2
+    fi
+  fi
   local logdir="${TMPDIR:-/tmp}/opencode-serve"; mkdir -p "$logdir"
   SERVE_LOG="$logdir/serve-${port}.log"
   # The server must read the SAME resolved pair the clients receive. Set both
@@ -1028,12 +1065,26 @@ refresh_credentials() {
   return 0
 }
 
-# After start_server: the started server must speak v1 for the v1-only modes
-# (a v2 binary serves the v2 API, which those paths cannot drive).
-require_started_v1() {
-  if resolve_report && [ "$RESOLVED_API" != "v1" ]; then
-    echo "error: $(client_bin) started a $RESOLVED_API server at $BASE_URL, but this mode still speaks the v1 API." >&2
-    echo "  Set this profile's \"bin\" to an opencode 1.18.x binary (see COMPATIBILITY.md)." >&2
+# After start_server: require a reachable, classified server. Both dialects are
+# supported now, so this only catches an auth-rejected or unclassifiable start
+# (a v2 binary is accepted rather than rejected as it was during the rollout).
+require_started_server() {
+  if ! resolve_report; then
+    echo "error: $(client_bin) started a server at $BASE_URL, but it could not be classified." >&2
+    if [ -n "$RESOLVED_REPORT" ] && [ -n "$(report_field detail)" ]; then
+      echo "  $(report_field detail)" >&2
+    fi
+    [ -n "$SERVE_LOG" ] && echo "  See $SERVE_LOG" >&2
+    return 1
+  fi
+  # A classified server is not necessarily a usable one: v2 serves its web UI
+  # publicly, so the API can be identified while /api/info is still 401. Without
+  # this check `serve` reported success on a server no client could use.
+  if [ "$(report_field authOk)" != "true" ]; then
+    echo "error: $(client_bin) started a server at $BASE_URL, but authentication was not accepted." >&2
+    [ -n "$(report_field detail)" ] && echo "  $(report_field detail)" >&2
+    echo "  Set the profile's password to the server's credential (or OPENCODE_SERVER_CREDENTIALS)." >&2
+    [ -n "$SERVE_LOG" ] && echo "  See $SERVE_LOG" >&2
     return 1
   fi
   return 0
@@ -1118,25 +1169,39 @@ stop_server() {  # stop the recorded server (or an explicitly-named --port/--hos
 }
 
 ensure_server() {  # auto-start in $DIR if none is reachable
-  server_up && return 0
+  if server_up; then
+    # Reachable is not necessarily usable: a v2 server whose password is wrong
+    # (or a service whose generated password we do not know) answers here but
+    # 401s every real call. Fail with the auth detail now.
+    require_server
+    return 0
+  fi
   echo "no opencode server ($SERVER_NAME) at $BASE_URL — starting one in ${DIR}…" >&2
-  start_server "$DIR" || { echo "error: server did not start; see $SERVE_LOG" >&2; exit 6; }
-  # These paths drive the v1 API; a v2 binary would have started a v2 server.
-  require_started_v1 || exit 2
+  local rc=0
+  start_server "$DIR" || rc=$?
+  # 2 = a preflight refusal (already explained); do not bury it under "did not
+  # start" or point at a log that was never created.
+  [ "$rc" -eq 2 ] && exit 2
+  if [ "$rc" -ne 0 ]; then
+    echo "error: server did not start." >&2
+    [ -n "$SERVE_LOG" ] && echo "  See $SERVE_LOG" >&2
+    exit 6
+  fi
+  # The profile's binary decides the dialect; run modes speak both.
+  require_started_server || exit 2
 }
 
 # --- server API helpers (used by the default server-backed run path) ---
 oc_create_session() {  # $1=agent $2=model $3=variant $4=title $5=permJson(optional) -> echoes id
-  AGENT="$1" MODEL="$2" VARIANT="$3" TITLE="$4" PERM="${5:-}" node -e '
-    const b={title:process.env.TITLE};
-    if(process.env.AGENT) b.agent=process.env.AGENT;
-    if(process.env.MODEL){const i=process.env.MODEL.indexOf("/");
-      b.model={providerID:process.env.MODEL.slice(0,i), id:process.env.MODEL.slice(i+1)};
-      if(process.env.VARIANT) b.model.variant=process.env.VARIANT;}
-    if(process.env.PERM) b.permission=JSON.parse(process.env.PERM);
-    process.stdout.write(JSON.stringify(b));' \
-  | curl -sf -m 15 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/session?$DIR_Q" -H 'content-type: application/json' --data-binary @- \
-  | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).id)}catch(e){process.exit(1)}});'
+  # Dialect differences (v1 POST /session vs v2 POST /api/session with
+  # location + permissions, model shape) live in oc-api.
+  local args=( create --server "$BASE_URL" --dir "$DIR" )
+  [ -n "${1:-}" ] && args+=( --agent "$1" )
+  [ -n "${2:-}" ] && args+=( --model "$2" )
+  [ -n "${3:-}" ] && args+=( --variant "$3" )
+  [ -n "${4:-}" ] && args+=( --title "$4" )
+  [ -n "${5:-}" ] && args+=( --permission "$5" )
+  oc_api "${args[@]}"
 }
 
 # The agent MUST be repeated on the prompt. The agent passed to POST /session is
@@ -1154,16 +1219,16 @@ oc_create_session() {  # $1=agent $2=model $3=variant $4=title $5=permJson(optio
 # POST /session/{id}/prompt_async: model is {providerID, modelID} (note:
 # modelID here, NOT `id` as on session create), and variant is a top-level
 # sibling field, not nested under model.
-oc_submit_async() {  # $1=sessionId $2=path-to-message-text-file $3=agent(optional) $4=model(optional provider/model) $5=variant(optional)
-  MSGFILE="$2" AGENT_ID="${3:-}" MODEL_ID="${4:-}" VARIANT_ID="${5:-}" node -e '
-    const fs=require("fs");
-    const b={parts:[{type:"text",text:fs.readFileSync(process.env.MSGFILE,"utf8")}]};
-    if(process.env.AGENT_ID) b.agent=process.env.AGENT_ID;
-    if(process.env.MODEL_ID){const m=process.env.MODEL_ID,i=m.indexOf("/");
-      b.model={providerID:m.slice(0,i), modelID:m.slice(i+1)};}
-    if(process.env.VARIANT_ID) b.variant=process.env.VARIANT_ID;
-    process.stdout.write(JSON.stringify(b));' \
-  | curl -sf -m 20 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/session/$1/prompt_async?$DIR_Q" -H 'content-type: application/json' --data-binary @-
+oc_submit_async() {  # $1=sessionId $2=path-to-message-text-file $3=agent(optional) $4=model(optional provider/model) $5=variant(optional) $6=baseline-id(optional)
+  # v1 POSTs prompt_async with agent/model/variant on the request. v2 sets the
+  # session's agent/model first and then POSTs /api/session/{id}/prompt — the
+  # adapter keeps that split out of the orchestrator.
+  local args=( submit --server "$BASE_URL" --dir "$DIR" --session "$1" --prompt-file "$2" )
+  [ -n "${3:-}" ] && args+=( --agent "$3" )
+  [ -n "${4:-}" ] && args+=( --model "$4" )
+  [ -n "${5:-}" ] && args+=( --variant "$5" )
+  [ -n "${6:-}" ] && args+=( --after "$6" )
+  oc_api "${args[@]}"
 }
 
 # ---- setup -------------------------------------------------------------------
@@ -1478,10 +1543,10 @@ prune_prompt_files() {
   find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name 'opencode-msg.*' -o -name 'opencode-diff.*' \) -mtime "+${ttl}" -delete 2>/dev/null || true
 }
 if [ "$MODE" = "serve" ]; then
-  # The serve lifecycle below manages a private v1 `opencode serve`. v2's
-  # shared background service is managed by `opencode service` (or a private
-  # `opencode serve`), which this dispatcher does not own yet.
-  require_v1_mode serve
+  # The serve lifecycle below manages a private `opencode serve` on either
+  # dialect: both v1 and v2 accept --port/--hostname and the same credential
+  # env names (v2's shared `opencode service` remains a separate, unmanaged
+  # option). The started server's dialect is detected, not assumed.
   check_pairing
   prune_prompt_files
   if [ -n "$STOP" ] && [ -n "$RESTART" ]; then
@@ -1510,32 +1575,52 @@ if [ "$MODE" = "serve" ]; then
     # Credentials are address-keyed: re-resolve for the recorded endpoint.
     refresh_credentials || { echo "error: could not resolve credentials for $HOST:$PORT" >&2; exit 2; }
     BASE_URL="http://${HOST}:${PORT}"
-    if start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD"; then
-      require_started_v1 || exit 2
+    _src=0
+    start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD" || _src=$?
+    if [ "$_src" -eq 0 ]; then
+      require_started_server || exit 2
       write_serve_args "$DIR" "$PORT" "$HOST"
-      echo "opencode server restarted at $BASE_URL (dir: $DIR)"
+      echo "opencode server restarted at $BASE_URL (dir: $DIR, dialect: $RESOLVED_API)"
       [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (address-keyed credential)"
       echo "log: $SERVE_LOG"
       exit 0
     fi
-    echo "error: server did not come up within ~9s; see $SERVE_LOG" >&2
-    tail -5 "$SERVE_LOG" >&2 2>/dev/null || true
+    [ "$_src" -eq 2 ] && exit 2
+    echo "error: server did not come up within ~15s." >&2
+    [ -n "$SERVE_LOG" ] && tail -5 "$SERVE_LOG" >&2 2>/dev/null || true
     exit 6
   fi
   if server_up; then
-    echo "opencode server '$SERVER_NAME' already running at $BASE_URL"
+    # Reachable is not the same as usable. In particular v2 serves its web UI
+    # publicly while the API requires basic auth; reporting "already running"
+    # on a 401 sent the caller into a wall. Verify the dialect AND the auth.
+    if ! resolve_report; then
+      echo "error: server '$SERVER_NAME' is reachable at $BASE_URL, but its dialect could not be classified." >&2
+      [ -n "$(report_field detail)" ] && echo "  $(report_field detail)" >&2
+      exit 5
+    fi
+    if [ "$(report_field authOk)" != "true" ]; then
+      echo "error: server '$SERVER_NAME' is running at $BASE_URL, but authentication was rejected." >&2
+      [ -n "$(report_field detail)" ] && echo "  $(report_field detail)" >&2
+      echo "  Fix the profile credential, or stop it: $(basename "$0") serve --stop --server $SERVER_NAME" >&2
+      exit 5
+    fi
+    echo "opencode server '$SERVER_NAME' already running at $BASE_URL (dialect: $RESOLVED_API)"
     exit 0
   fi
-  if start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD"; then
-    require_started_v1 || exit 2
+  _src=0
+  start_server "$DIR" "$PORT" "$LISTEN" "$SERVE_PASSWORD" || _src=$?
+  if [ "$_src" -eq 0 ]; then
+    require_started_server || exit 2
     write_serve_args "$DIR" "$PORT" "$HOST"
-    echo "opencode server started at $BASE_URL (dir: $DIR)"
+    echo "opencode server started at $BASE_URL (dir: $DIR, dialect: $RESOLVED_API)"
     [ -n "$SERVE_PASSWORD" ] && echo "auth:     ${SERVER_USERNAME} (address-keyed credential)"
     echo "log: $SERVE_LOG"
     exit 0
   fi
-  echo "error: server did not come up within ~9s; see $SERVE_LOG" >&2
-  tail -5 "$SERVE_LOG" >&2 2>/dev/null || true
+  [ "$_src" -eq 2 ] && exit 2
+  echo "error: server did not come up within ~15s." >&2
+  [ -n "$SERVE_LOG" ] && tail -5 "$SERVE_LOG" >&2 2>/dev/null || true
   exit 6
 fi
 
@@ -1548,7 +1633,9 @@ fi
 if [ "$MODE" = "sessions" ]; then
   require_server
   # Rendering (and dialect differences) live in oc-api; see COMPATIBILITY.md.
-  oc_api sessions --server "$BASE_URL" --limit "$TAIL" || exit $?
+  _sessargs=( sessions --server "$BASE_URL" --limit "$TAIL" )
+  [ -n "$FORMAT" ] && _sessargs+=( --json )
+  oc_api "${_sessargs[@]}" || exit $?
   exit 0
 fi
 
@@ -1592,13 +1679,17 @@ if [ "$MODE" = "status" ]; then
       fi
     fi
     while :; do
-      _out="$(OPENCODE_STATUS_ONCE=1 bash "$0" "${_once[@]}" 2>&1)"; _rc=$?
+      _rc=0
+      _out="$(OPENCODE_STATUS_ONCE=1 bash "$0" "${_once[@]}" 2>&1)" || _rc=$?
       # Ages tick every poll ("updated:" line; "N ago" column in the all-sessions
       # list); strip them so only real changes trigger a reprint.
-      _cmp="$(printf '%s\n' "$_out" | grep -v '^updated: ' | sed -E 's/ +([0-9]+[hms] ?)+ ago//; s/·([0-9]+[hms] ?)+//')"
+      _cmp="$(printf '%s\n' "$_out" | grep -v '^updated: ' | sed -E 's/ +([0-9]+[hms] ?)+ ago//; s/· *([0-9]+[hms] ?)+//')"
       if [ "$_cmp" != "$_prev" ]; then printf '%s\n' "$_out"; _prev="$_cmp"; fi
       [ "$_rc" -ne 0 ] && exit "$_rc"
-      if [ -n "${MSG_PARTS[0]:-}${TASK_ID:-}" ] && printf '%s\n' "$_out" | grep -q '^state: *idle'; then exit 0; fi
+      # Terminal states stop the watch: idle (clean finish) plus failed,
+      # interrupted, and stopped (no active turn, but not success). initializing and
+      # pending keep polling — a fresh worker must not be mistaken for done.
+      if [ -n "${MSG_PARTS[0]:-}${TASK_ID:-}" ] && printf '%s\n' "$_out" | grep -Eq '^state: *(idle|failed|interrupted|stopped)'; then exit 0; fi
       if [ "$FOLLOW_TIMEOUT" != "0" ] && [ "$(date +%s)" -ge "$_deadline" ]; then
         echo "(timeout after ${FOLLOW_TIMEOUT}s — still following stopped; re-run to continue)" >&2; exit 0
       fi
@@ -1614,7 +1705,8 @@ if [ "$MODE" = "status" ]; then
         fi
         _wargs=( watch --server "$BASE_URL" --timeout "$_wtimeout" )
         [ -n "$_wtsid" ] && _wargs+=( --session "$_wtsid" )
-        oc_api "${_wargs[@]}" >/dev/null 2>&1; _wrc=$?
+        _wrc=0
+        oc_api "${_wargs[@]}" >/dev/null 2>&1 || _wrc=$?
         case "$_wrc" in
           0|10) continue ;;
           3) echo "(timeout after ${FOLLOW_TIMEOUT}s — still following stopped; re-run to continue)" >&2; exit 0 ;;
@@ -1662,10 +1754,33 @@ emit_heartbeat() {
 # otherwise not meant to be messaged. It recovers the turn in place instead of
 # aborting and redoing it. Reads $SID from the calling loop (bash dynamic scope).
 nudge_hint() {
-  printf '%s' "nudge: $(basename "$0") send $SID \"<message>\" --steer"
+  # steer is a v2 delivery mode; v1 has no equivalent, so do not point at a
+  # command that will refuse to run.
+  if [ "$(resolve_api)" = "v2" ]; then
+    printf '%s' "nudge: $(basename "$0") send $SID \"<message>\" --steer"
+  else
+    printf '%s' "recover: v1 has no steer; abort if it never finishes"
+  fi
 }
-follow_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits (0)
+follow_turn() {  # $1=SID $2=min-msgs-for-done (default 2) $3=after-message-id(optional); always exits (0)
   local SID="$1" minmsgs="${2:-2}"
+  # v2 follows the event stream in oc-api (WebSocket/SSE wakeups, live text);
+  # the polling loop below is the v1 path. A bounded follow that times out
+  # leaves the turn running, so exit 0 like v1. $3 is the `send` baseline: the
+  # newest message that existed BEFORE the submit, which must not count as the
+  # turn we are waiting for.
+  if [ "$(resolve_api)" = "v2" ]; then
+    local _rc=0
+    local _fargs=( follow --server "$BASE_URL" --session "$SID" --dir "$DIR"
+      --timeout "$FOLLOW_TIMEOUT" --mode "$MODE" )
+    [ -n "${3:-}" ] && _fargs+=( --after "$3" )
+    # A bounded follow that times out (3) exits 0: the turn is left running,
+    # matching v1. Capture the status with `||` so `set -e` does not abort on
+    # the (expected) non-zero code before the mapping below.
+    oc_api "${_fargs[@]}" || _rc=$?
+    [ "$_rc" -eq 3 ] && exit 0
+    exit "$_rc"
+  fi
   local deadline last_beat now n st fails line tp ts qh ask prev_ask=""
   local mx prev_mx last_change askid askrest
   echo "[$MODE] session $SID started; following (timeout ${FOLLOW_TIMEOUT}s)…" >&2
@@ -1749,8 +1864,22 @@ follow_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits (0)
 # background task and the caller is re-invoked on that exit — wake-on-complete.
 # Exit codes: 3 = backstop timeout (still running server-side), 7 = server
 # unreachable, 8 = stall (hung turn / parked ask).
-await_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits
+await_turn() {  # $1=SID $2=min-msgs-for-done (default 2) $3=after-message-id(optional); always exits
   local SID="$1" minmsgs="${2:-2}"
+  # v2 delegates the whole blocking wait to oc-api: same banner, heartbeats,
+  # ask announcements, stall guard, distilled reply, and exit codes (0 done,
+  # 3 timeout, 7 unreachable, 8 stall). The loop below is the v1 path. $3 is
+  # the `send` baseline (see follow_turn).
+  if [ "$(resolve_api)" = "v2" ]; then
+    echo "[$MODE] session $SID started in the background; waiting for completion (stall guard ${STALL_SECS}s)…" >&2
+    local _wargs=( wait --server "$BASE_URL" --session "$SID" --dir "$DIR"
+      --timeout "$FOLLOW_TIMEOUT" --stall "$STALL_SECS" --min-messages "$minmsgs"
+      --tool-name "$(basename "$0")" --mode "$MODE" )
+    [ -n "${3:-}" ] && _wargs+=( --after "$3" )
+    local _wrc=0
+    oc_api "${_wargs[@]}" || _wrc=$?
+    exit "$_wrc"
+  fi
   local unbounded deadline fails prev_mx last_change last_beat now line n st he mx
   local tp ts qh ask prev_ask=""
   local askid askrest
@@ -1852,7 +1981,7 @@ await_turn() {  # $1=SID $2=min-msgs-for-done (default 2); always exits
 # ---- send --------------------------------------------------------------------
 if [ "$MODE" = "send" ]; then
   require_server
-  require_v1_mode send
+  _send_api="$(resolve_api)"
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
   [ -z "$SID" ] && { echo "error: send needs a <sessionID> and a message (positional or --prompt-file <path>)" >&2; exit 2; }
@@ -1866,43 +1995,60 @@ if [ "$MODE" = "send" ]; then
 
 (This message is also saved at $PROMPT_FILE — re-read that file if your context gets pruned.)"
   [ -z "$MSG" ] && { echo "error: prompt file is empty: $PROMPT_FILE" >&2; exit 2; }
+  msgfile="$(mktemp "${TMPDIR:-/tmp}/opencode-msg.XXXXXX")"
+  trap 'rm -f "$msgfile"' EXIT
+  printf '%s' "$MSG" > "$msgfile"
   if [ -n "$STEER" ] || [ -n "$QUEUE" ]; then
     delivery="steer"; [ -n "$QUEUE" ] && delivery="queue"
-    # /api/session/{id}/prompt (steer/queue delivery) has no model/variant/agent
-    # field in its schema (confirmed via GET /doc) — unlike prompt_async, there
-    # is no way to apply --model/--effort/--agent on this path. Warn rather than
-    # silently drop them.
+    # delivery:"steer"|"queue" is a v2 capability (POST /api/session/{id}/prompt).
+    # The v1 API has no equivalent, so refuse instead of posting to a route
+    # that does not exist.
+    if [ "$_send_api" != "v2" ]; then
+      echo "error: --$delivery requires a v2 server (the v1 API has no delivery field)." >&2
+      echo "  v1 supports the default submit+wait path; use that, or point at a v2 server." >&2
+      exit 2
+    fi
+    # The delivery request schema has no model/agent field: the running turn
+    # keeps its session configuration. Warn rather than silently drop them.
     if [ -n "$MODEL" ] || [ -n "$VARIANT" ] || [ -n "$AGENT" ]; then
       echo "warning: --model/--effort/--agent have no effect with --steer/--queue (the $delivery API has no model field); the turn runs on the session's configured model" >&2
     fi
-    MSG="$MSG" DELIVERY="$delivery" node -e '
-      process.stdout.write(JSON.stringify({prompt:{text:process.env.MSG},delivery:process.env.DELIVERY}));' \
-          | curl -sf -m 20 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/api/session/$SID/prompt?$DIR_Q" \
-          -H 'content-type: application/json' --data-binary @- \
-      | DELIVERY="$delivery" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);console.log(`${process.env.DELIVERY} admitted: seq=${j.data?.admittedSeq} id=${j.data?.id}`);}catch(e){console.log(d);}});'
+    oc_api submit --server "$BASE_URL" --session "$SID" --dir "$DIR" \
+      --prompt-file "$msgfile" --delivery "$delivery" \
+      || { echo "error: could not admit $delivery message to $SID" >&2; exit 5; }
     echo "(poll with: $(basename "$0") status $SID   /   history $SID --turns 1)"
   else
-    # Default delivery (and --wait/--background/--follow): async submit via
-    # prompt_async (same as the run modes), then the shared completion loop —
-    # no more hard 300s curl cap that died on long turns. --wait/--background
-    # select await_turn (24h backstop, stall guard, parked-permission heartbeat,
-    # exit codes 3/7/8); the default is follow_turn (300s bounded, exits 0 on
-    # timeout and leaves the turn running, matching --follow).
-    msgfile="$(mktemp "${TMPDIR:-/tmp}/opencode-msg.XXXXXX")"
-    trap 'rm -f "$msgfile"' EXIT
-    printf '%s' "$MSG" > "$msgfile"
-    # Pre-submit message count: the loops break on idle + N messages, and an
-    # existing session is already idle with history — without counting past the
-    # pre-submit total the loop could break on the OLD idle state and print a
-    # stale reply before the new turn even starts.
-    precount="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" 2>/dev/null \
-      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).length))}catch(e){process.stdout.write("0")}});')"
-    precount="${precount:-0}"
-    oc_submit_async "$SID" "$msgfile" "$AGENT" "$MODEL" "$VARIANT" || { echo "error: could not submit message to $SID" >&2; exit 5; }
-    if [ -n "$AWAIT" ]; then
-      await_turn "$SID" "$((precount + 2))"
+    # Default delivery (and --wait/--background/--follow): async submit, then
+    # the shared completion loop. --wait/--background select await_turn (24h
+    # backstop, stall guard, parked-permission heartbeat, exit codes 3/7/8);
+    # the default is follow_turn (300s bounded, exits 0 on timeout and leaves
+    # the turn running, matching --follow).
+    #
+    # Baseline: an existing session is already idle with history, so the loop
+    # must distinguish the new turn from the OLD one. v1 uses a pre-submit
+    # message count (break at precount+2); v2 captures the newest message id
+    # and ignores everything up to and including it (--after), which survives
+    # the paged v2 transcript window.
+    if [ "$_send_api" = "v2" ]; then
+      baseline="$(oc_api last --server "$BASE_URL" --session "$SID" --dir "$DIR" 2>/dev/null || true)"
     else
-      follow_turn "$SID" "$((precount + 2))"
+      precount="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID/message?$DIR_Q" 2>/dev/null \
+        | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).length))}catch(e){process.stdout.write("0")}});')"
+      precount="${precount:-0}"
+    fi
+    oc_submit_async "$SID" "$msgfile" "$AGENT" "$MODEL" "$VARIANT" "${baseline:-}" || { echo "error: could not submit message to $SID" >&2; exit 5; }
+    if [ "$_send_api" = "v2" ]; then
+      if [ -n "$AWAIT" ]; then
+        await_turn "$SID" 2 "$baseline"
+      else
+        follow_turn "$SID" 2 "$baseline"
+      fi
+    else
+      if [ -n "$AWAIT" ]; then
+        await_turn "$SID" "$((precount + 2))"
+      else
+        follow_turn "$SID" "$((precount + 2))"
+      fi
     fi
     exit 0
   fi
@@ -1918,14 +2064,29 @@ run_teardown() {  # $1=taskID [extra agent-cleanup args...]
   [ -f "$orch/agent-cleanup.mjs" ] || { echo "error: cleanup helper not found: $orch/agent-cleanup.mjs" >&2; return 5; }
   local cargs=( --task "$task" --from "$DIR" --teardown )
   [ -n "$WORKTREE_ROOT" ] && cargs+=( --worktree-root "$WORKTREE_ROOT" )
+  [ -n "$FORMAT" ] && cargs+=( --json )
   OPENCODE_PASSWORD="${SERVE_PASSWORD:-}" OPENCODE_SERVER_PASSWORD="${SERVE_PASSWORD:-}" \
   OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" \
     node "$orch/agent-cleanup.mjs" "${cargs[@]}" "$@"
 }
 
 if [ "$MODE" = "teardown" ]; then
+  if [ -n "$TEARDOWN_SESSION" ]; then
+    [ -z "$TASK_ID" ] && [ "${#MSG_PARTS[@]}" -eq 0 ] || {
+      echo "error: teardown takes --task or --session, not both" >&2; exit 2;
+    }
+    require_server
+    # No worker record means no worktree to remove: the native server delete is
+    # the whole operation. It also interrupts a running turn and cascades to
+    # child sessions. Only scope the delete when the caller supplied --dir;
+    # otherwise oc-api looks the session up and uses its recorded directory.
+    _dargs=( delete --server "$BASE_URL" --session "$TEARDOWN_SESSION" )
+    [ -n "$DIR_SET" ] && _dargs+=( --dir "$DIR" )
+    oc_api "${_dargs[@]}" || exit $?
+    exit 0
+  fi
   TASK_ID="${TASK_ID:-${MSG_PARTS[0]:-}}"
-  [ -n "$TASK_ID" ] || { echo "error: teardown needs --task <taskID>" >&2; exit 2; }
+  [ -n "$TASK_ID" ] || { echo "error: teardown needs --task <taskID> (or --session <sessionID>)" >&2; exit 2; }
   extra=()
   [ -n "$TEARDOWN_FORCE" ] && extra+=( --force )
   # ${extra[@]:+…}: an empty array trips set -u on macOS bash 3.2.
@@ -1936,11 +2097,12 @@ fi
 # ---- abort -------------------------------------------------------------------
 if [ "$MODE" = "abort" ]; then
   require_server
-  require_v1_mode abort
   SID="${MSG_PARTS[0]:-}"
   [ -n "$TASK_ID" ] && { resolve_task_context; }
   [ -z "$SID" ] && { echo "error: abort needs a <sessionID>" >&2; exit 2; }
-  if curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/session/$SID/abort?$DIR_Q" -o /dev/null; then
+  # v1 aborts through /session/{id}/abort; v2 interrupts through
+  # /api/session/{id}/interrupt (the adapter owns the difference).
+  if oc_api interrupt --server "$BASE_URL" --session "$SID" --dir "$DIR" >/dev/null 2>&1; then
     echo "aborted in-progress turn for $SID"
   else
     echo "error: abort failed (session not found or nothing running)" >&2; exit 5
@@ -1954,7 +2116,10 @@ fi
 # `external_directory`/`bash` ask on a headless server no TUI ever answered.
 if [ "$MODE" = "permissions" ]; then
   require_server
-  require_v1_mode permissions
+  if [ "$(resolve_api)" = "v2" ]; then
+    oc_api permissions --server "$BASE_URL" --dir "$DIR" --tool-name "$(basename "$0")" || exit $?
+    exit 0
+  fi
   all_asks /permission 10 \
     | node -e '
       let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
@@ -1984,9 +2149,14 @@ fi
 # fix). The blocked turn resumes if its session is still active.
 if [ "$MODE" = "allow" ]; then
   require_server
-  require_v1_mode allow
   RID="${MSG_PARTS[0]:-}"
   [ -z "$RID" ] && { echo "error: allow needs a <requestID> (see: $(basename "$0") permissions)" >&2; exit 2; }
+  if [ "$(resolve_api)" = "v2" ]; then
+    _aargs=( allow --server "$BASE_URL" --dir "$DIR" --request "$RID" --tool-name "$(basename "$0")" )
+    [ -n "$ALWAYS" ] && _aargs+=( --always )
+    oc_api "${_aargs[@]}" || exit $?
+    exit 0
+  fi
   REPLY="once"; [ -n "$ALWAYS" ] && REPLY="always"
   RBODY="$(mktemp)"; trap 'rm -f "$RBODY"' EXIT
   # The reply is routed per directory like the queue: a bare POST 404s for an
@@ -2051,6 +2221,22 @@ case "$MODE" in
   *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac
 AGENT_USE="${AGENT:-$AGENT_DEF}"
+
+# v2 leaves a newly created session's model empty; the turn then falls back to
+# the server default instead of the agent's configured model. Resolve the
+# selected agent's effective model from opencode.json (through the client's own
+# normalized `debug config`) and send it explicitly. An explicit --model /
+# OPENCODE_DISPATCH_MODEL wins; a profile "model" is only the fallback when the
+# agent has no configured model.
+if [ -z "$MODEL_EXPLICIT" ] && [ -f "$SCRIPT_DIR/agent-config.mjs" ]; then
+  _am="$(node "$SCRIPT_DIR/agent-config.mjs" --dir "$DIR" --agent "$AGENT_USE" --bin "$(client_bin)" 2>/dev/null || true)"
+  if [ -n "$_am" ]; then
+    _am_model="$(json_field "$_am" model)"
+    _am_variant="$(json_field "$_am" variant)"
+    [ -n "$_am_model" ] && MODEL="$_am_model"
+    if [ -z "$VARIANT" ] && [ -n "$_am_variant" ]; then VARIANT="$_am_variant"; fi
+  fi
+fi
 
 # review pulls the diff into a file; other modes take the message text.
 # NOTE: the diff is fetched HERE, inside the script, and uploaded straight to the
@@ -2149,9 +2335,9 @@ if [ -n "$DIRECT" ]; then
 fi
 
 # ---- DEFAULT: server-backed, async ----
-# v1-only for now: the submit/completion path below speaks the v1 API, and the
-# client binary must be paired with the server's generation before it launches.
-require_v1_mode "$MODE"
+# Session creation/submission go through the dialect adapter (oc_create_session
+# / oc_submit_async), so run modes speak both generations. Still check the
+# client pairing before the isolated worker launcher starts one.
 check_pairing
 ensure_server
 
@@ -2201,6 +2387,7 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
   [ -n "$MODEL" ] && spawn_args+=(--model "$MODEL")
   [ -n "$VARIANT" ] && spawn_args+=(--variant "$VARIANT")
   [ -n "$WORKTREE_ROOT" ] && spawn_args+=(--worktree-root "$WORKTREE_ROOT")
+  [ -n "$BOOTSTRAP_CMD" ] && spawn_args+=(--bootstrap-cmd "$BOOTSTRAP_CMD")
   worker_json="$(OPENCODE_PASSWORD="${SERVE_PASSWORD:-}" OPENCODE_SERVER_PASSWORD="${SERVE_PASSWORD:-}" \
     OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" node "${spawn_args[@]}")" || { echo "error: isolated worker launch failed" >&2; exit 5; }
   IFS=$'\t' read -r SID DIR TASK_ID WORKER_BRANCH < <(printf '%s' "$worker_json" | node -e '
@@ -2230,6 +2417,7 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
       console.log(`  session: ${r.sessionId||"pending"}`);
       console.log(`  branch:  ${r.branch}`);
       console.log(`  dir:     ${r.worktreePath}`);
+      console.log(`  bootstrap: ${r.bootstrapCommand || "(none)"}`);
       if(r.logPath) console.log(`  log:     ${r.logPath}`);
     });'
   if [ -z "$FOLLOW" ] && [ -z "$AWAIT" ]; then exit 0; fi
@@ -2262,15 +2450,14 @@ oc_submit_async "$SID" "$msgfile" "$AGENT_USE" "$MODEL" "$VARIANT" || { echo "er
 # from --dir), so scope it to them. Catches the "N subagents, one shared tree"
 # mistake — they all edit the SAME server cwd; they do NOT get separate worktrees.
 if { [ -n "$FOLLOW" ] || [ -n "$AWAIT" ]; } && { [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; }; then
-  sdir="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID" \
-    | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).directory||"")}catch(e){}});' 2>/dev/null)"
+  sdir="$(oc_api where --server "$BASE_URL" --session "$SID" --dir "$DIR" 2>/dev/null || true)"
   if [ -n "$sdir" ] && [ "$sdir" != "$DIR" ]; then
     echo "[$MODE] WARNING: server cwd ($sdir) != --dir ($DIR)." >&2
     echo "        This session EDITS $sdir, not $DIR. Every session on this server" >&2
     echo "        shares $sdir — subagents do NOT get separate worktrees here." >&2
     echo "        For isolation, run one server per worktree on its own --port." >&2
     if [ -n "$REQUIRE_DIR" ]; then
-      curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} -X POST "$BASE_URL/session/$SID/abort" -o /dev/null 2>/dev/null || true
+      oc_api interrupt --server "$BASE_URL" --session "$SID" --dir "$DIR" >/dev/null 2>&1 || true
       echo "[$MODE] --require-dir set: aborted $SID (refusing to edit the wrong tree)." >&2
       exit 9
     fi
@@ -2312,7 +2499,7 @@ if [ -n "$AWAIT" ]; then
   exit 0
 fi
 
-sdir="$(curl -sf -m 10 ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session/$SID" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).directory||"")}catch(e){}});' 2>/dev/null)"
+sdir="$(oc_api where --server "$BASE_URL" --session "$SID" --dir "$DIR" 2>/dev/null || true)"
 echo "started [$MODE] on server $BASE_URL"
 echo "  session: $SID"
 echo "  agent:   $AGENT_USE    model: ${MODEL:-<opencode default>}"
