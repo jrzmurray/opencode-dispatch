@@ -12,7 +12,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { OpenCodeClient } from "./opencode-server.mjs";
 import { API_V1, API_V2, clientAuthEnv, clientVersion, pairingStatus } from "./api-dialect.mjs";
 import {
-  assertClean,
   branchPrefix,
   canonicalPath,
   createTaskId,
@@ -35,7 +34,7 @@ function usage() {
 Options:
   --label <name>              Human-readable label; task IDs remain unique.
   --base <ref>                Git ref to branch from (default: HEAD).
-  --from <path>               Clean source worktree (default: current directory).
+  --from <path>               Source worktree (default: current directory).
   --worktree-root <path>      Override AGENT_WORKTREE_ROOT.
   --server <url>              Existing OpenCode server (or OPENCODE_SERVER_URL).
   --parent-session <id>       Fork this server session instead of creating a new one.
@@ -56,7 +55,8 @@ Options:
   -h, --help                  Show this help.
 
 Safety behavior:
-  - The source worktree must be clean.
+  - Workers start from --base (default: HEAD); uncommitted source changes stay
+    in the source worktree.
   - The child path and branch are generated under an atomic registry lock.
   - The server session directory must exactly match the child worktree before launch.
   - A bare, unattached OpenCode process is never started.`);
@@ -353,7 +353,6 @@ async function main() {
   // otherwise serialize every concurrent spawn-agent/agent-cleanup into the
   // 30s acquire timeout.
   await withAgentLockAsync(layout, async () => {
-    assertClean(repository.root);
     record = {
       ...plan,
       state: "reserved",

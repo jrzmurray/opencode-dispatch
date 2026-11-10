@@ -61,8 +61,9 @@ What each item is actually needed for:
   the dispatcher, which finds them there; `OPENCODE_ORCHESTRATION_ROOT` or
   `--orchestration-root` overrides (fallback: `<--dir>/scripts`). A per-repo bootstrap hook is optional (see below). Read-only and control modes (`review`, `plan`, `ask`,
   `follow`, `status`, `history`, `send`, `abort`, …) run without them.
-- **A clean source worktree for edit tasks** — enforced by the external
-  launcher; uncommitted source changes are not copied into a worker worktree.
+- **Dirty source worktrees are allowed for edit tasks** — workers start from the
+  selected Git ref (`HEAD` by default); uncommitted source changes stay in the
+  source checkout and are not copied into a worker worktree.
 
 ## OpenCode v1 and v2 support
 
@@ -284,7 +285,7 @@ it on a trusted local filesystem; it is executable orchestration code.
 
 ### Agent launcher scripts
 
-Standalone commands (run from the clean source worktree of the target repo, or
+Standalone commands (run from the source worktree of the target repo, or
 pass `--from <path>`):
 
 | Command | Purpose |
@@ -313,7 +314,7 @@ it (cwd = the child worktree). The command is chosen by, in order:
 `AGENT_*` (task id, worktree path, branch, record) plus `WORKTREE_TASK_ID`,
 `WORKTREE_SOURCE_PATH`, `WORKTREE_ORIGIN=spawned-agent`,
 `WORKTREE_BOOTSTRAP_CHILD=0`, and `WORKTREE_SESSION_START=0`. A non-zero exit
-rolls the task back. The config file is read from the clean source checkout and
+rolls the task back. The config file is read from the source checkout and
 executed as shell, so treat it like any other repo-controlled script.
 
 ### Environment variables
@@ -650,8 +651,8 @@ Uncommitted work is **not** recoverable after teardown; have the worker commit f
 - Never manually start an unattached `opencode` worker for an edit task.
 - Never start a second OpenCode server merely to obtain a different worktree.
 - Never reuse another task's branch, worktree path, task ID, or session ID.
-- Keep source clean before allocation; the child starts from the selected Git ref,
-  not uncommitted source changes.
+- Workers start from the selected Git ref, not uncommitted source changes. Commit
+  changes or choose a base ref when a worker needs those changes.
 - Treat `--no-bootstrap` as a test/provisioning escape hatch, not a normal task
   option.
 - Verify the reported branch and worktree before reviewing or merging changes.
@@ -672,12 +673,11 @@ Set `OPENCODE_ORCHESTRATION_ROOT` to this repository's `scripts/` directory
 (containing `spawn-agent.mjs`), or pass `--orchestration-root /absolute/path/to/scripts`. Confirm that the path is
 the same trusted checkout whose scripts you reviewed.
 
-### `source worktree is dirty`
+### A worker does not include uncommitted source changes
 
-Commit or stash the source changes before launching an edit task. The launcher
-does not copy uncommitted changes into a child. If the source is intentionally
-dirty, create a controlled worktree yourself and use the normal bootstrap path;
-do not bypass task ownership casually.
+This is expected: the worker starts from `--base` (default `HEAD`). Commit the
+changes first or set `--base` to a commit that contains them if the worker needs
+that code. The primary checkout's edits are left untouched.
 
 ### `directory mismatch`
 
