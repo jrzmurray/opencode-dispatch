@@ -21,6 +21,8 @@
 #   task      Agentic build task — the model may edit files and run commands.
 #   bulk      Same as task (async server run is inherently background-friendly).
 #   serve     Start (or confirm) a persistent local `opencode serve` on --port.
+#             Remote endpoints can only be confirmed; remote lifecycle management
+#             is not available from this machine.
 #             --stop stops the running server (identified by the recorded
 #             launch args, or --port/--host if none are recorded). --restart
 #             stops and starts it again with the SAME arguments it was last
@@ -292,9 +294,11 @@ Modes:
   review      Review local changes or run Git/gh diff reads on the remote server.
   plan        Read-only analysis/planning (agent 'plan').
   ask         Read-only question answering (agent 'plan').
-  task        Agentic build task in a freshly allocated worktree (agent 'auto').
+  task        Agentic build task in a freshly allocated worktree (agent 'auto');
+              remote workers require a v2 project/worktree API.
   bulk        Same as task, for background/batch work.
-  serve       Start/confirm the private server (v1 or v2); also --stop / --restart.
+  serve       Start/confirm the local server (v1 or v2); remote process management
+              is unsupported (remote endpoints can only be checked).
   sessions    List sessions from the server (id, updated, title); --json emits
               the raw normalized list.
   status      Liveness of a session (or a one-line summary of all sessions);
@@ -321,8 +325,11 @@ Modes:
               turn completes (sends nothing; --timeout <N> to bound the wait).
   setup       Show executable, server, auth, and model diagnostics.
   identify    Print this agent session's identity (session id, slug, agent).
-  claim       Atomically claim a unit of work (claim <unit>).
-  release     Release a claim owned by this session (release <unit>).
+              Explicit session-ID lookup uses the local OpenCode database.
+  claim       Atomically claim a unit of work (claim <unit>); claims are local
+              unless CLAIM_ROOT is a shared directory.
+  release     Release a claim owned by this session (release <unit>); claims are
+              local unless CLAIM_ROOT is a shared directory.
 
 Run-mode flags (review|plan|ask|task|bulk):
   --background        DEFAULT: the job runs in the background on the server;
@@ -331,8 +338,8 @@ Run-mode flags (review|plan|ask|task|bulk):
   --wait              Foreground blocking wait: the session blocks until the
                       turn completes (call the wrapper inline, not backgrounded).
   --follow            Bounded foreground wait (300s); leaves the session running.
-  --direct            One-shot 'opencode run' bypassing the server (read-only
-                      modes only; unobservable, not killable). --auto is passed
+  --direct            Local one-shot 'opencode run' bypassing the server
+                      (read-only modes only; unobservable, not killable). --auto is passed
                       only for review (its edit/webfetch are explicitly denied);
                       plan/ask run without it (bash is already allow-by-default
                       there, and --auto would only lift plan's read-only asks).

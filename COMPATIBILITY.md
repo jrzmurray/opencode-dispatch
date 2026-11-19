@@ -96,6 +96,25 @@ instead of issuing calls that cannot work. Remote `task`/`bulk` require the v2
 worktree API; remote session-control and read-only run modes remain available on
 v1.
 
+### Remote endpoint limits
+
+The mode matrix above describes server API dialect support. These additional
+limits apply when the dispatcher itself runs on a different machine from the
+OpenCode server:
+
+| Locally available command or option | Remote support | Limitation |
+| --- | --- | --- |
+| `serve` start / `--stop` / `--restart` | No | The dispatcher can confirm a reachable remote server, but process lifecycle operations run only on the dispatcher machine. Manage a remote server on its host. |
+| `--direct` | No | Runs the OpenCode client locally and cannot use a remote filesystem path. |
+| `task` / `bulk` | Conditional | Remote workers need a working v2 project and worktree API. A server identifying as v2 does not guarantee that it implements the worktree endpoint. Custom `--base` refs and `--parent-session` are not supported by the remote worker launcher. |
+| `claim` / `release` | Conditional | Claim files are written by the dispatcher to its local filesystem. They coordinate remote work only when `CLAIM_ROOT` points to a directory shared with the remote host. |
+| `identify <sessionID>` | No from the dispatcher | Explicit session lookup reads the local OpenCode database. Identity inside an agent depends on session environment injection; the bundled identity plugin is v1-shaped and is not available on v2. |
+| `review --pr <n>` | Conditional | Remote review runs `gh pr diff` on the server, so `gh` and GitHub authentication must be configured there. Local `gh` credentials are not forwarded. |
+
+Other session controls (`sessions`, `status`, `history`, `follow`, `send`,
+`abort`, `permissions`, `allow`, and session deletion) use the remote server API
+when the selected server implements the detected dialect's required routes.
+
 `send` and the run-mode submit path write a short-lived admission marker under
 `~/.local/state/opencode-dispatch/pending/` (override the root with
 `OPENCODE_DISPATCH_STATE_DIR`). It closes the window where the prompt POST has

@@ -432,7 +432,13 @@ remote worktree, then submit the task to a session rooted there. The worker's
 tools therefore read and edit the remote files. Remote `review` also runs its
 Git or GitHub diff command on the server. `--direct` is local-only. Remote
 `task`/`bulk` require the server's v2 worktree API; v1 servers continue to
-support remote session-control and read-only run modes.
+support remote session-control and read-only run modes. Remote endpoints do not
+support `serve` process start/stop/restart, `--direct`, or dispatcher-side
+`identify <sessionID>`. `claim`/`release` use local claim files and need a shared
+`CLAIM_ROOT` to coordinate with remote work. Remote `task`/`bulk` also depend on
+the server's worktree capability, and remote `review --pr` needs `gh` plus GitHub
+authentication on the server. See [COMPATIBILITY.md](COMPATIBILITY.md#remote-endpoint-limits)
+for the complete list.
 
 Profiles are named definitions in `~/.config/opencode-dispatch/servers.json`
 (see [Configuration](#configuration)). Each profile separates the **bind
