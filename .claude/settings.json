@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/jrmurray/Code/ai/opencode-dispatch/.claude/scripts/opencode-guard.sh"
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/scripts/opencode-guard.sh\""
           }
         ]
       }

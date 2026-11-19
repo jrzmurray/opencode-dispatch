@@ -272,9 +272,9 @@ async function getSessionWithFallback(client, sessionId, directory) {
  * endpoint is unavailable (an older v2 build or a test double), letting
  * callers fall back to the message heuristic.
  */
-async function activeSessionIds(client) {
+async function activeSessionIds(client, directory) {
   try {
-    const data = await client.getSessionStatus();
+    const data = await client.getSessionStatus({ directory });
     if (!data || typeof data !== "object" || Array.isArray(data)) return null;
     return new Set(Object.keys(data));
   } catch {
@@ -283,8 +283,8 @@ async function activeSessionIds(client) {
 }
 
 /** True/false from the active map; null when the endpoint cannot answer. */
-async function sessionRunning(client, sessionId) {
-  const active = await activeSessionIds(client);
+async function sessionRunning(client, sessionId, directory) {
+  const active = await activeSessionIds(client, directory);
   if (!active) return null;
   return active.has(sessionId);
 }
@@ -643,7 +643,7 @@ async function statusSingle(client, options, sessionId) {
   if (api === API_V2) {
     // Turn-level state comes from /api/session/active; the message stream only
     // provides the newest step (tool detail, errors) for the display.
-    activeIds = await activeSessionIds(client);
+    activeIds = await activeSessionIds(client, session.directory || options.dir || undefined);
     const page = await client.messagesPage(sessionId, { directory: session.directory || options.dir, limit: 50, order: "desc" });
     messageCount = page.messages.length;
     // v2 always returns a continuable cursor, so "more" is a window heuristic:
@@ -715,11 +715,18 @@ async function statusSingle(client, options, sessionId) {
 async function statusAll(client, options) {
   const sessions = await client.listSessions({ limit: options.limit }).catch(fail);
   const shown = sessions.slice(0, options.limit);
-  // One turn-level query for the whole list (v2 only: the v1 /session/status
-  // response is not the same active-session contract). `null` means the
-  // endpoint is unavailable; each row then falls back to the message heuristic.
+  // The v2 active map is scoped to one server directory, so cache one query per
+  // session location. `null` means the endpoint is unavailable; each row then
+  // falls back to the message heuristic.
   const api = await client.resolveApi();
-  const activeIds = api === API_V2 ? await activeSessionIds(client) : null;
+  const activeByDirectory = new Map();
+  const activeFor = (session) => {
+    if (api !== API_V2) return Promise.resolve(null);
+    const directory = session.directory || options.dir || undefined;
+    const key = directory || "";
+    if (!activeByDirectory.has(key)) activeByDirectory.set(key, activeSessionIds(client, directory));
+    return activeByDirectory.get(key);
+  };
   const pendingMap = api === API_V2 ? listPending(client.baseUrl) : new Map();
   const asks = await collectAsks(client, { directory: options.dir || undefined });
   const parkedBySession = new Map();
@@ -731,6 +738,7 @@ async function statusAll(client, options) {
     shown.map(async (session) => {
       const parked = parkedBySession.get(session.id);
       if (parked) return parked.kind === "permission" ? "PERMASK" : "QUESTION";
+      const activeIds = await activeFor(session);
       const running = activeIds ? activeIds.has(session.id) : null;
       const pending = pendingMap.get(session.id) || null;
       try {
@@ -1152,7 +1160,7 @@ async function commandWait(options) {
     // can still be running (a tool call or the next model step), so completion
     // additionally requires /api/session/active to no longer list the session.
     // `null` means that endpoint is unavailable: keep the message heuristic.
-    const running = await sessionRunning(client, options.session);
+    const running = await sessionRunning(client, options.session, directory);
     const pending = pendingOutstanding(client.baseUrl, options.session, turn);
     if ((turnError(turn) || isDone(turn)) && !pending && running !== true) {
       printFinal(turn);
@@ -1390,7 +1398,7 @@ async function commandFollow(options) {
   // follow open: the new user message may not have landed yet.
   const turnFinished = async (messages) => {
     if (pendingOutstanding(client.baseUrl, options.session, messages)) return false;
-    return (await sessionRunning(client, options.session)) !== true;
+    return (await sessionRunning(client, options.session, directory)) !== true;
   };
   const finish = (messages) => {
     endLine();
@@ -1480,6 +1488,11 @@ async function commandWatch(options) {
   }
   const timeout = options.timeoutSet ? options.timeout : 0;
   const deadline = timeout > 0 ? Date.now() + timeout * 1000 : 0;
+  let directory = options.dir || undefined;
+  if (options.session) {
+    const session = await getSessionWithFallback(client, options.session, directory).catch(() => null);
+    directory = session?.directory || directory;
+  }
 
   const sessionIdle = async () => {
     if (!options.session) return false;
@@ -1488,8 +1501,8 @@ async function commandWatch(options) {
     // means the turn is not settled; a fresh session (no transcript) or a
     // submitted-but-not-started prompt is not done either. Failed/interrupted
     // turns are settled (the caller re-reads status and reacts to the state).
-    const running = await sessionRunning(client, options.session);
-    const last = await lastMessage(client, options.session, options.dir || undefined);
+    const running = await sessionRunning(client, options.session, directory);
+    const last = await lastMessage(client, options.session, directory);
     const pending = pendingOutstanding(client.baseUrl, options.session, last ? [last] : []);
     const partialStep = last?.role === "assistant" && !last.completed;
     if (running === true || partialStep || pending) return false;

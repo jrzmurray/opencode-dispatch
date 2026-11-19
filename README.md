@@ -338,7 +338,7 @@ pass `--from <path>`):
 
 | Command | Purpose |
 | --- | --- |
-| `node <scripts>/spawn-agent.mjs [--remote] [--project <id\|name\|path>] [--label n] [--base ref] [--bootstrap-cmd cmd] [--no-bootstrap] [--prepare-only\|--dry-run] -- <prompt>` | Allocate a task. Local mode uses a locked local worktree and attached worker; `--remote` resolves a server project, creates its v2 worktree, runs bootstrap, then submits directly to the remote session. |
+| `node <scripts>/spawn-agent.mjs [--remote] [--project <id\|name\|path>] [--label n] [--base ref] [--bootstrap-cmd cmd] [--no-bootstrap] [--prepare-only\|--dry-run] -- <prompt>` | Allocate a task. Local mode uses a locked local worktree and attached worker; `--remote` resolves a server project, creates its v2 worktree, runs bootstrap, then submits directly to the remote session. Remote worktrees default to a uniquely named sibling directory beside the project; use `--worktree-root` to choose a server-side root. |
 | `node <scripts>/agent-status.mjs [--task <id>] [--json]` | Read-only report of local or remote task and server-session state. |
 | `node <scripts>/agent-cleanup.mjs --task <id> [--dry-run] [--delete-branch] [--force]` | Fail-closed stop/remove/archive of one local or remote task. Remote cleanup uses the server API; remote branch deletion is not available. |
 | `node <scripts>/agent-worker-guard.mjs --metadata <task.json>` | Preflight assertion of repository, path, branch, and record. |

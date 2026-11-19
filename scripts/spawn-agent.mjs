@@ -39,7 +39,8 @@ Options:
   --base <ref>                Git ref to branch from (default: HEAD).
   --from <path>               Source worktree (default: current directory).
   --project <id|name|path>    Select a remote OpenCode project and resolve its path.
-  --worktree-root <path>      Override AGENT_WORKTREE_ROOT.
+  --worktree-root <path>      Worker root; for remote mode this is a server path
+                              (default: a sibling .opencode-worktrees directory).
   --server <url>              Existing OpenCode server (or OPENCODE_SERVER_URL).
   --remote                    Create and run the worktree on a v2 server.
   --parent-session <id>       Fork this server session instead of creating a new one.
@@ -493,9 +494,14 @@ async function runRemoteTask(options) {
   const taskId = createTaskId(options.label);
   const prefix = branchPrefix(process.env).replace(/\/+$/, "");
   const branch = `${prefix}/${taskId}`;
+  // The remote worktree API requires an explicit destination. Put the default
+  // directly beside the project so its parent already exists and the worktree
+  // remains outside the source checkout. A configured root gets task-ID child
+  // directories, matching local --worktree-root behavior.
+  const projectName = pathPosix.basename(canonicalPath) || String(projectId);
   const requestedDirectory = options.worktreeRoot
     ? pathPosix.join(options.worktreeRoot, taskId)
-    : undefined;
+    : pathPosix.join(pathPosix.dirname(canonicalPath), `.opencode-worktree-${projectName}-${taskId}`);
   let worktree;
   let record = {
     taskId,

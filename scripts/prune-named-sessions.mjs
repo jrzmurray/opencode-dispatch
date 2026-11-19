@@ -400,7 +400,7 @@ function main() {
 
   const candidates = sessions
     .filter((session) => {
-      if (!session?.id || !matchesTitle(session)) return false;
+      if (!session?.id || session.id === self || !matchesTitle(session)) return false;
       const updated = updatedMs(session);
       return updated !== null && updated <= cutoff;
     })
