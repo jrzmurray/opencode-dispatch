@@ -21,7 +21,7 @@
     "listen": "0.0.0.0",
     "host": "192.0.2.50",
     "port": 4096,
-    "dir": "~/Code/your-project",
+    "dir": "/home/your-user/Code/your-project",
     "model": "deepseek/deepseek-v4-pro"
   },
   "_example-v1-legacy": {

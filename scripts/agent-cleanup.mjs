@@ -8,6 +8,7 @@ import path from "node:path";
 
 import { isLocalServerUrl, OpenCodeClient } from "./opencode-server.mjs";
 import { API_V2 } from "./api-dialect.mjs";
+import { archiveRemoteTaskRecord, readRemoteTaskRecord, writeRemoteTaskRecord } from "./remote-task-utils.mjs";
 import {
   archiveTaskRecord,
   canonicalPath,
@@ -54,6 +55,8 @@ Options:
                               no active turn, a reachable server whose session directory
                               matches the worktree (else "unknown", refused). --force
                               bypasses the process/turn/server checks.
+                              Remote worktree contents cannot be previewed locally; the
+                              server removes the worktree through its native API.
   --db <path>                 OpenCode database (default: $OPENCODE_DB or
                               ~/.local/share/opencode/opencode.db).
   --dry-run                   Report checks without changing anything.
@@ -242,6 +245,68 @@ async function deleteSessionViaServer(client, record, session) {
   return { deleted: true };
 }
 
+async function cleanupRemoteTask(options, record) {
+  if (options.deleteBranch) throw new Error("--delete-branch is not supported for remote worktrees by the OpenCode API; the remote branch is retained");
+  const configuredServerUrl = options.server || record.serverUrl || process.env.OPENCODE_SERVER_URL || "";
+  if (!configuredServerUrl) throw new Error("remote task record has no OpenCode server URL");
+  const client = new OpenCodeClient({ baseUrl: configuredServerUrl });
+  await client.health();
+  const worktrees = await client.listWorktrees(record.projectId);
+  const registered = worktrees.some((item) => path.posix.normalize(item?.directory || "") === path.posix.normalize(record.worktreePath));
+  if (!registered) throw new Error(`refusing remote cleanup: ${record.worktreePath} is not in the server's saved worktree inventory`);
+  const session = await inspectSession(client, record);
+  const messages = session.checked && session.exists
+    ? await client.messages(record.sessionId, { directory: record.worktreePath }).catch(() => [])
+    : [];
+  const last = messages.at(-1);
+  session.working = Boolean(last?.role === "user" || (last?.role === "assistant" && !last?.completed));
+  const checks = {
+    taskId: record.taskId,
+    remote: true,
+    serverUrl: client.baseUrl,
+    projectId: record.projectId,
+    worktreePath: record.worktreePath,
+    branch: record.branch,
+    pidAlive: false,
+    session,
+    dirtyFiles: null,
+    ...(options.teardown ? { leftovers: null } : {}),
+    dryRun: options.dryRun,
+  };
+  if (options.dryRun) return { ...checks, state: "dry-run" };
+  if ((session.working || session.unknown || (session.exists && !session.directoryMatches)) && !options.force) {
+    throw new Error(`refusing remote cleanup: ${session.working ? "server turn is active; " : ""}${session.unknown ? "server state is unknown; " : ""}${session.exists && !session.directoryMatches ? "server session directory does not match; " : ""}use --force only after reviewing the task`);
+  }
+  if (options.teardown && session.exists && !session.directoryMatches && !options.force) {
+    throw new Error("refusing remote teardown: server session directory does not match the worktree");
+  }
+  if (options.teardown && !options.force && record.sessionId && !session.exists) {
+    throw new Error("refusing remote teardown: server session is missing or could not be verified; use --force after reviewing the task");
+  }
+  if (options.teardown) console.error("teardown: remote worktree contents cannot be previewed here; the OpenCode server will remove the entire worktree");
+  if (options.force && record.sessionId) await client.abortSession(record.sessionId, { directory: record.worktreePath }).catch(() => {});
+
+  let serverDelete = null;
+  if (options.teardown && record.sessionId) {
+    serverDelete = await deleteSessionViaServer(client, record, session);
+  }
+  writeRemoteTaskRecord({ ...record, state: "cleaning" });
+  try {
+    await client.removeWorktree({ projectID: record.projectId, directory: record.worktreePath, force: Boolean(options.force || options.teardown) });
+  } catch (error) {
+    writeRemoteTaskRecord({ ...record, state: "failed-cleanup-required", cleanupError: error?.message || String(error) });
+    throw error;
+  }
+  const archivedPath = archiveRemoteTaskRecord(record);
+  return {
+    ...checks,
+    state: "removed",
+    archivedRecord: archivedPath,
+    branchDeleted: false,
+    ...(options.teardown ? { database: { deleted: Boolean(serverDelete?.deleted), via: "server-api", verification: "remote server database is not locally accessible" } } : {}),
+  };
+}
+
 /** Read-only row counts for one session, used to verify a server-side delete. */
 function countSessionRows(dbPath, sessionId, api) {
   if (!fs.existsSync(dbPath)) return { available: false, reason: `database not found: ${dbPath}` };
@@ -280,14 +345,29 @@ function deleteSessionData(dbPath, sessionId) {
   const before = { session: count(`SELECT count(*) FROM session WHERE id = ${id};`), eventSequence: count(`SELECT count(*) FROM event_sequence WHERE aggregate_id = ${id};`) };
   execFileSync(
     "sqlite3",
-    ["-bail", "-cmd", "PRAGMA foreign_keys=ON;", "-cmd", ".timeout 60000", dbPath, `BEGIN IMMEDIATE; DELETE FROM session WHERE id = ${id}; DELETE FROM event_sequence WHERE aggregate_id = ${id}; COMMIT;`],
-    { encoding: "utf8" },
+    ["-bail", "-cmd", ".timeout 60000", dbPath],
+    {
+      // Feed the transaction through stdin. Recent sqlite3 shells treat the
+      // optional SQL argument as one statement when it begins with BEGIN, so
+      // later DELETE/COMMIT statements can be skipped and rolled back on exit.
+      input: `PRAGMA foreign_keys=ON;\nBEGIN IMMEDIATE;\nDELETE FROM session WHERE id = ${id};\nDELETE FROM event_sequence WHERE aggregate_id = ${id};\nCOMMIT;\n`,
+      encoding: "utf8",
+    },
   );
   return { deleted: true, ...before };
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  let remoteRecord = null;
+  try { remoteRecord = readRemoteTaskRecord(options.task, options.server); } catch {}
+  if (remoteRecord) {
+    const result = await cleanupRemoteTask(options, remoteRecord);
+    if (options.json || options.dryRun) console.log(JSON.stringify(result, null, 2));
+    else console.log(`removed ${remoteRecord.taskId}\nremote worktree: ${remoteRecord.worktreePath}\nbranch: ${remoteRecord.branch}\nrecord: ${result.archivedRecord}`);
+    return;
+  }
+  if (options.server && !isLocalServerUrl(options.server)) throw new Error(`remote agent task not found: ${options.task}`);
   const repository = getRepositoryInfo(options.from);
   const environment = { ...process.env };
   if (options.worktreeRoot) environment.AGENT_WORKTREE_ROOT = options.worktreeRoot;

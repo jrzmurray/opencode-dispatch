@@ -171,6 +171,7 @@ host        addressable host the dispatcher reaches the server at
             a password)
 port        server port (default 4096)
 dir         server working directory
+            (absolute server-side path for remote profiles)
 username    optional basic-auth username for this profile (default `opencode`)
 password    optional basic-auth password for this profile
 model       default provider/model for dispatch through this profile
@@ -216,8 +217,10 @@ are treated as the same loopback credential key.
 
 `--server <name>` (or `$OPENCODE_DISPATCH_SERVER`, or `serve <name>`) selects a
 profile; per-field precedence is CLI flag > env (`OPENCODE_DISPATCH_*`) >
-definition. Default profile: `default` (127.0.0.1:4096) — the single-server
-behavior when no definitions file exists.
+definition. If `--host` (or `OPENCODE_DISPATCH_HOST`) exactly matches a profile's
+host and port and no profile name was selected, that profile supplies its
+directory, credentials, API pin, and model. Default profile: `default`
+(127.0.0.1:4096) — the single-server behavior when no definitions file exists.
 
 Two optional fields tune the server generation (see
 [COMPATIBILITY.md](COMPATIBILITY.md)):
@@ -335,9 +338,9 @@ pass `--from <path>`):
 
 | Command | Purpose |
 | --- | --- |
-| `node <scripts>/spawn-agent.mjs [--label n] [--base ref] [--bootstrap-cmd cmd] [--no-bootstrap] [--prepare-only\|--dry-run] -- <prompt>` | Allocate a task, create a locked worktree and branch, run the bootstrap hook, create a directory-bound session on the persistent server, run the guard, and launch the attached worker. Prints one JSON record. |
-| `node <scripts>/agent-status.mjs [--task <id>] [--json]` | Read-only report of local process, worktree, and server-session state. |
-| `node <scripts>/agent-cleanup.mjs --task <id> [--dry-run] [--delete-branch] [--force]` | Fail-closed stop/remove/archive of one task. |
+| `node <scripts>/spawn-agent.mjs [--remote] [--project <id\|name\|path>] [--label n] [--base ref] [--bootstrap-cmd cmd] [--no-bootstrap] [--prepare-only\|--dry-run] -- <prompt>` | Allocate a task. Local mode uses a locked local worktree and attached worker; `--remote` resolves a server project, creates its v2 worktree, runs bootstrap, then submits directly to the remote session. |
+| `node <scripts>/agent-status.mjs [--task <id>] [--json]` | Read-only report of local or remote task and server-session state. |
+| `node <scripts>/agent-cleanup.mjs --task <id> [--dry-run] [--delete-branch] [--force]` | Fail-closed stop/remove/archive of one local or remote task. Remote cleanup uses the server API; remote branch deletion is not available. |
 | `node <scripts>/agent-worker-guard.mjs --metadata <task.json>` | Preflight assertion of repository, path, branch, and record. |
 
 Run `spawn-agent.mjs --help` for every flag.
@@ -345,7 +348,8 @@ Run `spawn-agent.mjs --help` for every flag.
 #### Per-repo bootstrap hook
 
 After the child worktree is created, `spawn-agent.mjs` runs one shell command in
-it (cwd = the child worktree). The command is chosen by, in order:
+it (cwd = the child worktree) before creating the task session. The command is
+chosen by, in order:
 
 1. `--bootstrap-cmd "<cmd>"`
 2. the `bootstrap` string in `<source repo>/.opencode-dispatch.json`:
@@ -355,13 +359,22 @@ it (cwd = the child worktree). The command is chosen by, in order:
    ```
 3. otherwise no bootstrap runs.
 
-`--no-bootstrap` disables the hook entirely. The command receives
-`AGENT_*` (task id, worktree path, branch, record) plus `WORKTREE_TASK_ID`,
+`--no-bootstrap` disables this dispatcher hook. The command receives task id,
+worktree path, and branch in `AGENT_*`, plus `WORKTREE_TASK_ID`,
 `WORKTREE_SOURCE_PATH`, `WORKTREE_ORIGIN=spawned-agent`,
 `WORKTREE_BOOTSTRAP_CHILD=0`, and `WORKTREE_SESSION_START=0`. A non-zero exit
-rolls the task back. The config file is read from the source checkout
-(falling back to the primary repository root for a linked worktree) and executed
-as shell, so treat it like any other repo-controlled script.
+rolls the task back. For local workers, the config file is read from the source
+checkout (falling back to the primary repository root for a linked worktree).
+For remote workers, the launcher reads it through the server filesystem API and
+runs it through the server shell API, so the dispatcher does not need SSH
+access. The remote worktree API also runs OpenCode's project `commands.start`
+hook during creation; `.opencode-dispatch.json` runs afterward and before the
+session is created. A remote bootstrap failure triggers worktree cleanup and
+prevents session creation. A remote hook receives an empty `AGENT_METADATA_PATH`
+because its task record is local; `OPENCODE_SESSION_ID` is empty in both modes
+because the hook runs before the session exists. `--no-bootstrap` does not skip
+the OpenCode `commands.start` hook that the remote worktree API runs during
+creation. Treat the config as repo-controlled shell.
 
 The hook runs **in the child worktree**, which contains tracked files only. A
 command that references an untracked script (for example
@@ -394,21 +407,32 @@ stderr.
 | `OPENCODE_STALENESS_FETCH_TTL` / `OPENCODE_STALENESS_NUDGE_AT` / `OPENCODE_STALENESS_HOT_PATHS` | Tuning for the `opencode-branch-staleness` plugin: seconds between real `git fetch`es (default 300), commits-behind threshold for escalated wording (default 25), and optional comma-separated paths whose changes are called out explicitly. |
 | `OPENCODE_DISPATCH_MODEL` | Default `provider/model` for dispatch. |
 | `AGENT_WORKTREE_ROOT` | Generic allocation root. |
+| `OPENCODE_DISPATCH_REMOTE_WORKTREE_ROOT` | Optional absolute worktree root on the remote server; local `AGENT_WORKTREE_ROOT` is not reused remotely. |
 | `AGENT_REGISTRY_ROOT` | Override the worker registry directory (used by the launcher and the session pruner). |
 | `AGENT_BRANCH_PREFIX` | Generic worker branch prefix. |
 | `AGENT_LOCK_TIMEOUT_MS` | Allocation lock wait timeout. |
 | `OPENCODE_DISPATCH_STALL_SECS` | Default `--background` inactivity threshold; `0` disables it. |
 
-The child launcher also passes task metadata to the worker through
+The local child launcher also passes task metadata to the worker through
 `AGENT_TASK_ID`, `AGENT_WORKTREE_PATH`, `AGENT_WORKTREE_BRANCH`,
 `AGENT_METADATA_PATH`, `OPENCODE_SESSION_ID`, and `OPENCODE_SERVER_URL`.
 
 ## One-server execution model
 
-Run exactly one local `opencode serve` per **server profile** for the endpoints
-used by the skill. The server is a session broker, not the ownership boundary.
-Each session receives an explicit `directory=<worktree>` query, so multiple
-workers can share the server without sharing a checkout.
+Run one `opencode serve` on each host that will run OpenCode work. Session
+control modes (`ask`, `send`, `status`, `history`, `follow`, and related
+commands) use the server API and pass `--dir` as an absolute path on that
+server. The dispatcher does not resolve relative paths against a projects root.
+A profile's `dir` is the default remote project path; otherwise pass `--dir`
+explicitly. It must name a project the server knows.
+
+Local `task`/`bulk` workers use a local Git worktree and an attached client.
+With a remote profile, they instead ask an OpenCode v2 server to create a native
+remote worktree, then submit the task to a session rooted there. The worker's
+tools therefore read and edit the remote files. Remote `review` also runs its
+Git or GitHub diff command on the server. `--direct` is local-only. Remote
+`task`/`bulk` require the server's v2 worktree API; v1 servers continue to
+support remote session-control and read-only run modes.
 
 Profiles are named definitions in `~/.config/opencode-dispatch/servers.json`
 (see [Configuration](#configuration)). Each profile separates the **bind
@@ -433,9 +457,9 @@ operations (they use `lsof`); a remote profile is managed on the machine it
 runs on. `/opencode:setup` lists every profile with live UP/down state.
 
 If a server is already running for the profile, do not start another server for
-each worktree. If no server is reachable, the dispatch wrapper may start one at
-the configured endpoint; it still routes each created session to its explicit
-directory.
+each worktree. The wrapper can start a server when the endpoint is local; for a
+remote endpoint, start or reconnect the server on that host. `serve --stop` and
+`serve --restart` manage only servers on the current machine.
 
 ## Claude slash commands
 
@@ -594,6 +618,24 @@ Control modes:
   setup | identify | claim | release
   send: --steer injects into the running turn; --queue appends after it
 ```
+
+For a remote host, `--dir` must be an absolute path interpreted on that host. If
+`--host` and `--port` match a configured profile, its `dir` and credentials are
+inherited; otherwise provide `--dir` and configure credentials for that address.
+Add `--remote` when reaching a remote server through `localhost`, such as an SSH
+tunnel.
+
+For remote `task` and `bulk`, pass `--project <id|name|path>` to resolve a
+project from the remote server's OpenCode project list. The launcher sends the
+resolved canonical path to the worktree API, so you do not need to know the
+server's filesystem layout. Select a different project on each invocation:
+
+```sh
+opencode-dispatch.sh task --server ideapad5 --project my-service "Add a health endpoint"
+```
+
+`--project` is task/bulk-only and cannot be combined with `--dir`; a profile's
+`dir` remains the default when neither is given.
 
 **`--background` is the default for every run mode** (`review`, `plan`, `ask`,
 `task`, `bulk`). The job runs in the background on the persistent opencode

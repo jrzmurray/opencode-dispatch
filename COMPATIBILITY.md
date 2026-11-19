@@ -84,13 +84,17 @@ explicit `host` is refused. `localhost` and `127.0.0.1` share their key.
 | `permissions` / `allow` | ✓ | ✓ | v2 lists `/api/permission/request` across session directories and replies through the owning session (`{decision: once\|always}`) |
 | `send` (incl. `--steer`/`--queue`) | ✓ | ✓ | Default send uses a baseline message id on v2 instead of the v1 pre-count; `--steer`/`--queue` use v2's `delivery` field and are refused on v1 (no equivalent) |
 | `abort` | ✓ | ✓ | Routed through the adapter (`/session/{id}/abort` on v1, `/api/session/{id}/interrupt` on v2) |
-| `serve` / `--stop` / `--restart` | ✓ | ✓ | Manages a private `opencode serve` on either dialect (same `--port`/`--hostname`/credential env); a v2 start requires a configured password (see below); v2's shared background service is still managed by `opencode service` |
-| Run modes (`review`, `plan`, `ask`, `task`, `bulk`) server-backed | ✓ | ✓ | Create/submit go through `oc-api`; v2 `--follow` uses the event stream and `--background`/`--wait` use the v2 `wait` loop (same heartbeats, stalls, and exit codes) |
-| `--direct` one-shot | ✓ | — | The run flags differ between generations; refuses a v2 client binary |
+| `serve` / `--stop` / `--restart` | ✓ | ✓ | Starts/stops only a server on this machine; remote servers must be managed on their host; v2 start requires a configured password |
+| Run modes (`review`, `plan`, `ask`) server-backed | ✓ | ✓ | Sessions and prompts are routed through the selected server; remote review runs Git/gh diff there; follow/background polling works on both dialects |
+| Local `task` / `bulk` workers | ✓ | ✓ | Local Git worktree plus attached worker client |
+| Remote `task` / `bulk` workers | — | ✓ | Uses the v2 project/worktree API and submits directly to a remote session; no local worker process; detected from a remote hostname or explicit `--remote` |
+| `--direct` one-shot | ✓ | — | Local-only; the run flags differ between generations and it refuses a v2 client binary |
 
-The remaining generation-specific mode is `--direct` (one-shot, v1 client
-binary); it refuses a v2 server/client with a clear message instead of issuing
-calls that cannot work.
+The remaining generation-specific run path is `--direct` (one-shot, v1 client
+binary); it is local-only and refuses a v2 server/client with a clear message
+instead of issuing calls that cannot work. Remote `task`/`bulk` require the v2
+worktree API; remote session-control and read-only run modes remain available on
+v1.
 
 `send` and the run-mode submit path write a short-lived admission marker under
 `~/.local/state/opencode-dispatch/pending/` (override the root with

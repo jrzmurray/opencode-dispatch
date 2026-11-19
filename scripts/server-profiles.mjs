@@ -51,6 +51,7 @@ function isLoopback(address) {
 export function resolveProfile({
   defs = {},
   name = "default",
+  serverExplicit = false,
   file = "servers.json",
   cliListen = "",
   cliHost = "",
@@ -60,6 +61,22 @@ export function resolveProfile({
   envPort = "",
   env = process.env,
 } = {}) {
+  // A host override that exactly matches a configured profile should inherit
+  // that endpoint's directory, API pin, model, client binary, and credentials.
+  // This lets `--host ideapad5.home` target the same remote project as
+  // `--server ideapad5`, while an explicit --server remains authoritative.
+  if (!serverExplicit && name === "default" && (cliHost || envHost)) {
+    const targetHost = String(cliHost || envHost).toLowerCase().replace(/\.$/, "");
+    const targetPort = Number.parseInt(cliPort || envPort || "4096", 10);
+    const matches = Object.entries(defs).filter(([candidateName, candidate]) => {
+      if (candidateName.startsWith("_") || candidateName === "credentials" || !candidate || typeof candidate !== "object") return false;
+      const candidateHost = String(candidate.host || (isLoopback(candidate.listen || "127.0.0.1") ? candidate.listen || "127.0.0.1" : "")).toLowerCase().replace(/\.$/, "");
+      const candidatePort = Number.parseInt(candidate.port || "4096", 10);
+      return candidateHost === targetHost && candidatePort === targetPort;
+    });
+    if (matches.length > 1) throw new Error(`multiple server profiles match ${targetHost}:${targetPort}; pass --server <name>`);
+    if (matches.length === 1) name = matches[0][0];
+  }
   if (name === "credentials") {
     throw new Error(`"credentials" is a reserved key in ${file} (address-keyed credential map), not a server profile`);
   }
@@ -147,6 +164,7 @@ function main() {
       const profile = resolveProfile({
         defs,
         name: process.env.SRV_NAME || "default",
+        serverExplicit: process.env.SERVER_EXPLICIT === "1",
         file,
         cliListen: process.env.CLI_LISTEN,
         cliHost: process.env.CLI_HOST,

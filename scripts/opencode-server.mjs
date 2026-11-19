@@ -380,12 +380,12 @@ export class OpenCodeClient {
     return { "x-opencode-directory": encodeURIComponent(directory) };
   }
 
-  async request(method, pathname, { query = {}, body, timeoutMs = this.timeoutMs, headers: extraHeaders } = {}) {
+  async request(method, pathname, { query = {}, body, timeoutMs = this.timeoutMs, headers: extraHeaders, responseType = "json" } = {}) {
     const url = new URL(`${this.baseUrl}${pathname}`);
     for (const [key, value] of Object.entries(query)) {
       if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
     }
-    const headers = { accept: "application/json", ...extraHeaders };
+    const headers = { accept: responseType === "text" ? "*/*" : "application/json", ...extraHeaders };
     // v2 fixes basic auth to username `opencode`; a profile's custom username
     // only applies to v1 servers.
     const auth = basicAuthHeader(this._resolvedApi === API_V2 ? DEFAULT_USERNAME : this.username, this.password);
@@ -410,6 +410,7 @@ export class OpenCodeClient {
           url: url.toString(),
         });
       }
+      if (responseType === "text") return text;
       if (!text) return undefined;
       try {
         return JSON.parse(text);
@@ -430,6 +431,104 @@ export class OpenCodeClient {
     const api = await this.resolveApi();
     if (api === API_V2) return this.request("GET", "/api/info", { timeoutMs: Math.min(this.timeoutMs, 5_000) });
     return this.request("GET", "/session", { timeoutMs: Math.min(this.timeoutMs, 5_000) });
+  }
+
+  /** Projects and server-managed worktrees are available on the v2 API only. */
+  async listProjects() {
+    const api = await this.resolveApi();
+    if (api !== API_V2) throw new OpenCodeServerError("remote worktrees require an OpenCode v2 server", { status: 0 });
+    const response = await this.request("GET", "/api/project");
+    return Array.isArray(response?.data) ? response.data : Array.isArray(response) ? response : [];
+  }
+
+  /** Read a project file through the location-scoped v2 filesystem API. */
+  async readFile(filePath, directory) {
+    const parts = String(filePath || "").split("/").filter(Boolean);
+    if (parts.length === 0 || parts.some((part) => part === "." || part === "..")) {
+      throw new Error("remote file path must be a non-empty relative path without dot segments");
+    }
+    const pathname = "/api/fs/read/" + parts.map(encodeURIComponent).join("/");
+    return this.request("GET", pathname, {
+      headers: this.locationHeaders(directory),
+      responseType: "text",
+    });
+  }
+
+  /** Run a non-interactive command on the v2 server for a specific location. */
+  async createShell({ directory, cwd, command, timeout } = {}) {
+    const api = await this.resolveApi();
+    if (api !== API_V2) throw new OpenCodeServerError("remote bootstrap requires the OpenCode v2 shell API", { status: 0 });
+    const response = await this.request("POST", "/api/shell", {
+      headers: this.locationHeaders(directory),
+      body: {
+        command,
+        ...(cwd ? { cwd } : {}),
+        ...(timeout !== undefined ? { timeout } : {}),
+      },
+    });
+    return response?.data || response;
+  }
+
+  /** Get the status and exit code of a v2 server shell command. */
+  async getShell(shellId, { directory } = {}) {
+    const api = await this.resolveApi();
+    if (api !== API_V2) throw new OpenCodeServerError("remote bootstrap requires the OpenCode v2 shell API", { status: 0 });
+    const response = await this.request("GET", "/api/shell/" + encodeURIComponent(shellId), {
+      headers: this.locationHeaders(directory),
+    });
+    return response?.data || response;
+  }
+
+  /** Read captured output from a v2 server shell command. */
+  async getShellOutput(shellId, { directory, cursor = 0, limit = 16_000 } = {}) {
+    const api = await this.resolveApi();
+    if (api !== API_V2) throw new OpenCodeServerError("remote bootstrap requires the OpenCode v2 shell API", { status: 0 });
+    const response = await this.request("GET", "/api/shell/" + encodeURIComponent(shellId) + "/output", {
+      headers: this.locationHeaders(directory),
+      query: { cursor, limit },
+    });
+    return response?.data || response;
+  }
+
+  /** Stop and remove one v2 server shell command. */
+  async removeShell(shellId, { directory } = {}) {
+    const api = await this.resolveApi();
+    if (api !== API_V2) throw new OpenCodeServerError("remote bootstrap requires the OpenCode v2 shell API", { status: 0 });
+    return this.request("DELETE", "/api/shell/" + encodeURIComponent(shellId), {
+      headers: this.locationHeaders(directory),
+    });
+  }
+
+  async listWorktrees(projectID) {
+    const api = await this.resolveApi();
+    if (api !== API_V2) throw new OpenCodeServerError("remote worktrees require an OpenCode v2 server", { status: 0 });
+    const response = await this.request("GET", "/api/worktree", { query: { projectID } });
+    return Array.isArray(response?.data) ? response.data : Array.isArray(response) ? response : [];
+  }
+
+  async createWorktree({ projectID, from, branch, directory, name } = {}) {
+    const api = await this.resolveApi();
+    if (api !== API_V2) throw new OpenCodeServerError("remote worktrees require an OpenCode v2 server", { status: 0 });
+    const response = await this.request("POST", "/api/worktree", {
+      body: {
+        projectID,
+        ...(from ? { from } : {}),
+        ...(branch ? { branch } : {}),
+        ...(directory ? { directory } : {}),
+        ...(name ? { name } : {}),
+      },
+      timeoutMs: Math.max(this.timeoutMs, 10 * 60_000),
+    });
+    return response?.data || response;
+  }
+
+  async removeWorktree({ projectID, directory, force = false } = {}) {
+    const api = await this.resolveApi();
+    if (api !== API_V2) throw new OpenCodeServerError("remote worktrees require an OpenCode v2 server", { status: 0 });
+    return this.request("DELETE", "/api/worktree", {
+      body: { projectID, directory, force },
+      timeoutMs: Math.max(this.timeoutMs, 60_000),
+    });
   }
 
   async createSession({ directory, parentId, title, agent, model, permission } = {}) {

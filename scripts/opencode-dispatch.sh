@@ -15,7 +15,7 @@
 # blocking `opencode run` that prints output inline (for quick/small asks).
 #
 # Modes:
-#   review    Review the local git changes (uses the `review` agent).
+#   review    Review local changes or run Git/gh diff reads on the remote server.
 #   plan      Read-only analysis / planning, no edits (built-in `plan` agent).
 #   ask       Question answering, no edits (built-in `plan` agent).
 #   task      Agentic build task — the model may edit files and run commands.
@@ -68,16 +68,20 @@
 #                             tree; working-tree = uncommitted changes only
 #                             (git diff HEAD); branch = --base <ref>...HEAD
 #                             (requires --base).
-#   --pr <n>                  (review) review GitHub PR #n: fetches `gh pr diff <n>`
-#                             IN-SCRIPT and uploads it to the delegate — the diff
-#                             never returns to the caller's context. Needs gh+auth.
+#   --pr <n>                  (review) review GitHub PR #n. Local mode fetches the
+#                             diff here; remote mode runs `gh pr diff` on the server.
+#                             Needs gh+auth wherever the diff runs (remote server
+#                             for remote mode).
 #   --repo <owner/repo>       (review with --pr) explicit repo for gh pr diff,
-#                             for when the --dir has no git remote (default:
-#                             inferred from --dir's origin remote).
+#                             when gh cannot infer the remote repository.
 #   --dir <path>              Directory to root the SESSION in (default: current
-#                             dir). Passed as ?directory= on create+prompt, so a
-#                             single shared server can run each session in its own
-#                             worktree — no server-per-agent needed.
+#                             dir). For remote endpoints this must be an absolute
+#                             path on the server; it is not resolved against a
+#                             projects root.
+#   --project <id|name|path>  (remote task/bulk) select a project known to the
+#                             server and resolve its canonical server-side path.
+#   --remote                  Treat this endpoint as remote even if addressed via
+#                             localhost (for example, an SSH tunnel).
 #   --prompt-file <path>      (run modes + send) preferred source of the
 #                             message/task. --brief is an alias for this flag.
 #                             Plain positional prompt text is ALSO
@@ -90,9 +94,9 @@
 #                             context can always re-read the file. Positional
 #                             arguments are space-joined into one line (no line
 #                             breaks unless an argument itself contains one).
-#                             task/bulk additionally copy the prompt into the
-#                             worker's worktree as ./.opencode-task-brief.md
-#                             (git-excluded) and tell the worker to re-read it.
+#                             task/bulk preserve the prompt in the worker worktree
+#                             as ./.opencode-task-brief.md and tell the worker to
+#                             re-read it (local mode excludes it from git).
 #                             Historical rationale (superseded text follows): for large prompts and to avoid
 #                             shell quoting/arg-length issues. Positionals and --prompt-file are mutually exclusive.
 #   --direct                  (run modes) invoke the opencode CLI DIRECTLY — a
@@ -285,7 +289,7 @@ Usage: opencode-dispatch.sh <mode> [flags] [message...]
 Delegate work to a persistent opencode server (or run one-shot with --direct).
 
 Modes:
-  review      Review local git changes or a GitHub PR (read-only; agent 'review').
+  review      Review local changes or run Git/gh diff reads on the remote server.
   plan        Read-only analysis/planning (agent 'plan').
   ask         Read-only question answering (agent 'plan').
   task        Agentic build task in a freshly allocated worktree (agent 'auto').
@@ -298,9 +302,9 @@ Modes:
   history     Print a session transcript (bound with --tail/--turns/--since).
   send        Message an existing session (completion-loop reply, or --steer/--queue).
   abort       Interrupt a session's in-progress turn.
-  teardown    Remove a finished task: print the files left in its worktree (first
-              80 bytes of the first 5), delete the worktree, and delete the session's
-              rows from the OpenCode database (session + event_sequence).
+  teardown    Remove a finished task: preview local leftovers or remove the remote
+              worktree through the server API, and delete the session through the
+              OpenCode API.
               Usage: teardown --task <taskID> [--force]
                      teardown --session <sessionID> [--dir <path>]
               --session deletes one session through the native server API without
@@ -341,6 +345,12 @@ Run-mode flags (review|plan|ask|task|bulk):
   --variant <name>    Raw provider variant passthrough.
   --agent <name>      Override the agent (plan|ask -> plan; task|bulk -> auto).
   --dir <path>        Directory to root the session in (default: current dir).
+                      For remote servers, use an absolute path on that server.
+  --project <id|name|path>  (remote task/bulk) resolve an OpenCode project on
+                      the server and create the worker from its canonical path.
+                      It can be different on each invocation; do not combine
+                      it with --dir.
+  --remote            Treat this endpoint as remote (also useful with SSH tunnels).
   --prompt-file <path>  Preferred prompt source (alias: --brief). Plain
                       positional prompt text
                       is also accepted (space-joined); the two are mutually
@@ -366,7 +376,8 @@ Status flags (status):
 
 Review-only flags:
   --base <ref>        Diff base ref (the job's base branch), e.g. main.
-  --pr <n>            Review GitHub PR #n (needs gh + auth).
+  --pr <n>            Review GitHub PR #n (needs gh + auth on the server for
+                      remote review; local review uses local gh).
   --repo <owner/repo> Explicit repo for --pr when --dir has no git remote.
   --scope <auto|working-tree|branch>  What to diff; branch requires --base.
 
@@ -446,7 +457,7 @@ if [ "$MODE" = "--help" ] || [ "$MODE" = "--usage" ] || [ "$MODE" = "-?" ]; then
 fi
 for _a in "$@"; do
   case "$_a" in
-    --help|--usage|-?) print_usage; exit 0 ;;
+    --help|--usage|-\?) print_usage; exit 0 ;;
   esac
 done
 
@@ -465,6 +476,7 @@ REPO=""
 PR=""
 SCOPE=""
 DIR="$PWD"
+PROJECT_SELECTOR=""
 FORMAT=""
 TAIL="100"
 TAIL_SET=""
@@ -474,6 +486,7 @@ STEER=""
 QUEUE=""
 WAIT=""
 DIRECT=""
+REMOTE_FORCE=""
 FOLLOW=""
 AWAIT=""
 NO_AWAIT=""
@@ -497,6 +510,8 @@ if [ -z "$ORCHESTRATION_ROOT" ]; then
   unset _self_dir
 fi
 WORKTREE_ROOT="${AGENT_WORKTREE_ROOT:-}"
+WORKTREE_ROOT_SET=""
+REMOTE_WORKTREE_ROOT="${OPENCODE_DISPATCH_REMOTE_WORKTREE_ROOT:-}"
 TASK_ID=""
 PROMPT_FILE=""
 API_SETTING="${OPENCODE_DISPATCH_API:-}"
@@ -532,6 +547,7 @@ while [ $# -gt 0 ]; do
     --repo)              REPO="${2:-}"; shift 2 ;;
     --scope)             SCOPE="${2:-}"; shift 2 ;;
     --dir)               DIR="${2:-}"; DIR_SET=1; shift 2 ;;
+    --project)           PROJECT_SELECTOR="${2:-}"; shift 2 ;;
     --prompt-file|--brief) PROMPT_FILE="${2:-}"; shift 2 ;;
     --json)              FORMAT="json"; shift ;;
     --tail)              TAIL="${2:-}"; TAIL_SET=1; shift 2 ;;
@@ -543,6 +559,7 @@ while [ $# -gt 0 ]; do
     --background)        AWAIT=1; NO_AWAIT=""; shift ;;
     --await)             echo "error: --await was removed — use --background instead (the default: job runs in the background, wrapper waits, caller woken on completion) or --wait (blocks the session until the turn completes)." >&2; exit 2 ;;
     --direct)            DIRECT=1; shift ;;
+    --remote)            REMOTE_FORCE=1; shift ;;
     --follow)            FOLLOW=1; shift ;;
     --always)            ALWAYS=1; shift ;;
     --summarize)         echo "error: --summarize was removed — run modes now always return the session transcript's final message (no remote summary step)" >&2; exit 2 ;;
@@ -550,7 +567,7 @@ while [ $# -gt 0 ]; do
     --stall)             STALL_SECS="${2:-}"; shift 2 ;;
     --require-dir)       REQUIRE_DIR=1; shift ;;
     --orchestration-root) ORCHESTRATION_ROOT="${2:-}"; shift 2 ;;
-    --worktree-root)     WORKTREE_ROOT="${2:-}"; shift 2 ;;
+    --worktree-root)     WORKTREE_ROOT="${2:-}"; WORKTREE_ROOT_SET=1; shift 2 ;;
     --bootstrap-cmd)     BOOTSTRAP_CMD="${2:-}"; shift 2 ;;
     --task)              TASK_ID="${2:-}"; shift 2 ;;
     --teardown)          TEARDOWN=1; shift ;;
@@ -596,7 +613,7 @@ esac
 # the password into the wrong variable). \x1f is literal, so every field slot
 # survives, including empty ones.
 IFS=$'\x1f' read -r SERVER_NAME LISTEN HOST PORT SERVE_DIR SERVE_PASSWORD DEF_MODEL DEF_API SERVE_BIN SERVE_USERNAME < <(
-  SRV_NAME="$SERVER_NAME" SERVERS_FILE="$SERVERS_FILE" \
+  SRV_NAME="$SERVER_NAME" SERVER_EXPLICIT="${SERVER_SET:-}" SERVERS_FILE="$SERVERS_FILE" \
   CLI_LISTEN="$LISTEN" CLI_HOST="$HOST" CLI_PORT="$PORT" \
   ENV_LISTEN="${OPENCODE_DISPATCH_LISTEN:-}" \
   ENV_HOST="${OPENCODE_DISPATCH_HOST:-}" \
@@ -613,16 +630,6 @@ API_SETTING="${API_SETTING:-auto}"
 # generation (per-profile only; no global default — PATH `opencode` otherwise).
 # It is validated where it is actually launched (require_client_bin), so
 # read-only HTTP modes are not blocked by a missing binary.
-# Binding a non-loopback interface without a password would expose an
-# unauthenticated server on the network — refuse.
-case "$LISTEN" in
-  127.*|localhost|::1) ;;
-  *)
-    if [ -z "$SERVE_PASSWORD" ]; then
-      echo "error: server '$SERVER_NAME' binds non-loopback interface '$LISTEN' — set a credential for ${HOST}:${PORT} in servers.json (\"credentials\" or the profile) or OPENCODE_SERVER_CREDENTIALS, or it would be reachable without auth" >&2
-      exit 2
-    fi ;;
-esac
 # Profile fields feed the session defaults: directory root + dispatch model.
 [ -z "$DIR_SET" ] && [ -n "$SERVE_DIR" ] && DIR="$SERVE_DIR"
 [ -z "$MODEL" ] && [ -n "$DEF_MODEL" ] && MODEL="$DEF_MODEL"
@@ -630,6 +637,42 @@ esac
 SERVE_ARGS_FILE="${TMPDIR:-/tmp}/opencode-serve/serve-${SERVER_NAME}.args"
 
 BASE_URL="http://${HOST}:${PORT}"
+SERVER_IS_LOCAL="$(MODULE="$SCRIPT_DIR/opencode-server.mjs" URL="$BASE_URL" node --input-type=module -e 'import { pathToFileURL } from "node:url"; const { isLocalServerUrl } = await import(pathToFileURL(process.env.MODULE)); process.stdout.write(isLocalServerUrl(process.env.URL) ? "1" : "0")' 2>/dev/null || printf '0')"
+SERVER_IS_REMOTE=1
+[ "$SERVER_IS_LOCAL" = "1" ] && SERVER_IS_REMOTE=0
+[ -n "$REMOTE_FORCE" ] && SERVER_IS_REMOTE=1
+if [ "$SERVER_IS_REMOTE" = "1" ] && [[ "$DIR" != /* ]]; then
+  if [ -z "$PROJECT_SELECTOR" ]; then
+    echo "error: remote --dir must be an absolute path on the server (the dispatcher does not resolve it relative to a projects root): $DIR" >&2
+    exit 2
+  fi
+fi
+if [ -n "$PROJECT_SELECTOR" ]; then
+  case "$MODE" in
+    task|bulk) ;;
+    *) echo "error: --project is only supported for remote task/bulk" >&2; exit 2 ;;
+  esac
+  if [ "$SERVER_IS_REMOTE" != "1" ]; then
+    echo "error: --project requires a remote server endpoint" >&2
+    exit 2
+  fi
+  if [ -n "$DIR_SET" ]; then
+    echo "error: use either --project or --dir, not both" >&2
+    exit 2
+  fi
+fi
+# Binding a non-loopback interface without a password would expose a locally
+# started server on the network. Remote profiles are only API targets here.
+if [ "$SERVER_IS_LOCAL" = "1" ]; then
+  case "$LISTEN" in
+    127.*|localhost|::1) ;;
+    *)
+      if [ -z "$SERVE_PASSWORD" ]; then
+        echo "error: server '$SERVER_NAME' binds non-loopback interface '$LISTEN' — set a credential for ${HOST}:${PORT} in servers.json (\"credentials\" or the profile) or OPENCODE_SERVER_CREDENTIALS, or it would be reachable without auth" >&2
+        exit 2
+      fi ;;
+  esac
+fi
 # opencode serve's basic auth pairs a username (OPENCODE_SERVER_USERNAME,
 # default 'opencode' — the server validates it, verified on 1.18.9) with the
 # password. Both the launched server and every client use the SAME resolved
@@ -651,9 +694,10 @@ refresh_dir_query() {
 
 resolve_task_context() {
   [ -n "$TASK_ID" ] || return 0
-  local orch="${ORCHESTRATION_ROOT:-$DIR/scripts}" status_json
+  local orch="${ORCHESTRATION_ROOT:-$SCRIPT_DIR}" status_json
+  if [ -z "$ORCHESTRATION_ROOT" ] && [ ! -f "$orch/agent-status.mjs" ] && [ "$SERVER_IS_REMOTE" != "1" ]; then orch="$DIR/scripts"; fi
   [ -f "$orch/agent-status.mjs" ] || { echo "error: task lifecycle helper not found: $orch/agent-status.mjs" >&2; exit 5; }
-  status_json="$(node "$orch/agent-status.mjs" --from "$DIR" --worktree-root "${WORKTREE_ROOT:-}" --task "$TASK_ID" --json)" || exit 5
+  status_json="$(node "$orch/agent-status.mjs" --from "$DIR" --worktree-root "${WORKTREE_ROOT:-}" --server "$BASE_URL" --task "$TASK_ID" --json)" || exit 5
   IFS=$'\t' read -r SID DIR < <(printf '%s' "$status_json" | node -e '
     const rows=JSON.parse(require("fs").readFileSync(0,"utf8"));
     const r=rows[0]; if(!r?.sessionId||!r?.worktreePath) process.exit(1);
@@ -732,7 +776,7 @@ prompt_rebuild() {  # $1 = leading positional arg to keep ("" = none); rest = pr
   [ -n "$REPO" ] && args+=( --repo "$REPO" )
   [ -n "$PR" ] && args+=( --pr "$PR" )
   [ -n "$SCOPE" ] && args+=( --scope "$SCOPE" )
-  args+=( --dir "$DIR" )
+  if [ -n "$PROJECT_SELECTOR" ]; then args+=( --project "$PROJECT_SELECTOR" ); else args+=( --dir "$DIR" ); fi
   [ -n "$FORMAT" ] && args+=( --json )
   [ -n "$TAIL_SET" ] && args+=( --tail "$TAIL" )
   [ -n "$TURNS" ] && args+=( --turns "$TURNS" )
@@ -740,6 +784,8 @@ prompt_rebuild() {  # $1 = leading positional arg to keep ("" = none); rest = pr
   [ -n "$STEER" ] && args+=( --steer )
   [ -n "$QUEUE" ] && args+=( --queue )
   [ -n "$DIRECT" ] && args+=( --direct )
+  [ -n "$REMOTE_FORCE" ] && args+=( --remote )
+  [ -n "$BOOTSTRAP_CMD" ] && args+=( --bootstrap-cmd "$BOOTSTRAP_CMD" )
   [ -n "$FOLLOW" ] && args+=( --follow )
   [ -n "$AWAIT" ] && args+=( --background )
   [ -n "$NO_AWAIT" ] && args+=( --wait )
@@ -1176,6 +1222,11 @@ ensure_server() {  # auto-start in $DIR if none is reachable
     require_server
     return 0
   fi
+  if [ "$SERVER_IS_REMOTE" = "1" ]; then
+    echo "error: remote server $BASE_URL is unreachable; refusing to start a local server for remote directory $DIR" >&2
+    echo "  Start or reconnect the OpenCode server on the remote host, then retry." >&2
+    exit 5
+  fi
   echo "no opencode server ($SERVER_NAME) at $BASE_URL — starting one in ${DIR}…" >&2
   local rc=0
   start_server "$DIR" || rc=$?
@@ -1547,10 +1598,23 @@ if [ "$MODE" = "serve" ]; then
   # dialect: both v1 and v2 accept --port/--hostname and the same credential
   # env names (v2's shared `opencode service` remains a separate, unmanaged
   # option). The started server's dialect is detected, not assumed.
-  check_pairing
+  [ "$SERVER_IS_REMOTE" = "1" ] || check_pairing
   prune_prompt_files
   if [ -n "$STOP" ] && [ -n "$RESTART" ]; then
     echo "error: --stop and --restart are mutually exclusive" >&2; exit 2
+  fi
+  if [ "$SERVER_IS_REMOTE" = "1" ]; then
+    if [ -n "$STOP" ] || [ -n "$RESTART" ]; then
+      echo "error: serve --stop/--restart only manages servers on this machine; manage $BASE_URL on its host" >&2
+      exit 2
+    fi
+    if ! server_up; then
+      echo "error: remote server $BASE_URL is not reachable; serve cannot start a process on that host" >&2
+      exit 5
+    fi
+    require_server
+    echo "opencode server '$SERVER_NAME' already running at $BASE_URL (dialect: $RESOLVED_API)"
+    exit 0
   fi
   if [ -n "$STOP" ]; then
     stop_server || exit 6
@@ -1672,9 +1736,10 @@ if [ "$MODE" = "status" ]; then
     # change", which still converges via the timeout.
     _wtsid="${MSG_PARTS[0]:-}"
     if [ -z "$_wtsid" ] && [ -n "${TASK_ID:-}" ]; then
-      _orch="${ORCHESTRATION_ROOT:-$DIR/scripts}"
+      _orch="${ORCHESTRATION_ROOT:-$SCRIPT_DIR}"
+      if [ -z "$ORCHESTRATION_ROOT" ] && [ ! -f "$_orch/agent-status.mjs" ] && [ "$SERVER_IS_REMOTE" != "1" ]; then _orch="$DIR/scripts"; fi
       if [ -f "$_orch/agent-status.mjs" ]; then
-        _wtsid="$(node "$_orch/agent-status.mjs" --from "$DIR" --worktree-root "${WORKTREE_ROOT:-}" --task "$TASK_ID" --json 2>/dev/null \
+        _wtsid="$(node "$_orch/agent-status.mjs" --from "$DIR" --worktree-root "${WORKTREE_ROOT:-}" --server "$BASE_URL" --task "$TASK_ID" --json 2>/dev/null \
           | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const r=JSON.parse(d)[0];process.stdout.write(r?.sessionId||"")}catch(e){}})')" || _wtsid=""
       fi
     fi
@@ -2060,9 +2125,11 @@ fi
 # preview), removes the worktree, and deletes the session's database rows.
 run_teardown() {  # $1=taskID [extra agent-cleanup args...]
   local task="$1"; shift
-  local orch="${ORCHESTRATION_ROOT:-$DIR/scripts}"
+  local orch="${ORCHESTRATION_ROOT:-$SCRIPT_DIR}"
+  if [ -z "$ORCHESTRATION_ROOT" ] && [ ! -f "$orch/agent-cleanup.mjs" ] && [ "$SERVER_IS_REMOTE" != "1" ]; then orch="$DIR/scripts"; fi
   [ -f "$orch/agent-cleanup.mjs" ] || { echo "error: cleanup helper not found: $orch/agent-cleanup.mjs" >&2; return 5; }
   local cargs=( --task "$task" --from "$DIR" --teardown )
+  cargs+=( --server "$BASE_URL" )
   [ -n "$WORKTREE_ROOT" ] && cargs+=( --worktree-root "$WORKTREE_ROOT" )
   [ -n "$FORMAT" ] && cargs+=( --json )
   OPENCODE_PASSWORD="${SERVE_PASSWORD:-}" OPENCODE_SERVER_PASSWORD="${SERVE_PASSWORD:-}" \
@@ -2221,6 +2288,11 @@ case "$MODE" in
   *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac
 AGENT_USE="${AGENT:-$AGENT_DEF}"
+if [ "$MODE" = "review" ] && [ "$SERVER_IS_REMOTE" = "1" ] && [ -z "$AGENT" ]; then
+  # The bundled review agent is read-only and denies bash, while remote review
+  # needs git/gh on the server. Session permissions below keep edits denied.
+  AGENT_USE="auto"
+fi
 
 # v2 leaves a newly created session's model empty; the turn then falls back to
 # the server default instead of the agent's configured model. Resolve the
@@ -2228,7 +2300,7 @@ AGENT_USE="${AGENT:-$AGENT_DEF}"
 # normalized `debug config`) and send it explicitly. An explicit --model /
 # OPENCODE_DISPATCH_MODEL wins; a profile "model" is only the fallback when the
 # agent has no configured model.
-if [ -z "$MODEL_EXPLICIT" ] && [ -f "$SCRIPT_DIR/agent-config.mjs" ]; then
+if [ -z "$MODEL_EXPLICIT" ] && [ "$SERVER_IS_REMOTE" != "1" ] && [ -f "$SCRIPT_DIR/agent-config.mjs" ]; then
   _am="$(node "$SCRIPT_DIR/agent-config.mjs" --dir "$DIR" --agent "$AGENT_USE" --bin "$(client_bin)" 2>/dev/null || true)"
   if [ -n "$_am" ]; then
     _am_model="$(json_field "$_am" model)"
@@ -2249,10 +2321,19 @@ if [ -n "$SCOPE" ] && [ "$MODE" != "review" ]; then
   echo "error: --scope is only valid for 'review' (edit workers always operate on their allocated worktree)" >&2; exit 2
 fi
 diff=""
+REMOTE_REVIEW=""
 if [ "$MODE" = "review" ]; then
   diff="$(mktemp "${TMPDIR:-/tmp}/opencode-diff.XXXXXX")"
   trap 'rm -f "$diff"' EXIT
-  if [ -n "$PR" ]; then
+  if [ "$SERVER_IS_REMOTE" = "1" ]; then
+    if [ "$SCOPE" = "working-tree" ] && [ -n "$BASE" ]; then
+      echo "error: --scope working-tree conflicts with --base" >&2; exit 2
+    fi
+    if [ "$SCOPE" = "branch" ] && [ -z "$BASE" ]; then
+      echo "error: --scope branch needs --base <ref> (the base branch for the job)" >&2; exit 2
+    fi
+    REMOTE_REVIEW=1
+  elif [ -n "$PR" ]; then
     # Fetch the GitHub PR diff via gh, in-script. Requires gh + auth.
     if ! command -v gh >/dev/null 2>&1; then
       echo "error: --pr needs the GitHub CLI (gh). Install: brew install gh; then: gh auth login" >&2
@@ -2288,12 +2369,16 @@ if [ "$MODE" = "review" ]; then
   else
     git -C "$DIR" diff HEAD > "$diff" 2>/dev/null || git -C "$DIR" diff > "$diff"
   fi
-  if [ ! -s "$diff" ]; then echo "Nothing to review (empty diff for the selected scope)."; exit 0; fi
+  if [ -z "$REMOTE_REVIEW" ] && [ ! -s "$diff" ]; then echo "Nothing to review (empty diff for the selected scope)."; exit 0; fi
 else
   [ -z "$MSG" ] && { echo "error: a message/task is required" >&2; exit 2; }
 fi
 
 if [ -n "$DIRECT" ]; then
+  if [ "$SERVER_IS_REMOTE" = "1" ]; then
+    echo "error: --direct runs the OpenCode client on this machine and cannot use remote project paths; use the server-backed mode" >&2
+    exit 2
+  fi
   # One-shot local runs execute the client binary directly; the run flags
   # differ between generations (v1: --dir/--variant; v2: cwd + --server and
   # provider/model#variant). v2 one-shots are not wired yet — refuse instead
@@ -2338,14 +2423,30 @@ fi
 # Session creation/submission go through the dialect adapter (oc_create_session
 # / oc_submit_async), so run modes speak both generations. Still check the
 # client pairing before the isolated worker launcher starts one.
-check_pairing
+ [ "$SERVER_IS_REMOTE" = "1" ] || check_pairing
 ensure_server
 
 # assemble the prompt text into a file (safe for huge review diffs over HTTP)
 msgfile="$(mktemp "${TMPDIR:-/tmp}/opencode-msg.XXXXXX")"
 trap 'rm -f "$diff" "$msgfile"' EXIT
 if [ "$MODE" = "review" ]; then
-  if [ -n "$PR" ]; then
+  if [ -n "$REMOTE_REVIEW" ]; then
+    if [ -n "$PR" ]; then
+      _quoted_pr="$(printf '%q' "$PR")"
+      _repo_option=""
+      [ -n "$REPO" ] && _repo_option=" --repo $(printf '%q' "$REPO")"
+      review_source="Run gh pr diff ${_quoted_pr}${_repo_option} from this remote project, then review that diff."
+    elif [ "$SCOPE" = "working-tree" ]; then
+      review_source="Run git diff HEAD in this remote worktree and review the result."
+    elif [ "$SCOPE" = "branch" ] || [ -n "$BASE" ]; then
+      _quoted_base="$(printf '%q' "$BASE")"
+      review_source="Run git diff ${_quoted_base}...HEAD in this remote worktree (fall back to git diff ${_quoted_base} if the three-dot range is unavailable), then review the result."
+    else
+      review_source="Run git diff HEAD in this remote worktree and review the result."
+    fi
+    { printf '%s\n\n' "${MSG:-Review the selected changes.} Report concrete issues only and cite file:line."; printf '%s\n' "$review_source"; printf '%s\n' "Do not edit files. Read the remote repository directly and return only actionable findings."; } > "$msgfile"
+    title="review: ${DIR##*/}"
+  elif [ -n "$PR" ]; then
     default_intro="Review the following diff for GitHub PR #$PR."; title="review PR #$PR: ${DIR##*/}"
   else
     default_intro="Review the following git diff."; title="review: ${DIR##*/}"
@@ -2357,12 +2458,21 @@ elif [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
   # submitted message leads with that pointer. opencode prunes older tool
   # output to ~2k chars once a session grows, so a long brief WILL vanish from
   # the model's context mid-session — the on-disk copy is the recovery path.
-  {
+  if [ "$SERVER_IS_REMOTE" = "1" ]; then
+    {
+      printf '%s\n' "The complete task brief follows. Save it verbatim to .opencode-task-brief.md in the root of your remote worktree before implementation. Re-read it before each major step and whenever context is unclear."
+      printf '%s\n' "Keep scratch files inside the remote worktree."
+      printf '\n---\n\n'
+      printf '%s' "$MSG"
+    } > "$msgfile"
+  else
+    {
     printf '%s\n' "YOUR COMPLETE TASK BRIEF IS SAVED AT ./.opencode-task-brief.md (root of your working directory)."
     printf '%s\n' "Long sessions prune older tool output from your context. RE-READ that file (in chunks if large) before each major implementation step, and any time you are unsure of the spec."
     printf '%s\n\n---\n\n' "Keep all scratch files INSIDE your working directory (writing outside it, e.g. /tmp, can stall the session on a permission prompt no one can answer)."
     printf '%s' "$MSG"
-  } > "$msgfile"
+    } > "$msgfile"
+  fi
   title="$MODE: ${MSG:0:60}"
 else
   printf '%s' "$MSG" > "$msgfile"
@@ -2376,17 +2486,26 @@ fi
 ISOLATED=0
 if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
   ISOLATED=1
-  orch="${ORCHESTRATION_ROOT:-$DIR/scripts}"
+  orch="${ORCHESTRATION_ROOT:-$SCRIPT_DIR}"
+  if [ -z "$ORCHESTRATION_ROOT" ] && [ ! -f "$orch/spawn-agent.mjs" ] && [ "$SERVER_IS_REMOTE" != "1" ]; then orch="$DIR/scripts"; fi
   spawn="$orch/spawn-agent.mjs"
   if [ ! -f "$spawn" ]; then
     echo "error: isolated worker launcher not found: $spawn" >&2
     echo "  Set OPENCODE_ORCHESTRATION_ROOT or pass --orchestration-root <path>." >&2
     exit 5
   fi
-  spawn_args=("$spawn" --from "$DIR" --server "$BASE_URL" --opencode "$(client_bin)" --agent "${AGENT_USE:-auto}" --prompt-file "$msgfile" --allow-edit --allow-bash)
+  spawn_args=("$spawn" --server "$BASE_URL" --opencode "$(client_bin)" --agent "${AGENT_USE:-auto}" --prompt-file "$msgfile" --allow-edit --allow-bash)
+  if [ -n "$PROJECT_SELECTOR" ]; then spawn_args+=(--project "$PROJECT_SELECTOR"); else spawn_args+=(--from "$DIR"); fi
+  [ "$SERVER_IS_REMOTE" = "1" ] && spawn_args+=(--remote)
+  [ -n "$BASE" ] && spawn_args+=(--base "$BASE")
   [ -n "$MODEL" ] && spawn_args+=(--model "$MODEL")
   [ -n "$VARIANT" ] && spawn_args+=(--variant "$VARIANT")
-  [ -n "$WORKTREE_ROOT" ] && spawn_args+=(--worktree-root "$WORKTREE_ROOT")
+  if [ "$SERVER_IS_REMOTE" = "1" ]; then
+    if [ -n "$WORKTREE_ROOT_SET" ] && [ -n "$WORKTREE_ROOT" ]; then spawn_args+=(--worktree-root "$WORKTREE_ROOT")
+    elif [ -n "$REMOTE_WORKTREE_ROOT" ]; then spawn_args+=(--worktree-root "$REMOTE_WORKTREE_ROOT"); fi
+  elif [ -n "$WORKTREE_ROOT" ]; then
+    spawn_args+=(--worktree-root "$WORKTREE_ROOT")
+  fi
   [ -n "$BOOTSTRAP_CMD" ] && spawn_args+=(--bootstrap-cmd "$BOOTSTRAP_CMD")
   worker_json="$(OPENCODE_PASSWORD="${SERVE_PASSWORD:-}" OPENCODE_SERVER_PASSWORD="${SERVE_PASSWORD:-}" \
     OPENCODE_SERVER_USERNAME="${SERVER_USERNAME:-opencode}" node "${spawn_args[@]}")" || { echo "error: isolated worker launch failed" >&2; exit 5; }
@@ -2400,12 +2519,12 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
   # Land the durable brief copy the submitted message points at. Local-only:
   # excluded from git so it can never ride into a commit. (The submit is
   # async; this cp completes long before the model's first read.)
-  if cp "$msgfile" "$DIR/.opencode-task-brief.md" 2>/dev/null; then
+  if [ "$SERVER_IS_REMOTE" != "1" ] && cp "$msgfile" "$DIR/.opencode-task-brief.md" 2>/dev/null; then
     excl="$(git -C "$DIR" rev-parse --git-path info/exclude 2>/dev/null || true)"
     if [ -n "$excl" ]; then
       grep -qxF ".opencode-task-brief.md" "$excl" 2>/dev/null || echo ".opencode-task-brief.md" >> "$excl"
     fi
-  else
+  elif [ "$SERVER_IS_REMOTE" != "1" ]; then
     echo "warning: could not write $DIR/.opencode-task-brief.md (worker must rely on in-context brief)" >&2
   fi
   refresh_dir_query
@@ -2426,7 +2545,11 @@ if [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; then
   # branch and worktree are. stderr, so the distilled reply on stdout stays clean.
   print_worker_footer() {
     local state="kept"
-    [ -d "$WORKER_WORKTREE" ] || state="removed (torn down)"
+    if [ "$SERVER_IS_REMOTE" != "1" ]; then
+      [ -d "$WORKER_WORKTREE" ] || state="removed (torn down)"
+    elif [ -n "${WORKER_TORN_DOWN:-}" ]; then
+      state="removed (torn down)"
+    fi
     {
       echo "[$MODE] task:     ${TASK_ID:-?}"
       echo "[$MODE] branch:   ${WORKER_BRANCH:-?}"
@@ -2440,6 +2563,9 @@ fi
 if [ "$ISOLATED" -eq 0 ]; then
 perm=""
 { [ "$MODE" = "task" ] || [ "$MODE" = "bulk" ]; } && perm='[{"permission":"edit","pattern":"**","action":"allow"},{"permission":"bash","pattern":"**","action":"allow"}]'
+if [ "$MODE" = "review" ] && [ -n "$REMOTE_REVIEW" ]; then
+  perm='[{"permission":"edit","pattern":"**","action":"deny"},{"permission":"bash","pattern":"**","action":"allow"}]'
+fi
 
 SID="$(oc_create_session "$AGENT_USE" "$MODEL" "$VARIANT" "$title" "$perm")" || { echo "error: could not create session" >&2; exit 5; }
 oc_submit_async "$SID" "$msgfile" "$AGENT_USE" "$MODEL" "$VARIANT" || { echo "error: could not submit prompt to $SID" >&2; exit 5; }
@@ -2486,7 +2612,11 @@ if [ -n "$AWAIT" ]; then
       # (agent-cleanup refuses while the PID lives), so retry a few times.
       td_ok=""
       for _try in 1 2 3 4 5; do
-        if run_teardown "$TASK_ID"; then td_ok=1; break; fi
+        if run_teardown "$TASK_ID"; then
+          td_ok=1
+          if [ "$SERVER_IS_REMOTE" = "1" ]; then WORKER_TORN_DOWN=1; fi
+          break
+        fi
         sleep 3
       done
       [ -n "$td_ok" ] || echo "warning: teardown of $TASK_ID failed; clean up manually: $(basename "$0") teardown --task $TASK_ID" >&2

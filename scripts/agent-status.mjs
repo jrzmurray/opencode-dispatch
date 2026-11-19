@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-/** Report the local ownership record and server/worktree health for workers. */
+/** Report local or remote task ownership records and server/worktree health. */
 
 import fs from "node:fs";
 import path from "node:path";
 
-import { OpenCodeClient } from "./opencode-server.mjs";
+import { isLocalServerUrl, OpenCodeClient } from "./opencode-server.mjs";
+import { listRemoteTaskRecords, readRemoteTaskRecord } from "./remote-task-utils.mjs";
 import {
   canonicalPath,
   countDirty,
@@ -107,6 +108,61 @@ async function serverHealth(client, record) {
   }
 }
 
+async function remoteServerHealth(client, record) {
+  if (!client || !record.sessionId) return { checked: false, exists: false, directoryMatches: false };
+  try {
+    const session = await client.getSession(record.sessionId, { directory: record.worktreePath });
+    const messages = await client.messages(record.sessionId, { directory: record.worktreePath, limit: 20 }).catch(() => []);
+    const last = messages.at(-1);
+    const working = last?.role === "user" || (last?.role === "assistant" && !last?.completed);
+    return {
+      checked: true,
+      exists: Boolean(session?.id),
+      directory: session?.directory || null,
+      directoryMatches: Boolean(session?.directory && path.posix.normalize(session.directory) === path.posix.normalize(record.worktreePath)),
+      working,
+      title: session?.title || null,
+    };
+  } catch (error) {
+    return { checked: true, exists: false, directoryMatches: false, error: error?.message || String(error) };
+  }
+}
+
+function remoteTaskState(record, server) {
+  if (!server.checked) return "server-unreachable";
+  if (!server.exists) return "session-missing";
+  if (!server.directoryMatches) return "session-directory-mismatch";
+  if (record.state === "failed-cleanup-required") return record.state;
+  if (record.state === "completed" || record.state === "failed") return record.state;
+  if (server.working) return "running";
+  return "idle";
+}
+
+async function remoteRows(records, serverUrl) {
+  const rows = [];
+  for (const record of records) {
+    const configuredServerUrl = serverUrl || record.serverUrl;
+    const client = configuredServerUrl ? new OpenCodeClient({ baseUrl: configuredServerUrl }) : null;
+    const server = await remoteServerHealth(client, record);
+    rows.push({
+      taskId: record.taskId,
+      label: record.label,
+      state: remoteTaskState(record, server),
+      branch: record.branch,
+      worktreePath: record.worktreePath,
+      sessionId: record.sessionId,
+      pid: null,
+      remote: true,
+      local: { remote: true, pathExists: null, dirtyFiles: null, pidAlive: false },
+      server,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      recordPath: record.recordPath,
+    });
+  }
+  return rows;
+}
+
 function deriveState(record, local, server) {
   if (!local.pathSafe) return "invalid-record-path";
   if (!local.pathExists) return "missing-worktree";
@@ -122,6 +178,32 @@ function deriveState(record, local, server) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  if (options.task) {
+    let remote = null;
+    try { remote = readRemoteTaskRecord(options.task, options.server); } catch {}
+    if (remote) {
+      const rows = await remoteRows([remote], options.server);
+      if (options.json) console.log(JSON.stringify(rows, null, 2));
+      else {
+        const row = rows[0];
+        console.log("TASK\tSTATE\tBRANCH\tPID\tDIRTY\tWORKTREE\tSESSION");
+        console.log([row.taskId, row.state, row.branch, "-", "remote", row.worktreePath, row.sessionId || "-"].join("\t"));
+      }
+      return;
+    }
+    if (options.server && !isLocalServerUrl(options.server)) {
+      throw new Error(`remote agent task not found: ${options.task}`);
+    }
+  } else if (options.server && !isLocalServerUrl(options.server)) {
+    const rows = await remoteRows(listRemoteTaskRecords(options.server), options.server);
+    if (options.json) console.log(JSON.stringify(rows, null, 2));
+    else if (rows.length === 0) console.log("No remote agent records.");
+    else {
+      console.log("TASK\tSTATE\tBRANCH\tPID\tDIRTY\tWORKTREE\tSESSION");
+      for (const row of rows) console.log([row.taskId, row.state, row.branch, "-", "remote", row.worktreePath, row.sessionId || "-"].join("\t"));
+    }
+    return;
+  }
   const repository = getRepositoryInfo(options.from);
   const environment = { ...process.env };
   if (options.worktreeRoot) environment.AGENT_WORKTREE_ROOT = options.worktreeRoot;
