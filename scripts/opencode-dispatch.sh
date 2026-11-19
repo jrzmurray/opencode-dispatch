@@ -1339,6 +1339,13 @@ if [ "$MODE" = "setup" ]; then
   "$(client_bin)" auth list 2>/dev/null | sed 's/^/  /' || echo "  (none — run: opencode auth login)"
   echo "models available:"
   "$(client_bin)" models 2>/dev/null | sed 's/^/  - /' | head -40 || echo "  (run after auth to list)"
+  # Install drift: is this installed copy still what the checkout has?
+  if [ -f "$SCRIPT_DIR/opencode-install-check.mjs" ]; then
+    echo "install:"
+    inst_out="$(node "$SCRIPT_DIR/opencode-install-check.mjs" "$SCRIPT_DIR" 2>&1)" && inst_rc=0 || inst_rc=$?
+    printf '%s\n' "$inst_out" | sed 's/^/  /'
+    [ "$inst_rc" = 0 ] || echo "  WARNING: installed opencode-dispatch has drifted from its checkout; re-run ./install.sh" >&2
+  fi
   exit 0
 fi
 

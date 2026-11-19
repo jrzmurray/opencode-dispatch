@@ -47,6 +47,13 @@ Options:
                           registration and drop the skills and guard hook
                           directly into Codex's auto-discovered paths
                           (~/.codex/skills/, ~/.codex/hooks.json).
+  --check                 Report whether the PROFILE-scope install
+                          ($CLAUDE/scripts and the Codex script dirs) matches
+                          this checkout (source SHA in
+                          .opencode-dispatch-install.json plus a byte compare
+                          of every installed script); exit 1 on drift.
+                          Re-run ./install.sh to update. /opencode:setup runs
+                          the same check and warns on drift.
   --help, --usage, -?              Show this help and exit.
 
 Environment:
@@ -59,6 +66,7 @@ Claude install (--claude):
   scripts/opencode-hang-diag.sh     -> same dirs
   scripts/opencode-set-model.sh     -> same dirs
   scripts/opencode-guard.sh         -> same dirs
+  scripts/opencode-install-check.mjs -> same dirs (drift check)
   scripts/{spawn-agent,agent-status,agent-cleanup,agent-worker-guard,
           worktree-utils,opencode-server,api-dialect,oc-api,agent-config,
           server-profiles,prune-named-sessions}.mjs
@@ -111,7 +119,14 @@ Codex install (--codex):
 
   Repo scope (--scope repo): the skills + guard hook are dropped directly into
   <repo>/.codex/skills/ and <repo>/.codex/hooks.json. No marketplace or plugin
-  registration (those are user-profile concepts).
+  registration (those are user-profile concepts). See README "Known issues".
+
+  Profile Codex installs are self-contained (no ~/.claude dependency): the
+  dispatch wrapper + agent launcher + guard go to the plugin's scripts/
+  (~/.codex/plugins/opencode-dispatch/scripts/) or, with --no-marketplace, to
+  ~/.codex/scripts/, and the generated skills call them there. `--codex` alone
+  never touches ~/.claude. Re-installs remove stale scripts the previous
+  install put there (listed in the install stamp).
 
 The installer never reads or writes provider credentials.
 
@@ -121,8 +136,9 @@ Next:
 EOF
 }
 
-CLAUDE=""
+DO_CLAUDE=""
 CODEX=""
+CHECK=""
 SCOPE="profile"
 SCOPE_SET=""
 TARGET_REPO=""
@@ -130,17 +146,43 @@ NO_MARKETPLACE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|--usage|-\?) print_help; exit 0 ;;  # NOTE: \-? escaped — bare ? would glob-match -s/-r
-    --claude) CLAUDE=1; shift ;;
+    --claude) DO_CLAUDE=1; shift ;;
     --codex) CODEX=1; shift ;;
-    -s|--scope) SCOPE="${2:-}"; SCOPE_SET=1; shift 2 ;;
-    -r|--repo) TARGET_REPO="${2:-}"; shift 2 ;;
+    -s|--scope) [ $# -ge 2 ] || { echo "error: $1 needs a value (profile|repo)" >&2; exit 2; }; SCOPE="$2"; SCOPE_SET=1; shift 2 ;;
+    -r|--repo) [ $# -ge 2 ] || { echo "error: $1 needs a path" >&2; exit 2; }; TARGET_REPO="$2"; shift 2 ;;
     --no-marketplace) NO_MARKETPLACE=1; shift ;;
+    --check) CHECK=1; shift ;;
     *) echo "error: unknown argument: $1 (see: ./install.sh --help)" >&2; exit 2 ;;
   esac
 done
 
+# --check: drift detection for the PROFILE-scope installs, then exit. Without
+# --claude/--codex, checks every profile install that has a stamp.
+if [ -n "$CHECK" ]; then
+  check_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  ch_claude="${CLAUDE_HOME:-$HOME/.claude}/scripts"
+  checked=0; drift=0
+  chk() {  # $1 label, $2 dir, $3 requested(1/"")
+    if [ ! -f "$2/.opencode-dispatch-install.json" ] && [ -n "$3" ]; then
+      echo "== $1: $2"; checked=1; echo "no install stamp (not installed, or installed by an older install.sh)"; drift=1
+    elif [ -f "$2/.opencode-dispatch-install.json" ]; then
+      echo "== $1: $2"; checked=1
+      node "$check_repo/scripts/opencode-install-check.mjs" "$2" "$check_repo" || drift=1
+    fi
+  }
+  chk "claude" "$ch_claude" "$DO_CLAUDE"
+  chk "codex (plugin)" "$HOME/.codex/plugins/opencode-dispatch/scripts" ""
+  chk "codex (direct)" "$HOME/.codex/scripts" ""
+  if [ -n "$CODEX" ] && [ ! -f "$HOME/.codex/plugins/opencode-dispatch/scripts/.opencode-dispatch-install.json" ] \
+     && [ ! -f "$HOME/.codex/scripts/.opencode-dispatch-install.json" ]; then
+    echo "== codex: no install stamp found (not installed, or installed by an older install.sh)"; drift=1
+  fi
+  [ "$checked" = 1 ] || { echo "no opencode-dispatch profile install found"; drift=1; }
+  exit "$drift"
+fi
+
 # No target = same as --help: print, do nothing.
-if [ -z "$CLAUDE" ] && [ -z "$CODEX" ]; then
+if [ -z "$DO_CLAUDE" ] && [ -z "$CODEX" ] && [ -z "$CHECK" ]; then
   print_help
   exit 0
 fi
@@ -183,31 +225,76 @@ if [ "$SCOPE" = "repo" ]; then
 fi
 
 CLAUDE="${CLAUDE_HOME:-$HOME/.claude}"
-LAUNCHER_FILES=(spawn-agent.mjs agent-status.mjs agent-cleanup.mjs agent-worker-guard.mjs worktree-utils.mjs opencode-server.mjs api-dialect.mjs oc-api.mjs agent-config.mjs server-credentials.cjs server-profiles.mjs prune-named-sessions.mjs)
 CONFIG="$HOME/.config/opencode/opencode.json"
 echo "repo:   $REPO"
 echo "claude: $CLAUDE"
+
+# Scripts every install carries. The agent launcher (task/bulk edit workers) is
+# installed beside opencode-dispatch.sh, which locates it relative to itself.
+DISPATCH_SCRIPTS="opencode-dispatch.sh opencode-hang-diag.sh opencode-set-model.sh opencode-guard.sh opencode-install-check.mjs"
+LAUNCHER_SCRIPTS="spawn-agent.mjs agent-status.mjs agent-cleanup.mjs agent-worker-guard.mjs worktree-utils.mjs opencode-server.mjs api-dialect.mjs oc-api.mjs agent-config.mjs server-credentials.cjs server-profiles.mjs prune-named-sessions.mjs"
+STAMP_NAME=".opencode-dispatch-install.json"
+
+# Install the script set into $1. Profile scope also (a) removes files a previous
+# install put there that are no longer part of the set (listed in the old
+# stamp) and (b) writes the install stamp (source SHA + checkout + file list)
+# that `install.sh --check` and /opencode:setup compare against.
+install_script_set() {  # $1 = scripts dir
+  local dest="$1" f
+  mkdir -p "$dest"
+  if [ "$SCOPE" != "repo" ] && [ -f "$dest/$STAMP_NAME" ]; then
+    node - "$dest" "$DISPATCH_SCRIPTS $LAUNCHER_SCRIPTS" <<'EOF'
+      const fs = require("fs"), path = require("path");
+      const [dest, keep] = process.argv.slice(2);
+      const keepSet = new Set(keep.split(/\s+/));
+      let old = [];
+      try { old = JSON.parse(fs.readFileSync(path.join(dest, ".opencode-dispatch-install.json"), "utf8")).files || []; } catch {}
+      for (const f of old) {
+        if (!keepSet.has(f) && !f.includes("/") && !f.includes("..")) {
+          try { fs.rmSync(path.join(dest, f)); console.log("removed stale: " + path.join(dest, f)); } catch {}
+        }
+      }
+EOF
+  fi
+  for f in $DISPATCH_SCRIPTS $LAUNCHER_SCRIPTS; do
+    install -m 0755 "$REPO/scripts/$f" "$dest/$f"
+    echo "installed: $dest/$f"
+  done
+  if [ "$SCOPE" != "repo" ]; then
+    node - "$dest/$STAMP_NAME" "$REPO" "$DISPATCH_SCRIPTS $LAUNCHER_SCRIPTS" "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" "${STAMP_COMMANDS_DIR:-}" <<'EOF'
+      const fs = require("fs");
+      const [out, repo, files, sha, commandsDir] = process.argv.slice(2);
+      const stamp = { sourceSha: sha, sourceRepo: repo, installedAt: new Date().toISOString(), files: files.split(/\s+/) };
+      if (commandsDir) stamp.commandsDir = commandsDir;
+      fs.writeFileSync(out, JSON.stringify(stamp, null, 2) + "\n");
+EOF
+    echo "stamped:   $dest/$STAMP_NAME"
+  fi
+}
+
+# Copy commands/opencode to $1, replacing the Claude profile script path with
+# $2 (a path beginning with $HOME, kept literal). Used so the Codex skills call
+# the Codex-located wrapper rather than anything under ~/.claude.
+stage_codex_commands() {  # $1 = out dir, $2 = replacement scripts dir
+  mkdir -p "$1"
+  node - "$REPO/commands/opencode" "$1" "$2" <<'EOF'
+    const fs = require("fs"), path = require("path");
+    const [src, out, scripts] = process.argv.slice(2);
+    const from = '"$HOME/.claude/scripts/';
+    const to = '"' + scripts + '/';
+    for (const f of fs.readdirSync(src).filter(n => n.endsWith(".md"))) {
+      fs.writeFileSync(path.join(out, f), fs.readFileSync(path.join(src, f), "utf8").split(from).join(to));
+    }
+EOF
+}
 
 # ---------------------------------------------------------------- claude ----
 install_claude() {  # $1 = install root (profile: $CLAUDE, repo: $REPO/.claude)
   local ROOT="$1"
 
-  # 1) scripts
-  mkdir -p "$ROOT/scripts"
-  install -m 0755 "$REPO/scripts/opencode-dispatch.sh" "$ROOT/scripts/opencode-dispatch.sh"
-  echo "installed: $ROOT/scripts/opencode-dispatch.sh"
-  install -m 0755 "$REPO/scripts/opencode-hang-diag.sh" "$ROOT/scripts/opencode-hang-diag.sh"
-  echo "installed: $ROOT/scripts/opencode-hang-diag.sh"
-  install -m 0755 "$REPO/scripts/opencode-set-model.sh" "$ROOT/scripts/opencode-set-model.sh"
-  echo "installed: $ROOT/scripts/opencode-set-model.sh"
-  install -m 0755 "$REPO/scripts/opencode-guard.sh" "$ROOT/scripts/opencode-guard.sh"
-  echo "installed: $ROOT/scripts/opencode-guard.sh"
-  # Worker launcher for task/bulk: the dispatcher finds it next to itself.
-  # The modules import each other by relative path, so they install together.
-  for f in "${LAUNCHER_FILES[@]}"; do
-    install -m 0755 "$REPO/scripts/$f" "$ROOT/scripts/$f"
-  done
-  echo "installed: $ROOT/scripts/ worker launcher (${LAUNCHER_FILES[*]})"
+  # 1) scripts (dispatch + agent launcher, side by side); the stamp also records
+  # the commands dir so --check / setup compare the installed commands too.
+  STAMP_COMMANDS_DIR="$ROOT/commands/opencode" install_script_set "$ROOT/scripts"
 
   # 2) slash commands
   mkdir -p "$ROOT/commands/opencode"
@@ -344,16 +431,22 @@ install_codex() {
 JSON
   echo "wrote:   $PLUGIN_DIR/.codex-plugin/plugin.json"
 
-  # 2) skills: generate from commands/opencode via the sync script
+  # 2) skills: generate from commands/opencode via the sync script, with the
+  # script path pointed at this plugin's own scripts/ (self-contained: no
+  # ~/.claude dependency).
+  STAGE="$(mktemp -d)"
+  stage_codex_commands "$STAGE" '$HOME/.codex/plugins/opencode-dispatch/scripts'
   if node "$REPO/scripts/sync-claude-commands-to-skills.ts" \
-      --codex --out="$PLUGIN_DIR/skills" --name-prefix=opencode >/dev/null 2>&1; then
+      --codex --out="$PLUGIN_DIR/skills" --name-prefix=opencode --source="$STAGE" >/dev/null 2>&1; then
     echo "skills:  $PLUGIN_DIR/skills/ ($(ls "$PLUGIN_DIR/skills" | wc -l | tr -d ' ') opencode-* skills)"
   else
     echo "warning: skill generation failed (needs Node >= 22.6); the plugin will install without skills" >&2
   fi
 
-  # 3) tail-guard hook, bundled with the Codex block convention (exit 2)
-  install -m 0755 "$REPO/scripts/opencode-guard.sh" "$PLUGIN_DIR/scripts/opencode-guard.sh"
+  rm -rf "$STAGE"
+
+  # 3) dispatch wrapper + launcher + tail-guard hook (Codex block convention, exit 2)
+  install_script_set "$PLUGIN_DIR/scripts"
   cat > "$PLUGIN_DIR/hooks/hooks.json" <<'JSON'
 {
   "hooks": {
@@ -439,18 +532,32 @@ install_codex_direct() {  # $1 = install root (profile: $HOME/.codex, repo: $REP
   SCRIPTS_DIR="$ROOT/scripts"
   HOOKS_FILE="$ROOT/hooks.json"
 
-  # 1) skills — flat under ~/.codex/skills/<opencode-*>/SKILL.md (auto-discovered)
+  # 1) skills — flat under ~/.codex/skills/<opencode-*>/SKILL.md (auto-discovered).
+  # Profile scope is self-contained: the dispatch wrapper + launcher go to
+  # $SCRIPTS_DIR and the skills call them there (no ~/.claude dependency).
+  # Repo scope is unchanged: skills generated from the unmodified commands.
+  SOURCE_ARG=""; STAGE=""
+  if [ "$SCOPE" != "repo" ]; then
+    STAGE="$(mktemp -d)"
+    stage_codex_commands "$STAGE" '$HOME/.codex/scripts'
+    SOURCE_ARG="--source=$STAGE"
+  fi
   if node "$REPO/scripts/sync-claude-commands-to-skills.ts" \
-      --codex --out="$SKILLS_DIR" --name-prefix=opencode >/dev/null 2>&1; then
+      --codex --out="$SKILLS_DIR" --name-prefix=opencode ${SOURCE_ARG:+"$SOURCE_ARG"} >/dev/null 2>&1; then
     echo "skills:  $SKILLS_DIR/ ($(ls "$SKILLS_DIR" | wc -l | tr -d ' ') opencode-* skills, auto-discovered)"
   else
     echo "warning: skill generation failed (needs Node >= 22.6); installing the guard hook only" >&2
   fi
+  [ -n "$STAGE" ] && rm -rf "$STAGE"
 
-  # 2) guard script
-  mkdir -p "$SCRIPTS_DIR"
-  install -m 0755 "$REPO/scripts/opencode-guard.sh" "$SCRIPTS_DIR/opencode-guard.sh"
-  echo "installed: $SCRIPTS_DIR/opencode-guard.sh"
+  # 2) scripts (profile: dispatch + launcher + guard; repo: guard only, as before)
+  if [ "$SCOPE" = "repo" ]; then
+    mkdir -p "$SCRIPTS_DIR"
+    install -m 0755 "$REPO/scripts/opencode-guard.sh" "$SCRIPTS_DIR/opencode-guard.sh"
+    echo "installed: $SCRIPTS_DIR/opencode-guard.sh"
+  else
+    install_script_set "$SCRIPTS_DIR"
+  fi
 
   # 3) hooks.json — merge the PreToolUse entry (never clobber existing hooks).
   # If the existing file is not valid JSON, skip registration rather than
@@ -488,7 +595,7 @@ EOF
 }
 
 # ------------------------------------------------------------------ main ----
-if [ -n "$CLAUDE" ]; then
+if [ -n "$DO_CLAUDE" ]; then
   if [ "$SCOPE" = "repo" ]; then
     install_claude "$TARGET_REPO/.claude"
   else
@@ -507,7 +614,7 @@ fi
 
 echo
 echo "Done."
-if [ -n "$CLAUDE" ]; then
+if [ -n "$DO_CLAUDE" ]; then
   echo "  1) opencode auth login       (authenticate a provider — credentials are stored by opencode itself, never in env vars or config files)"
   echo "  2) /opencode:setup           (verify install/auth/models)"
 fi
