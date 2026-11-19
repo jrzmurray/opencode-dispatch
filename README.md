@@ -25,7 +25,7 @@ worker scripts are documented under "Agent launcher scripts" below.
 | `scripts/opencode-guard.sh` | `~/.claude/scripts/opencode-guard.sh` | PreToolUse hook (Bash matcher) that throws if `opencode-dispatch.sh` output is piped through `tail`. |
 | `commands/opencode/*.md` | `~/.claude/commands/opencode/` | Claude Code slash-command instructions. |
 | `install.sh` | not installed | Installs the surfaces above, registers the tail-guard hook in `~/.claude/settings.json` (merged, never clobbered), and copies the config samples (`config/opencode.json`, `config/servers.json.example`) into `~/.config/…` only when no file exists there yet. It never reads or writes provider credentials. |
-| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`) | `~/.claude/scripts/` (installed next to the dispatcher) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, and cleans up. |
+| `scripts/spawn-agent.mjs` and helpers (`agent-status.mjs`, `agent-cleanup.mjs`, `agent-worker-guard.mjs`, `worktree-utils.mjs`, `opencode-server.mjs`, `api-dialect.mjs`, `oc-api.mjs`, `agent-config.mjs`, `server-profiles.mjs`, `server-credentials.cjs`, `prune-named-sessions.mjs`) | `~/.claude/scripts/` (installed next to the dispatcher) | Allocates worktrees, runs the target repo's bootstrap hook, verifies sessions, reports status, cleans up, prunes old named sessions, resolves profiles/credentials, and owns the v1/v2 API dialect layer. |
 
 The skill repository is not the worker repository. `install.sh` installs the
 launcher scripts next to `opencode-dispatch.sh`, and the dispatcher finds them
@@ -38,6 +38,10 @@ What each item is actually needed for:
 
 - **OpenCode CLI on `PATH`** — every mode; the wrapper exits 4 when it is
   missing (`brew install sst/tap/opencode`, or `npm i -g opencode-ai`).
+  Both server generations are supported: v1 (1.18.29+) and v2 (2.x). A
+  server and the client binary launched against it must be the same
+  generation; the dispatcher detects the dialect and refuses mismatches. See
+  [COMPATIBILITY.md](COMPATIBILITY.md).
 - **Node.js** — the wrapper needs Node 18+ (the `follow` mode uses built-in
   `fetch`). Two features need newer Node: `identify`'s database fallback uses
   `node:sqlite` (Node 22.5+) and the Codex skill generator uses native
@@ -48,8 +52,8 @@ What each item is actually needed for:
   `--codex` needs Codex with plugin support. The read-only Claude modes need
   only OpenCode + Node.
 - **An authenticated OpenCode provider** — run `opencode auth login` once per
-  provider. opencode stores credentials itself; never set API keys in
-  environment variables or config files.
+  provider. The dispatcher uses OpenCode's own credential store; the separate
+  Go usage script can also read `OPENCODE_GO_API_KEYS` as described below.
 - **The launcher scripts (`scripts/*.mjs`, in this repo)** — only the
   edit-capable `task` and `bulk` modes need them: `spawn-agent.mjs`,
   `worktree-utils.mjs`, `opencode-server.mjs`, `agent-worker-guard.mjs`,
@@ -57,8 +61,21 @@ What each item is actually needed for:
   the dispatcher, which finds them there; `OPENCODE_ORCHESTRATION_ROOT` or
   `--orchestration-root` overrides (fallback: `<--dir>/scripts`). A per-repo bootstrap hook is optional (see below). Read-only and control modes (`review`, `plan`, `ask`,
   `follow`, `status`, `history`, `send`, `abort`, …) run without them.
-- **A clean source worktree for edit tasks** — enforced by the external
-  launcher; uncommitted source changes are not copied into a worker worktree.
+- **Dirty source worktrees are allowed for edit tasks** — workers start from the
+  selected Git ref (`HEAD` by default); uncommitted source changes stay in the
+  source checkout and are not copied into a worker worktree.
+
+## OpenCode v1 and v2 support
+
+This dispatcher speaks both the original opencode server API (**v1**, opencode
+1.18.29+) and the revised **v2** API (opencode 2.x). The dialect is detected by
+probing the server; each profile may pin `api` and the client binary it uses
+(`bin`), and a server/client generation mismatch is refused before anything
+launches. Not every mode is v2-ready yet — the per-mode matrix and the rollout
+plan live in [COMPATIBILITY.md](COMPATIBILITY.md). Modes that are not ported
+refuse a v2 server with a clear error instead of issuing calls that cannot
+work. `/opencode:setup` prints each profile's live dialect and the resolved
+profile's pairing.
 
 ## Installation
 
@@ -154,14 +171,84 @@ host        addressable host the dispatcher reaches the server at
             a password)
 port        server port (default 4096)
 dir         server working directory
-password    basic-auth password (username defaults to `opencode`)
+            (absolute server-side path for remote profiles)
+username    optional basic-auth username for this profile (default `opencode`)
+password    optional basic-auth password for this profile
 model       default provider/model for dispatch through this profile
 ```
 
+Credentials are per address. A profile's `username`/`password` apply to that
+profile; profiles without one use the top-level `credentials` map, keyed by
+`host`, `host:port`, or a full URL.
+
+The single `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` value is only the
+last-resort fallback for a profile with no keyed credential — it never
+overrides an address-specific one.
+
+Where each layer lives:
+
+| Layer | Location | Scope |
+| --- | --- | --- |
+| profiles + top-level `credentials` map | `~/.config/opencode-dispatch/servers.json` (or `$OPENCODE_DISPATCH_SERVERS`) | persistent; `install.sh` seeds it from `config/servers.json.example` and never overwrites it |
+| `OPENCODE_SERVER_CREDENTIALS` map, `OPENCODE_SERVER_USERNAME`, single password | `.env.local` next to the installed dispatch scripts (e.g. `~/.claude/scripts/.env.local`), or `$OPENCODE_DISPATCH_ENV_FILE` | persistent per install; exported variables win over the file |
+| same variables exported in a shell | the invoking shell / process tree | that invocation only, unless placed in a shell profile |
+
+The `credentials` map is a sibling of the profiles in `servers.json`, not a
+field inside a profile:
+
+```json
+{
+  "work": { "listen": "0.0.0.0", "host": "127.0.0.1", "port": 4096 },
+  "credentials": { "127.0.0.1:4096": "local-pw" }
+}
+```
+
+A profile's own `username`/`password` is also valid and takes precedence over
+the map. The single `OPENCODE_SERVER_PASSWORD` only applies to profiles whose
+address has no keyed or profile credential.
+
+The bind address (`listen`) and the connection address (`host`) are separate
+on purpose. Credentials are keyed by the **connection** address: a profile that
+binds `0.0.0.0` but sets `host: "127.0.0.1"` uses the `127.0.0.1` credential;
+the same bind with `host: "192.0.2.50"` uses that address's credential.
+`0.0.0.0`/`::` are never valid connection addresses, so a wildcard bind without
+an explicit `host` is refused rather than guessed. `localhost` and `127.0.0.1`
+are treated as the same loopback credential key.
+
 `--server <name>` (or `$OPENCODE_DISPATCH_SERVER`, or `serve <name>`) selects a
 profile; per-field precedence is CLI flag > env (`OPENCODE_DISPATCH_*`) >
-definition. Default profile: `default` (127.0.0.1:4096) — the single-server
-behavior when no definitions file exists.
+definition. If `--host` (or `OPENCODE_DISPATCH_HOST`) exactly matches a profile's
+host and port and no profile name was selected, that profile supplies its
+directory, credentials, API pin, and model. Default profile: `default`
+(127.0.0.1:4096) — the single-server behavior when no definitions file exists.
+
+Two optional fields tune the server generation (see
+[COMPATIBILITY.md](COMPATIBILITY.md)):
+
+```text
+api         API dialect pin: auto (default; probe the server) | v1 | v2
+bin         opencode client binary paired with THIS profile's generation
+            (per-profile; default: `opencode` on PATH)
+```
+
+`setup` shows each profile's live dialect and the resolved profile's binary
+pairing status.
+
+### Agent model resolution
+
+A per-agent `model` in `opencode.json` is honored on both generations. Run
+modes resolve the selected agent's effective model through the client binary's
+normalized `opencode debug config` output and send it explicitly when the
+session is created/submitted (v2 otherwise leaves the session model empty and
+falls back to the server default). Precedence:
+
+1. `--model` / `OPENCODE_DISPATCH_MODEL` (explicit)
+2. the selected agent's `model` from `opencode.json`
+3. the profile's `model` default
+
+`--effort` / `--variant` override the agent's configured variant. If the binary
+does not support `debug config` (older v1) or the config cannot be read, the
+dispatcher leaves the model unset and relies on the server's own resolution.
 
 ### Credentials (`.env.local`)
 
@@ -170,11 +257,39 @@ cp .env.local.example .env.local    # gitignored; install.sh copies it next
 $EDITOR .env.local                  # to the installed scripts
 ```
 
-Only `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD` are read; an
-exported shell variable always wins over the file. The resolved pair
-authenticates every HTTP request and is exported to servers the dispatcher
-starts, so server and clients always share one credential. Binding a
-non-loopback interface requires a password.
+`.env.local` accepts `OPENCODE_SERVER_USERNAME`, the password names
+`OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` (one slot), and
+`OPENCODE_SERVER_CREDENTIALS` — an object keyed by `host`, `host:port`, or a
+full URL. An exported shell variable always wins over the file, and the v1/v2
+password names share one slot (neither file value overrides an exported
+variable under the other name).
+
+`OPENCODE_SERVER_CREDENTIALS` accepts JSON and the JavaScript-style form used
+by older instructions (unquoted keys and values):
+
+```bash
+OPENCODE_SERVER_CREDENTIALS='{127.0.0.1:4096:{password:"secret"}}'
+OPENCODE_SERVER_CREDENTIALS='{127.0.0.1:4096:{username:me,password:secret}}'
+OPENCODE_SERVER_CREDENTIALS='{127.0.0.1:4096:secret}'
+```
+
+Both forms are parsed by one shared parser, so the dispatcher, profile
+resolver, prune script, and tests accept the same syntax. Quote a password that
+contains a comma, closing brace, or trailing whitespace.
+
+Resolution for each request is by the address actually used:
+
+1. `OPENCODE_SERVER_CREDENTIALS` (environment or `.env.local`),
+2. the selected profile's `username`/`password`,
+3. the `credentials` map in `servers.json`,
+4. the single `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD` fallback.
+
+The winning pair authenticates the server, and only that pair is exported to
+each launched client/helper (under the names its dialect reads), so server and
+clients always share one credential. A private `opencode serve` started by the
+dispatcher receives the same resolved pair (both dialect names), so it cannot
+start with a credential different from the clients it serves. Binding a
+non-loopback interface requires a credential for that address.
 
 ### Agent config (`opencode.json`)
 
@@ -186,6 +301,22 @@ commands rely on. The installer copies it to `~/.config/opencode/opencode.json`
 only when no config exists there yet; it never modifies it beyond that
 copy-if-absent step. Manage it by hand or with `/opencode:model`; restart the
 server for changes to take effect.
+
+### OpenCode Go usage
+
+Run `node scripts/opencode-go-usage.mjs` to print the rolling, weekly, and
+monthly Go usage percentages. It gathers `OPENCODE_GO_API_KEYS` and
+`OPENCODE_API_KEY` from the shell, `.env.local`, or `.env` (shell values win;
+`.env.local` wins over `.env`), Go provider keys from
+`~/.config/opencode/opencode.json` or `opencode.jsonc`, and Go credentials from
+OpenCode's legacy auth file or SQLite credential store. Duplicate keys are
+checked once, and the script never prints key values.
+
+The module can also be imported without running the CLI. It exports
+`getOpenCodeGoUsage(apiKey)`, `getOpenCodeGoUsages(apiKeys)`, and
+`getConfiguredOpenCodeGoUsages()`. Each returns numeric `rolling`, `weekly`,
+and `monthly` percentages; the configured variant also includes credential
+source labels but never returns key values.
 
 ### Orchestration scripts
 
@@ -202,14 +333,14 @@ it on a trusted local filesystem; it is executable orchestration code.
 
 ### Agent launcher scripts
 
-Standalone commands (run from the clean source worktree of the target repo, or
+Standalone commands (run from the source worktree of the target repo, or
 pass `--from <path>`):
 
 | Command | Purpose |
 | --- | --- |
-| `node <scripts>/spawn-agent.mjs [--label n] [--base ref] [--bootstrap-cmd cmd] [--no-bootstrap] [--prepare-only\|--dry-run] -- <prompt>` | Allocate a task, create a locked worktree and branch, run the bootstrap hook, create a directory-bound session on the persistent server, run the guard, and launch the attached worker. Prints one JSON record. |
-| `node <scripts>/agent-status.mjs [--task <id>] [--json]` | Read-only report of local process, worktree, and server-session state. |
-| `node <scripts>/agent-cleanup.mjs --task <id> [--dry-run] [--delete-branch] [--force]` | Fail-closed stop/remove/archive of one task. |
+| `node <scripts>/spawn-agent.mjs [--remote] [--project <id\|name\|path>] [--label n] [--base ref] [--bootstrap-cmd cmd] [--no-bootstrap] [--prepare-only\|--dry-run] -- <prompt>` | Allocate a task. Local mode uses a locked local worktree and attached worker; `--remote` resolves a server project, creates its v2 worktree, runs bootstrap, then submits directly to the remote session. Remote worktrees default to a uniquely named sibling directory beside the project; use `--worktree-root` to choose a server-side root. |
+| `node <scripts>/agent-status.mjs [--task <id>] [--json]` | Read-only report of local or remote task and server-session state. |
+| `node <scripts>/agent-cleanup.mjs --task <id> [--dry-run] [--delete-branch] [--force]` | Fail-closed stop/remove/archive of one local or remote task. Remote cleanup uses the server API; remote branch deletion is not available. |
 | `node <scripts>/agent-worker-guard.mjs --metadata <task.json>` | Preflight assertion of repository, path, branch, and record. |
 
 Run `spawn-agent.mjs --help` for every flag.
@@ -217,7 +348,8 @@ Run `spawn-agent.mjs --help` for every flag.
 #### Per-repo bootstrap hook
 
 After the child worktree is created, `spawn-agent.mjs` runs one shell command in
-it (cwd = the child worktree). The command is chosen by, in order:
+it (cwd = the child worktree) before creating the task session. The command is
+chosen by, in order:
 
 1. `--bootstrap-cmd "<cmd>"`
 2. the `bootstrap` string in `<source repo>/.opencode-dispatch.json`:
@@ -227,12 +359,31 @@ it (cwd = the child worktree). The command is chosen by, in order:
    ```
 3. otherwise no bootstrap runs.
 
-`--no-bootstrap` disables the hook entirely. The command receives
-`AGENT_*` (task id, worktree path, branch, record) plus `WORKTREE_TASK_ID`,
+`--no-bootstrap` disables this dispatcher hook. The command receives task id,
+worktree path, and branch in `AGENT_*`, plus `WORKTREE_TASK_ID`,
 `WORKTREE_SOURCE_PATH`, `WORKTREE_ORIGIN=spawned-agent`,
 `WORKTREE_BOOTSTRAP_CHILD=0`, and `WORKTREE_SESSION_START=0`. A non-zero exit
-rolls the task back. The config file is read from the clean source checkout and
-executed as shell, so treat it like any other repo-controlled script.
+rolls the task back. For local workers, the config file is read from the source
+checkout (falling back to the primary repository root for a linked worktree).
+For remote workers, the launcher reads it through the server filesystem API and
+runs it through the server shell API, so the dispatcher does not need SSH
+access. The remote worktree API also runs OpenCode's project `commands.start`
+hook during creation; `.opencode-dispatch.json` runs afterward and before the
+session is created. A remote bootstrap failure triggers worktree cleanup and
+prevents session creation. A remote hook receives an empty `AGENT_METADATA_PATH`
+because its task record is local; `OPENCODE_SESSION_ID` is empty in both modes
+because the hook runs before the session exists. `--no-bootstrap` does not skip
+the OpenCode `commands.start` hook that the remote worktree API runs during
+creation. Treat the config as repo-controlled shell.
+
+The hook runs **in the child worktree**, which contains tracked files only. A
+command that references an untracked script (for example
+`node scripts/agent/bootstrap-worktree.mjs`) fails there even if the script
+exists in your source checkout: commit it, or pass `--bootstrap-cmd` with an
+absolute path. `/opencode:task` forwards `--bootstrap-cmd` and prints the
+resolved hook (or `(none)`) in its started block, and `spawn-agent` reports
+`bootstrap: <cmd>` / `bootstrap: ok` / a failure with the command's stderr on
+stderr.
 
 ### Environment variables
 
@@ -243,28 +394,51 @@ executed as shell, so treat it like any other repo-controlled script.
 | `OPENCODE_DISPATCH_HOST` / `OPENCODE_DISPATCH_PORT` | Dispatch server endpoint parts (override the resolved profile). |
 | `OPENCODE_DISPATCH_LISTEN` | Bind interface override for launches (same as `--listen`). |
 | `OPENCODE_DISPATCH_SERVER` | Server profile name (default `default`; same as `--server`). |
+| `OPENCODE_DISPATCH_API` | Server API dialect override (`auto` default; `v1` or `v2`; same as `--api`). |
 | `OPENCODE_DISPATCH_SERVERS` | Server definitions file (default `~/.config/opencode-dispatch/servers.json`). |
-| `OPENCODE_SERVER_PASSWORD` | Server password for HTTP requests; exported to launched servers. |
-| `OPENCODE_SERVER_USERNAME` | Server basic-auth username (default `opencode`); exported to launched servers. |
+| `OPENCODE_SERVER_PASSWORD` | Fallback password for profiles with no address-keyed credential; the v1 name (still read by v2 clients); exported to launched clients. |
+| `OPENCODE_PASSWORD` | v2 name for the same fallback password slot (preferred by v2 clients). |
+| `OPENCODE_SERVER_CREDENTIALS` | Credential object keyed by `host`, `host:port`, or URL; accepts JSON and the JavaScript-style `{host:port:{password:pw}}` form. Overrides `servers.json` and profile fields. |
+| `OPENCODE_SERVER_USERNAME` | Fallback v1 basic-auth username (default `opencode`); v2 fixes the username to `opencode`. |
 | `OPENCODE_DISPATCH_ENV_FILE` | Explicit path to a `.env.local`-style credential file. |
+| `OPENCODE_GO_API_KEYS` | Optional comma/space-separated list (or JSON array) of Go API keys for `scripts/opencode-go-usage.mjs`; exact duplicates are checked once. |
+| `OPENCODE_API_KEY` | Optional single Go API key for `scripts/opencode-go-usage.mjs`; `.env.local` overrides `.env`, while an exported shell value wins over both. |
 | `OPENCODE_SESSION_ID` / `_SLUG` / `_TITLE` / `_AGENT` / `_MODEL` / `_DIRECTORY` | The **executing** session's own identity, injected into every tool shell by the `opencode-identity` plugin (`plugins/opencode-identity.js`, installed to `~/.config/opencode/plugins/`). Parents and subagents each see their own id — the basis for `identify` / `claim`. |
 | `OPENCODE_STALENESS_FETCH_TTL` / `OPENCODE_STALENESS_NUDGE_AT` / `OPENCODE_STALENESS_HOT_PATHS` | Tuning for the `opencode-branch-staleness` plugin: seconds between real `git fetch`es (default 300), commits-behind threshold for escalated wording (default 25), and optional comma-separated paths whose changes are called out explicitly. |
 | `OPENCODE_DISPATCH_MODEL` | Default `provider/model` for dispatch. |
 | `AGENT_WORKTREE_ROOT` | Generic allocation root. |
+| `OPENCODE_DISPATCH_REMOTE_WORKTREE_ROOT` | Optional absolute worktree root on the remote server; local `AGENT_WORKTREE_ROOT` is not reused remotely. |
+| `AGENT_REGISTRY_ROOT` | Override the worker registry directory (used by the launcher and the session pruner). |
 | `AGENT_BRANCH_PREFIX` | Generic worker branch prefix. |
 | `AGENT_LOCK_TIMEOUT_MS` | Allocation lock wait timeout. |
 | `OPENCODE_DISPATCH_STALL_SECS` | Default `--background` inactivity threshold; `0` disables it. |
 
-The child launcher also passes task metadata to the worker through
+The local child launcher also passes task metadata to the worker through
 `AGENT_TASK_ID`, `AGENT_WORKTREE_PATH`, `AGENT_WORKTREE_BRANCH`,
 `AGENT_METADATA_PATH`, `OPENCODE_SESSION_ID`, and `OPENCODE_SERVER_URL`.
 
 ## One-server execution model
 
-Run exactly one local `opencode serve` per **server profile** for the endpoints
-used by the skill. The server is a session broker, not the ownership boundary.
-Each session receives an explicit `directory=<worktree>` query, so multiple
-workers can share the server without sharing a checkout.
+Run one `opencode serve` on each host that will run OpenCode work. Session
+control modes (`ask`, `send`, `status`, `history`, `follow`, and related
+commands) use the server API and pass `--dir` as an absolute path on that
+server. The dispatcher does not resolve relative paths against a projects root.
+A profile's `dir` is the default remote project path; otherwise pass `--dir`
+explicitly. It must name a project the server knows.
+
+Local `task`/`bulk` workers use a local Git worktree and an attached client.
+With a remote profile, they instead ask an OpenCode v2 server to create a native
+remote worktree, then submit the task to a session rooted there. The worker's
+tools therefore read and edit the remote files. Remote `review` also runs its
+Git or GitHub diff command on the server. `--direct` is local-only. Remote
+`task`/`bulk` require the server's v2 worktree API; v1 servers continue to
+support remote session-control and read-only run modes. Remote endpoints do not
+support `serve` process start/stop/restart, `--direct`, or dispatcher-side
+`identify <sessionID>`. `claim`/`release` use local claim files and need a shared
+`CLAIM_ROOT` to coordinate with remote work. Remote `task`/`bulk` also depend on
+the server's worktree capability, and remote `review --pr` needs `gh` plus GitHub
+authentication on the server. See [COMPATIBILITY.md](COMPATIBILITY.md#remote-endpoint-limits)
+for the complete list.
 
 Profiles are named definitions in `~/.config/opencode-dispatch/servers.json`
 (see [Configuration](#configuration)). Each profile separates the **bind
@@ -289,9 +463,9 @@ operations (they use `lsof`); a remote profile is managed on the machine it
 runs on. `/opencode:setup` lists every profile with live UP/down state.
 
 If a server is already running for the profile, do not start another server for
-each worktree. If no server is reachable, the dispatch wrapper may start one at
-the configured endpoint; it still routes each created session to its explicit
-directory.
+each worktree. The wrapper can start a server when the endpoint is local; for a
+remote endpoint, start or reconnect the server on that host. `serve --stop` and
+`serve --restart` manage only servers on the current machine.
 
 ## Claude slash commands
 
@@ -451,6 +625,24 @@ Control modes:
   send: --steer injects into the running turn; --queue appends after it
 ```
 
+For a remote host, `--dir` must be an absolute path interpreted on that host. If
+`--host` and `--port` match a configured profile, its `dir` and credentials are
+inherited; otherwise provide `--dir` and configure credentials for that address.
+Add `--remote` when reaching a remote server through `localhost`, such as an SSH
+tunnel.
+
+For remote `task` and `bulk`, pass `--project <id|name|path>` to resolve a
+project from the remote server's OpenCode project list. The launcher sends the
+resolved canonical path to the worktree API, so you do not need to know the
+server's filesystem layout. Select a different project on each invocation:
+
+```sh
+opencode-dispatch.sh task --server ideapad5 --project my-service "Add a health endpoint"
+```
+
+`--project` is task/bulk-only and cannot be combined with `--dir`; a profile's
+`dir` remains the default when neither is given.
+
 **`--background` is the default for every run mode** (`review`, `plan`, `ask`,
 `task`, `bulk`). The job runs in the background on the persistent opencode
 server (detached, no terminal); the wrapper then waits for the turn to complete,
@@ -559,14 +751,49 @@ to run manually is printed instead.
 Branch commits are kept unless `--delete-branch` is given to `agent-cleanup.mjs`.
 Uncommitted work is **not** recoverable after teardown; have the worker commit first.
 
+### Pruning old named sessions
+
+OpenCode auto-names sessions with a suffix such as `agent — brave-canyon` or
+`review PR #42 — calm-wizard`. To remove those older than 24 hours:
+
+```bash
+node scripts/prune-named-sessions.mjs                    # report only
+node scripts/prune-named-sessions.mjs --apply            # delete
+node scripts/prune-named-sessions.mjs --hours 48 --apply
+```
+
+Every match with an opencode-dispatch worker record is removed with
+`teardown --task <id>` (worktree and session) and its JSON result is checked for
+`database.deleted`; a teardown that reports the rows were not cleaned counts as
+a failure. Sessions without a worker record (reviews, TUI sessions, subagents)
+are removed with `teardown --session <id>`, which uses the native server delete
+and its child-session cascade. The script is a dry run unless `--apply` is
+passed; `--force` forwards teardown's force checks, and `--managed-only` leaves
+unmanaged sessions alone.
+
+Because the native delete cascades to child sessions, the script skips a
+matching parent when any descendant is outside the selection (fresh, a
+different title, the current session, or unmanaged under `--managed-only`).
+`--cascade` explicitly allows that broader deletion. Custom registry layouts are
+found through `AGENT_REGISTRY_ROOT` or `--registry-root`; if a worker's source
+checkout is gone, the session is deleted without worktree cleanup and the result
+is marked as a fallback. The suffix must match the session's `slug` when the
+server supplies one, avoiding false positives such as `Fix bug — Windows-11`.
+
+Server credentials come from the same environment as the dispatcher:
+`OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD` / `OPENCODE_PASSWORD`, and
+`OPENCODE_SERVER_CREDENTIALS`. The script also loads those four keys from
+`$OPENCODE_DISPATCH_ENV_FILE`, a `.env.local` next to the dispatcher or script,
+or `~/.claude/scripts/.env.local`; exported variables always win.
+
 ## Safety rules
 
 - Never pass the primary checkout as a worker worktree path.
 - Never manually start an unattached `opencode` worker for an edit task.
 - Never start a second OpenCode server merely to obtain a different worktree.
 - Never reuse another task's branch, worktree path, task ID, or session ID.
-- Keep source clean before allocation; the child starts from the selected Git ref,
-  not uncommitted source changes.
+- Workers start from the selected Git ref, not uncommitted source changes. Commit
+  changes or choose a base ref when a worker needs those changes.
 - Treat `--no-bootstrap` as a test/provisioning escape hatch, not a normal task
   option.
 - Verify the reported branch and worktree before reviewing or merging changes.
@@ -587,12 +814,11 @@ Set `OPENCODE_ORCHESTRATION_ROOT` to this repository's `scripts/` directory
 (containing `spawn-agent.mjs`), or pass `--orchestration-root /absolute/path/to/scripts`. Confirm that the path is
 the same trusted checkout whose scripts you reviewed.
 
-### `source worktree is dirty`
+### A worker does not include uncommitted source changes
 
-Commit or stash the source changes before launching an edit task. The launcher
-does not copy uncommitted changes into a child. If the source is intentionally
-dirty, create a controlled worktree yourself and use the normal bootstrap path;
-do not bypass task ownership casually.
+This is expected: the worker starts from `--base` (default `HEAD`). Commit the
+changes first or set `--base` to a commit that contains them if the worker needs
+that code. The primary checkout's edits are left untouched.
 
 ### `directory mismatch`
 
@@ -643,5 +869,6 @@ npm run check   # node --check on the launcher scripts
 npm test        # node --test scripts/tests/*.test.mjs
 ```
 
-The tests use temporary Git repositories and mocked server requests. They must not
-require, inspect, or modify secret-bearing OpenCode configuration.
+The tests use temporary Git repositories and mocked server requests (covering
+both v1 and v2 response shapes). They must not require, inspect, or modify
+secret-bearing OpenCode configuration.

@@ -1,6 +1,6 @@
 ---
 description: List opencode sessions from the running server (assumes server up)
-argument-hint: '[--tail <N>] [--server <name>] [--port <N>] [--host <addr>]'
+argument-hint: '[--tail <N>] [--json] [--server <name>] [--port <N>] [--host <addr>]'
 allowed-tools: Bash(bash:*), Bash(opencode:*)
 ---
 

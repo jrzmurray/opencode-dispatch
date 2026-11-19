@@ -24,11 +24,17 @@ Delivery:
   tight.
 - `--follow` — explicit form of the default bounded follow.
 - `--wait` — same completion loop with the ~24h backstop (blocks to done).
-- `--steer` — inject into the turn already in progress.
-- `--queue` — append to run after the current turn.
+- `--steer` — (v2 server) inject into the turn already in progress.
+- `--queue` — (v2 server) append to run after the current turn.
 
-`--steer`/`--queue` return an admission record, not the reply — then read the
-result with `/opencode:status <id>` and `/opencode:history <id> --turns 1`.
+`--steer`/`--queue` use v2's `delivery` field; v1 has no equivalent and the
+command refuses rather than posting to a missing route. They return an
+admission record, not the reply — then read the result with
+`/opencode:status <id>` and `/opencode:history <id> --turns 1`.
+
+The submit records its admission, so concurrent `status` checks report
+`pending` from the POST until the new user message is visible; they do not fall
+back to the session's previous `idle` turn.
 
 **Never pipe this command's output through `tail`** — the installed PreToolUse
 hook blocks it; the reply is already the distilled result.

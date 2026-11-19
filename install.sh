@@ -60,9 +60,12 @@ Claude install (--claude):
   scripts/opencode-set-model.sh     -> same dirs
   scripts/opencode-guard.sh         -> same dirs
   scripts/{spawn-agent,agent-status,agent-cleanup,agent-worker-guard,
-          worktree-utils,opencode-server}.mjs
-                                    -> same dirs (task/bulk worker launcher;
-                                       the dispatcher finds it next to itself)
+          worktree-utils,opencode-server,api-dialect,oc-api,agent-config,
+          server-profiles,prune-named-sessions}.mjs
+  scripts/server-credentials.cjs    -> same dirs (task/bulk worker launcher,
+                                       profile resolver, shared credential
+                                       parser; the dispatcher finds them next
+                                       to itself)
   commands/opencode/*.md            -> $CLAUDE/commands/opencode/ (profile)
                                        <repo>/.claude/commands/opencode/ (repo)
   PreToolUse/Bash hook              -> merged into $CLAUDE/settings.json
@@ -180,7 +183,7 @@ if [ "$SCOPE" = "repo" ]; then
 fi
 
 CLAUDE="${CLAUDE_HOME:-$HOME/.claude}"
-LAUNCHER_FILES=(spawn-agent.mjs agent-status.mjs agent-cleanup.mjs agent-worker-guard.mjs worktree-utils.mjs opencode-server.mjs)
+LAUNCHER_FILES=(spawn-agent.mjs agent-status.mjs agent-cleanup.mjs agent-worker-guard.mjs worktree-utils.mjs opencode-server.mjs api-dialect.mjs oc-api.mjs agent-config.mjs server-credentials.cjs server-profiles.mjs prune-named-sessions.mjs)
 CONFIG="$HOME/.config/opencode/opencode.json"
 echo "repo:   $REPO"
 echo "claude: $CLAUDE"
@@ -216,9 +219,14 @@ install_claude() {  # $1 = install root (profile: $CLAUDE, repo: $REPO/.claude)
   # existing file is not valid JSON, skip registration rather than destroy it.
   SETTINGS="$ROOT/settings.json"
   GUARD_CMD="$ROOT/scripts/opencode-guard.sh"
-  if node - "$SETTINGS" "$GUARD_CMD" <<'EOF'
+  HOOK_CMD="$GUARD_CMD"
+  if [ "$SCOPE" = "repo" ]; then
+    # Keep committed repo-scoped settings portable across checkout locations.
+    HOOK_CMD='bash "${CLAUDE_PROJECT_DIR}/.claude/scripts/opencode-guard.sh"'
+  fi
+  if node - "$SETTINGS" "$HOOK_CMD" <<'EOF'
     const fs = require("fs");
-    const [settingsPath, guardCmd] = process.argv.slice(2);
+    const [settingsPath, hookCommand] = process.argv.slice(2);
     let s = {};
     if (fs.existsSync(settingsPath)) {
       try { s = JSON.parse(fs.readFileSync(settingsPath, "utf8")); }
@@ -229,8 +237,14 @@ install_claude() {  # $1 = install root (profile: $CLAUDE, repo: $REPO/.claude)
     let bashEntry = arr.find(e => String(e.matcher || "").toLowerCase() === "bash");
     if (!bashEntry) { bashEntry = { matcher: "Bash", hooks: [] }; arr.push(bashEntry); }
     bashEntry.hooks = bashEntry.hooks || [];
-    if (!bashEntry.hooks.some(h => h.type === "command" && h.command === guardCmd)) {
-      bashEntry.hooks.push({ type: "command", command: guardCmd });
+    if (hookCommand.includes("${CLAUDE_PROJECT_DIR}")) {
+      // Replace a prior repo-scoped absolute path so moved/cloned checkouts do
+      // not keep trying to invoke the guard from the old location.
+      bashEntry.hooks = bashEntry.hooks.filter(h =>
+        h.type !== "command" || h.command === hookCommand || !String(h.command).includes(".claude/scripts/opencode-guard.sh"));
+    }
+    if (!bashEntry.hooks.some(h => h.type === "command" && h.command === hookCommand)) {
+      bashEntry.hooks.push({ type: "command", command: hookCommand });
     }
     fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + "\n");
 EOF

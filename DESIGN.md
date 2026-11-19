@@ -8,6 +8,13 @@ Status: the CLI/skill layer (dispatch script + `/opencode:*` commands + persiste
 server + session read-back) is built. The inter-agent features below are the
 roadmap for the future MCP server.
 
+Platform status: the dispatcher is **dual-generation**. v1 (opencode 1.18.29+)
+is the reference implementation; v2 (opencode 2.x) support rolls out mode by
+mode behind dialect detection and client pairing — `COMPATIBILITY.md` holds the
+live matrix. The read-only modes (`sessions`, `status`, `history`, `follow`)
+are v2-ready, with the v2 event stream driving `follow` / `status --follow`;
+the remaining modes refuse a v2 server with a clear error until ported.
+
 ---
 
 ## 1. The core idea (token seam)
@@ -105,6 +112,14 @@ Each contract-designed to return distilled output.
 
 ## 4. Operational notes (hard-won)
 
+- **Server dialects are detected, never assumed.** opencode 2.x replaced the
+  server API (`/api/*`) and the plugin API. `scripts/api-dialect.mjs` probes
+  the server (`/api/info` ⇒ v2; legacy `/session` JSON ⇒ v1), profiles carry
+  `api` + `bin`, and not-yet-ported modes refuse a v2 server instead of
+  issuing v1 calls (`COMPATIBILITY.md`). Read-only modes delegate wire shapes
+  to `scripts/oc-api.mjs`; on v2, `follow` and `status --follow` are driven by
+  the `/api/event` stream with the polling loop kept as the fallback.
+
 - **Everything runs in the server context by default.** Run modes are server-backed
   and async: submit → get a session id → observe (`status`/`history`) → kill
   (`abort`). This replaced the original one-shot `opencode run` default, which was
@@ -184,6 +199,13 @@ Each contract-designed to return distilled output.
 ---
 
 ## 5. Useful opencode endpoints (v1.18.x)
+
+The table below is the **v1** surface this repo originally targeted. On v2 the
+same capabilities live under `/api/*` (session create/list/prompt/interrupt/
+message/permission/form/event, with `location`/`x-opencode-directory` scoping
+instead of `?directory=`); `COMPATIBILITY.md` has the mapping and the support
+matrix. `scripts/opencode-server.mjs` is the only place that speaks either
+wire format; `scripts/oc-api.mjs` exposes it to the shell.
 
 | Endpoint | Use |
 |---|---|

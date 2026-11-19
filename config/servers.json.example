@@ -1,14 +1,41 @@
 {
+  "_comment": "Named OpenCode server profiles. Keys starting with _ are documentation and ignored. See COMPATIBILITY.md for the v1/v2 dialect rules.",
+  "_comment-fields": {
+    "_listen_host": "listen = bind interface passed to `opencode serve --hostname`; host = addressable address the dispatcher reaches (never 0.0.0.0/::).",
+    "_api": "Optional 'api': auto (default; probe the server), v1, or v2. Only set to pin what auto cannot see (e.g. a server that is down).",
+    "_bin": "Optional 'bin': the opencode client binary paired with THIS server's generation (per-profile; default PATH `opencode`). A v2 binary cannot drive a v1 server and vice versa; see COMPATIBILITY.md.",
+    "_username_password": "Optional per-profile 'username'/'password'. When omitted, the top-level address-keyed 'credentials' map is consulted, then the single OPENCODE_SERVER_PASSWORD/OPENCODE_PASSWORD fallback.",
+    "_credentials": "Address-keyed credentials: keys are 'host', 'host:port', or a full URL; values are a password string or {username, password}. More specific (host:port) beats host. OPENCODE_SERVER_CREDENTIALS (a JSON object in the environment/.env.local) overrides this map. Precedence: env map > profile fields > this map > single env password.",
+    "_password_note": "Required when 'listen' is non-loopback, and for any v2 'opencode serve' (v2 always enables basic auth and invents a random password when none is supplied). v1 clients read it via OPENCODE_SERVER_PASSWORD; v2 clients prefer OPENCODE_PASSWORD (both are exported for launched clients)."
+  },
+  "credentials": {
+    "192.0.2.50": { "password": "REPLACE_ME" },
+    "127.0.0.1:4096": { "username": "opencode", "password": "REPLACE_ME" }
+  },
   "default": {
     "listen": "127.0.0.1",
-    "port": 4096
+    "port": 4096,
+    "_v2-note": "On a v2 install the shared background service lives at a discovered URL (see `opencode service status`); point a profile at it with host/port, or run a private `opencode serve`."
   },
   "_example-remote": {
     "listen": "0.0.0.0",
     "host": "192.0.2.50",
     "port": 4096,
-    "dir": "~/Code/your-project",
-    "password": "REPLACE_ME",
+    "dir": "/home/your-user/Code/your-project",
     "model": "deepseek/deepseek-v4-pro"
+  },
+  "_example-v1-legacy": {
+    "listen": "127.0.0.1",
+    "host": "127.0.0.1",
+    "port": 4096,
+    "api": "v1",
+    "bin": "/opt/opencode-v1/opencode"
+  },
+  "_example-v2": {
+    "listen": "127.0.0.1",
+    "host": "127.0.0.1",
+    "port": 4096,
+    "api": "v2",
+    "bin": "/opt/opencode-v2/opencode"
   }
 }

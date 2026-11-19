@@ -1,6 +1,6 @@
 ---
 description: Remove a finished opencode task — worktree and session database rows
-argument-hint: '--task <taskID> [--force]'
+argument-hint: '--task <taskID> [--force] | --session <sessionID> [--dir <path>]'
 allowed-tools: Bash(bash:*), Bash(opencode:*)
 ---
 
@@ -15,6 +15,11 @@ session is deleted through it, never through the local database.
 Refuses unless the worker process has exited, no turn is active,
 and the server is reachable with a matching session directory (`--force`
 bypasses these).
+
+With `--session <id>`, there is no worker record or worktree to remove: the
+command looks the session up, interrupts any live turn, and deletes it through
+the native server API (including its child sessions). Pass `--dir <path>` only
+when the session's directory is known.
 
 To do this automatically, pass `--teardown` to `task`/`bulk` (with
 `--background`/`--wait`); it runs only after a clean completion.
