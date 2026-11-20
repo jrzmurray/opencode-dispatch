@@ -856,24 +856,33 @@ server_up() {
   [ "$(json_field "$out" serverUp)" = "true" ]
 }
 
-# all_asks </permission|/question> [timeout-s] — print the merged JSON array of
+# all_asks </permission|/question> [timeout-s] [sessionID] — print the merged JSON array of
 # open asks across EVERY directory the server has a session in. The ask queues
 # are scoped per directory (instance): a bare GET returns only the asks of the
 # server's own/default directory, so a session working in another repo (or
 # worktree) looked like "WORKING, tool running, no ask in queue" while it sat
-# parked on an external_directory prompt. Verified on 1.18.9.
+# parked on an external_directory prompt. Verified on 1.18.9. With a sessionID
+# only that session directory is queried (one small GET, not the full list).
 all_asks() {
   local tmo="${2:-5}" ab=""
   [ -n "${SERVE_PASSWORD:-}" ] && ab="$(printf '%s' "${SERVER_USERNAME}:${SERVE_PASSWORD}" | base64)"
-  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session" 2>/dev/null \
-    | BASE_URL="$BASE_URL" AUTH_B64="$ab" QPATH="$1" TMO="$tmo" DIR="$DIR" node -e '
+  curl -sf -m "$tmo" ${CURL_AUTH[@]:+"${CURL_AUTH[@]}"} "$BASE_URL/session${3:+/$3}" 2>/dev/null \
+    | BASE_URL="$BASE_URL" AUTH_B64="$ab" QPATH="$1" TMO="$tmo" DIR="$DIR" SESSION="${3:-}" node -e '
       let d="";process.stdin.on("data",c=>d+=c).on("end",async()=>{
         let s=[];try{s=JSON.parse(d)}catch(e){}
-        const dirs=new Set([""]);if(process.env.DIR)dirs.add(process.env.DIR);
-        for(const x of Array.isArray(s)?s:[])if(x&&x.directory)dirs.add(x.directory);
+        const sessions=Array.isArray(s)?s:[s];
+        const dirs=new Set();
+        if(process.env.SESSION){
+          const session=sessions[0];
+          dirs.add(session&&session.directory!==undefined?session.directory:(process.env.DIR||""));
+        }else{
+          dirs.add("");if(process.env.DIR)dirs.add(process.env.DIR);
+          for(const x of sessions)if(x&&x.directory)dirs.add(x.directory);
+        }
         const h=process.env.AUTH_B64?{authorization:"Basic "+process.env.AUTH_B64}:{};
         const out=new Map();
-        await Promise.all([...dirs].map(async dir=>{
+        const list=[...dirs];
+        for(let i=0;i<list.length;i+=6)await Promise.all(list.slice(i,i+6).map(async dir=>{
           try{
             const u=process.env.BASE_URL+process.env.QPATH+(dir?"?directory="+encodeURIComponent(dir):"");
             const r=await fetch(u,{headers:h,signal:AbortSignal.timeout(+process.env.TMO*1000)});
@@ -895,9 +904,9 @@ all_asks() {
 # stuck in state.status "running" with no time.end).
 parked_permission() {
   local tmo="${2:-5}"
-  all_asks /permission "$tmo" \
+  all_asks /permission "$tmo" "$1" \
     | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);process.stdout.write(p.id+" "+p.permission+" "+((p.patterns||[]).join(" ")))}catch(e){process.exit(0)}})' 2>/dev/null || true
-  all_asks /question "$tmo" \
+  all_asks /question "$tmo" "$1" \
     | PERMSID="$1" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d);const p=(a||[]).find(x=>x.sessionID===process.env.PERMSID);if(!p)process.exit(0);const q=(p.questions||[])[0]||{};process.stdout.write(p.id+" [question] "+((q.header||q.question||"").slice(0,80)))}catch(e){process.exit(0)}})' 2>/dev/null || true
 }
 
@@ -1387,7 +1396,7 @@ if [ "$MODE" = "follow" ]; then
     // Ask queues are per-directory: also query the directory the session lives in.
     let sessDir;
     const jask = async (u) => {
-      if (sessDir === undefined) { try { sessDir = (await jget("/session/" + sid)).directory || ""; } catch (e) { sessDir = ""; } }
+      if (sessDir === undefined) { try { sessDir = (await jget("/session/" + sid)).directory || ""; } catch (e) {} }
       const out = new Map();
       for (const q of await jget(u)) out.set(q.id, q);
       if (sessDir) for (const q of await jget(u + "?directory=" + encodeURIComponent(sessDir))) out.set(q.id, q);
